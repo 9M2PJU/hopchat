@@ -159,6 +159,8 @@ pub enum Update {
     },
     /// Something home did or wants the person at this machine to know.
     Home(String),
+    /// What the Devices panel should show now.
+    HomeView(Box<home::View>),
     Protocol(Box<Event>),
     Error(String),
 }

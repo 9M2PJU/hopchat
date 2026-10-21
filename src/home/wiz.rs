@@ -69,6 +69,44 @@ fn scene_name(id: u64) -> Option<&'static str> {
     SCENES.iter().find(|(_, i)| u64::from(*i) == id).map(|(n, _)| *n)
 }
 
+/// What a bulb can show, from the module name it reports: `SHRGB` bulbs do
+/// colour and white tones, `SHTW` white tones, `SHDW` brightness only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Caps {
+    pub colour: bool,
+    pub white: bool,
+}
+
+impl Caps {
+    pub fn of(module: &str) -> Self {
+        let m = module.to_ascii_uppercase();
+        if m.contains("RGB") {
+            Self { colour: true, white: true }
+        } else if m.contains("TW") {
+            Self { colour: false, white: true }
+        } else if m.contains("DW") {
+            Self::default()
+        } else {
+            // Unknown module: let it try everything rather than refuse.
+            Self { colour: true, white: true }
+        }
+    }
+
+    pub fn describe(&self) -> &'static str {
+        match (self.colour, self.white) {
+            (true, _) => "colour",
+            (false, true) => "white tones",
+            (false, false) => "dimmable",
+        }
+    }
+}
+
+/// A bulb's identity, as it reports it.
+pub struct System {
+    pub mac: String,
+    pub module: String,
+}
+
 pub struct Bulb {
     pub ip: Ipv4Addr,
 }
@@ -79,6 +117,10 @@ impl Bulb {
         if params.as_object().is_none_or(|p| p.is_empty()) {
             return Err("nothing to change".into());
         }
+        self.set_raw(params)
+    }
+
+    fn set_raw(&self, params: Value) -> Result<(), String> {
         let answer = self.call(json!({"method": "setPilot", "params": params}))?;
         match answer.pointer("/result/success") {
             Some(Value::Bool(true)) => Ok(()),
@@ -86,26 +128,35 @@ impl Bulb {
         }
     }
 
+    fn pilot(&self) -> Result<Value, String> {
+        let answer = self.call(json!({"method": "getPilot", "params": {}}))?;
+        answer.get("result").cloned().ok_or_else(|| "bulb sent no state".into())
+    }
+
+    pub fn system(&self) -> Result<System, String> {
+        let answer = self.call(json!({"method": "getSystemConfig", "params": {}}))?;
+        let r = answer.get("result").ok_or("bulb sent no config")?;
+        Ok(System {
+            mac: r.get("mac").and_then(Value::as_str).unwrap_or_default().to_string(),
+            module: r.get("moduleName").and_then(Value::as_str).unwrap_or_default().to_string(),
+        })
+    }
+
     /// A one-line description of what the bulb is doing now.
     pub fn status(&self) -> Result<String, String> {
-        let answer = self.call(json!({"method": "getPilot", "params": {}}))?;
-        let r = answer.get("result").ok_or("bulb sent no state")?;
-        if r.get("state") == Some(&Value::Bool(false)) {
-            return Ok("off".into());
+        Ok(describe(&self.pilot()?))
+    }
+
+    /// Dips the light twice and puts it back as it was, so you can tell
+    /// which bulb is which.
+    pub fn blink(&self) -> Result<(), String> {
+        let before = self.pilot()?;
+        let was_on = before.get("state") != Some(&Value::Bool(false));
+        for dimming in [10, 100, 10, 100] {
+            self.set_raw(json!({"state": true, "dimming": dimming}))?;
+            std::thread::sleep(Duration::from_millis(350));
         }
-        let mut out = format!("on at {}%", r.get("dimming").and_then(Value::as_u64).unwrap_or(100));
-        if let Some(k) = r.get("temp").and_then(Value::as_u64).filter(|k| *k > 0) {
-            out.push_str(&format!(", {k}K white"));
-        } else if let Some(scene) = r.get("sceneId").and_then(Value::as_u64).and_then(scene_name) {
-            out.push_str(&format!(", scene {scene}"));
-        } else if let (Some(red), Some(g), Some(b)) = (
-            r.get("r").and_then(Value::as_u64),
-            r.get("g").and_then(Value::as_u64),
-            r.get("b").and_then(Value::as_u64),
-        ) {
-            out.push_str(&format!(", colour #{red:02x}{g:02x}{b:02x}"));
-        }
-        Ok(out)
+        self.set_raw(restore(&before, was_on))
     }
 
     fn call(&self, request: Value) -> Result<Value, String> {
@@ -124,25 +175,78 @@ impl Bulb {
                 return serde_json::from_slice(&buf[..n]).map_err(|e| e.to_string());
             }
         }
-        Err(format!("bulb at {} did not answer", self.ip))
+        Err(format!("the light at {} did not answer", self.ip))
     }
 }
 
-/// Every Wiz bulb that answers a broadcast within `wait`.
-pub fn discover(wait: Duration) -> Vec<Ipv4Addr> {
+fn describe(r: &Value) -> String {
+    if r.get("state") == Some(&Value::Bool(false)) {
+        return "off".into();
+    }
+    let mut out = format!("on · {}%", r.get("dimming").and_then(Value::as_u64).unwrap_or(100));
+    if let Some(scene) = r.get("sceneId").and_then(Value::as_u64).and_then(scene_name) {
+        out.push_str(&format!(" · {scene}"));
+    } else if let Some(k) = r.get("temp").and_then(Value::as_u64).filter(|k| *k > 0) {
+        out.push_str(&format!(" · {k}K"));
+    } else if let (Some(red), Some(g), Some(b)) = (
+        r.get("r").and_then(Value::as_u64),
+        r.get("g").and_then(Value::as_u64),
+        r.get("b").and_then(Value::as_u64),
+    ) {
+        out.push_str(&format!(" · #{red:02x}{g:02x}{b:02x}"));
+    }
+    out
+}
+
+/// The `setPilot` params that put a bulb back to a `getPilot` state.
+fn restore(before: &Value, was_on: bool) -> Value {
+    if !was_on {
+        return json!({"state": false});
+    }
+    let mut p = serde_json::Map::new();
+    p.insert("state".into(), json!(true));
+    if let Some(d) = before.get("dimming") {
+        p.insert("dimming".into(), d.clone());
+    }
+    match before.get("sceneId").and_then(Value::as_u64) {
+        Some(id) if id > 0 => {
+            p.insert("sceneId".into(), json!(id));
+        }
+        _ => {
+            for key in ["temp", "r", "g", "b"] {
+                if let Some(v) = before.get(key).filter(|v| v.as_u64().is_some_and(|n| n > 0)) {
+                    p.insert(key.into(), v.clone());
+                }
+            }
+        }
+    }
+    Value::Object(p)
+}
+
+/// Every Wiz bulb that answers a broadcast within `wait`, with the MAC it
+/// reported.
+pub fn discover(wait: Duration) -> Vec<(Ipv4Addr, Option<String>)> {
     let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else { return Vec::new() };
     let _ = socket.set_broadcast(true);
     let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
     let probe = json!({"method": "getPilot", "params": {}}).to_string();
-    let _ = socket.send_to(probe.as_bytes(), (Ipv4Addr::BROADCAST, PORT));
     let deadline = Instant::now() + wait;
-    let mut found = Vec::new();
+    let mut found: Vec<(Ipv4Addr, Option<String>)> = Vec::new();
     let mut buf = [0u8; 2048];
+    let mut next_probe = Instant::now();
     while Instant::now() < deadline {
-        if let Ok((_, SocketAddr::V4(from))) = socket.recv_from(&mut buf)
-            && !found.contains(from.ip())
+        // Broadcasts get lost; ask a few times.
+        if Instant::now() >= next_probe {
+            let _ = socket.send_to(probe.as_bytes(), (Ipv4Addr::BROADCAST, PORT));
+            next_probe = Instant::now() + Duration::from_millis(700);
+        }
+        if let Ok((n, SocketAddr::V4(from))) = socket.recv_from(&mut buf)
+            && !found.iter().any(|(ip, _)| ip == from.ip())
         {
-            found.push(*from.ip());
+            let mac = serde_json::from_slice::<Value>(&buf[..n])
+                .ok()
+                .and_then(|v| v.pointer("/result/mac")?.as_str().map(str::to_string));
+            found.push((*from.ip(), mac));
         }
     }
     found
@@ -160,6 +264,24 @@ mod tests {
         assert_eq!(off.params(), json!({"state": false}));
         let both = Pilot { rgb: Some((255, 0, 0)), kelvin: Some(2700), ..Default::default() };
         assert_eq!(both.params(), json!({"r": 255, "g": 0, "b": 0, "state": true}));
+    }
+
+    #[test]
+    fn capabilities_from_module_names() {
+        assert_eq!(Caps::of("ESP01_SHTW1C_31"), Caps { colour: false, white: true });
+        assert_eq!(Caps::of("ESP01_SHRGB1C_31"), Caps { colour: true, white: true });
+        assert_eq!(Caps::of("ESP06_SHDW9_01"), Caps { colour: false, white: false });
+    }
+
+    #[test]
+    fn restores_what_it_found() {
+        let scene = json!({"state": true, "sceneId": 15, "dimming": 80, "temp": 0});
+        assert_eq!(restore(&scene, true), json!({"state": true, "dimming": 80, "sceneId": 15}));
+        let white = json!({"state": true, "sceneId": 0, "dimming": 40, "temp": 2700});
+        assert_eq!(restore(&white, true), json!({"state": true, "dimming": 40, "temp": 2700}));
+        assert_eq!(restore(&white, false), json!({"state": false}));
+        assert_eq!(describe(&scene), "on · 80% · focus");
+        assert_eq!(describe(&white), "on · 40% · 2700K");
     }
 
     #[test]

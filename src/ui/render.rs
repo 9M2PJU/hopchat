@@ -10,7 +10,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::devices::{self, Devices, Primary};
 use super::picker::{self, Picker};
+use crate::home::{self, DeviceView, ModelState, State};
 use super::{App, Convo, Mode};
 use crate::history::{Body, Entry, Status, Transfer};
 
@@ -36,7 +38,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/invite", "add someone nearby to this group: /invite NICK"),
     ("/members", "list who is in this group"),
     ("/leave", "leave this group"),
-    ("/home", "devices: /home on|off in a group, /home bulb IP, /home tv IP"),
+    ("/devices", "find, pair and test your smart devices (also Ctrl-D)"),
+    ("/home", "/home on|off lets this group use your devices · /home add IP"),
     ("/me", "show and copy your own address"),
     ("/clear", "delete this conversation from this device"),
     ("/log", "show or hide the protocol event log"),
@@ -84,6 +87,7 @@ impl App {
 
         match &self.mode {
             Mode::Picker(picker) => draw_picker(frame, picker),
+            Mode::Devices(panel) => self.draw_devices(frame, panel),
             Mode::Help => draw_help(frame),
             _ => {}
         }
@@ -303,7 +307,7 @@ impl App {
         if convo.data.entries.is_empty() {
             rows.push((Line::from(""), None));
             let hint = if convo.data.group {
-                "A new group. /invite NICK adds people; /home on lets them use your devices."
+                "A new group. /invite NICK adds people; Ctrl-D, then g, lets them use your devices."
             } else if convo.secure {
                 "Say hello — or drop a file here."
             } else {
@@ -641,9 +645,22 @@ impl App {
                 ("Esc", "cancel"),
             ],
             Mode::Help => &[("any key", "close")],
+            Mode::Devices(ref panel) if panel.renaming.is_some() => {
+                &[("type", "a name"), ("Enter", "save"), ("Esc", "cancel")]
+            }
+            Mode::Devices(_) => &[
+                ("↑↓", "move"),
+                ("Enter", "add/pair/test"),
+                ("n", "rename"),
+                ("x", "forget"),
+                ("r", "rescan"),
+                ("g", "access"),
+                ("Esc", "close"),
+            ],
             Mode::Normal => &[
                 ("Enter", "send"),
                 ("Ctrl-O", "attach"),
+                ("Ctrl-D", "devices"),
                 ("Tab", "next chat"),
                 ("↑", "select"),
                 ("F1", "help"),
@@ -678,6 +695,231 @@ impl App {
         frame.render_widget(Clear, at);
         frame.render_widget(line, at);
     }
+}
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn spinner() -> &'static str {
+    let ms = chrono::Utc::now().timestamp_millis();
+    SPINNER[(ms / 90) as usize % SPINNER.len()]
+}
+
+impl App {
+    fn draw_devices(&self, frame: &mut Frame, panel: &Devices) {
+        let view = &self.home_view;
+        let area = centered(frame.area(), 78, 82);
+        frame.render_widget(Clear, area);
+        let status = if view.scanning {
+            format!(" {} scanning ", spinner()).fg(ACCENT)
+        } else {
+            " r rescans ".fg(MUTED)
+        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(ACCENT))
+            .title(" Devices ".fg(ACCENT).bold())
+            .title(Line::from(status).alignment(Alignment::Right));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [list, help, footer] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .areas(inner);
+
+        let width = list.width as usize;
+        let selected = panel.selected.min(view.devices.len().saturating_sub(1));
+        let mut lines: Vec<Line> = Vec::new();
+        let mut selected_row = 0;
+        let added = view.devices.iter().filter(|d| d.added).count();
+        for (i, d) in view.devices.iter().enumerate() {
+            if i == 0 && d.added {
+                lines.push(Line::from(" Your devices".fg(MUTED).bold()));
+            }
+            if i == added {
+                if added > 0 {
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::from(" Found on this network".fg(MUTED).bold()));
+            }
+            if i == selected {
+                selected_row = lines.len();
+            }
+            lines.push(device_line(d, i == selected, panel, width));
+        }
+        if view.devices.is_empty() {
+            lines.push(Line::from(""));
+            if view.scanning {
+                lines.push(Line::from(format!("  {} Looking for Wiz lights and LG TVs on this network…", spinner()).fg(MUTED)));
+            } else {
+                lines.push(Line::from("  Nothing found.".fg(MUTED)));
+                lines.push(Line::from(""));
+                lines.push(Line::from("  Devices have to be on the same network as this machine, and switched on.".fg(FAINT)));
+                lines.push(Line::from("  r scans again · /home add IP adds one by its address".fg(FAINT)));
+            }
+        } else if view.scanning && !view.devices.iter().any(|d| !d.added) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("  {} looking for more…", spinner()).fg(FAINT)));
+        }
+        if !view.scanning && !view.devices.iter().any(|d| d.kind == home::Kind::Tv) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                "  📺 No TV? ".fg(MUTED),
+                "A TV only shows up while it's switched on. Turn it on, then ".fg(FAINT),
+                "r".fg(ACCENT).bold(),
+                ".".fg(FAINT),
+            ]));
+        }
+        // Keep the selection in view.
+        let height = list.height as usize;
+        let skip = (selected_row + 2).saturating_sub(height);
+        let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
+        frame.render_widget(Paragraph::new(lines), list);
+
+        let current = panel.current(view);
+        frame.render_widget(Paragraph::new(device_help(current, panel)), help);
+
+        frame.render_widget(Paragraph::new(self.devices_footer(width)), footer);
+    }
+
+    fn devices_footer(&self, width: usize) -> Vec<Line<'static>> {
+        let view = &self.home_view;
+        let rule = Line::from("─".repeat(width).fg(FAINT));
+        let model = match view.model_state {
+            ModelState::Ready => vec!["● ".fg(OK), view.model.clone().bold(), " ready".fg(MUTED)],
+            ModelState::Missing => vec![
+                "◐ ".fg(WARN),
+                format!("{} isn't downloaded · ", view.model).fg(WARN),
+                format!("ollama pull {}", view.model).fg(ACCENT),
+            ],
+            ModelState::NoServer => vec![
+                "○ ".fg(ERR),
+                "Ollama isn't running · start it with ".fg(WARN),
+                "ollama serve".fg(ACCENT),
+            ],
+            ModelState::Unknown => vec![format!("{} ", spinner()).fg(MUTED), "checking…".fg(MUTED)],
+        };
+        let mut model_line = vec!["  Model   ".fg(MUTED)];
+        model_line.extend(model);
+        let access = match self.home_here() {
+            Some((_, name, true)) => vec![
+                "# ".fg(ACCENT),
+                name.bold(),
+                " can use them".fg(OK),
+                "  · g switches off".fg(FAINT),
+            ],
+            Some((_, name, false)) => vec![
+                "# ".fg(FAINT),
+                name.bold(),
+                " can't use them".fg(MUTED),
+                "  · g lets this group in".fg(ACCENT),
+            ],
+            None => {
+                let n = view.groups.len();
+                vec![
+                    format!("on in {n} group{}", if n == 1 { "" } else { "s" }).fg(MUTED),
+                    "  · open a group, then g to let it in".fg(FAINT),
+                ]
+            }
+        };
+        let mut access_line = vec!["  Access  ".fg(MUTED)];
+        access_line.extend(access);
+        vec![rule, Line::from(model_line), Line::from(access_line)]
+    }
+}
+
+fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) -> Line<'static> {
+    let icon = match d.kind {
+        home::Kind::Light => "💡",
+        home::Kind::Tv => "📺",
+    };
+    let (dot, state) = match &d.state {
+        State::Ready => ("●".fg(OK), d.detail.clone().fg(Color::Reset)),
+        State::Offline => ("○".fg(FAINT), d.detail.clone().fg(MUTED)),
+        State::Checking => (spinner().fg(MUTED), "checking…".fg(MUTED)),
+        State::New => ("✦".fg(ACCENT), d.detail.clone().fg(MUTED)),
+        State::Pairing { until } => {
+            let left = until.saturating_duration_since(std::time::Instant::now()).as_secs();
+            (spinner().fg(WARN), format!("waiting for the TV · {left}s").fg(WARN))
+        }
+        State::Failed(_) => ("✗".fg(ERR), "didn't work".fg(ERR)),
+    };
+    let marker = if selected { "▌".fg(ACCENT) } else { " ".into() };
+    let name = match &panel.renaming {
+        Some(typed) if selected => Span::from(format!("{typed}▏")).fg(ACCENT).bold(),
+        _ if selected => Span::from(clip(&d.name, 22)).bold(),
+        _ => Span::from(clip(&d.name, 22)),
+    };
+    let ip = d.ip.to_string();
+    let used = 6 + name.content.width().max(22) + 2 + 15 + 2;
+    let state = Span::styled(clip(&state.content, width.saturating_sub(used + 2)), state.style);
+    let name_pad = 22usize.saturating_sub(name.content.width());
+    let line = Line::from(vec![
+        marker,
+        " ".into(),
+        format!("{icon} ").into(),
+        name,
+        " ".repeat(name_pad + 2).into(),
+        format!("{ip:<15}").fg(FAINT),
+        "  ".into(),
+        dot,
+        " ".into(),
+        state,
+    ]);
+    if selected { line.style(Style::new().bg(SELECTED_BG)) } else { line }
+}
+
+/// Two lines under the list saying what the selected device needs.
+fn device_help(d: Option<&DeviceView>, panel: &Devices) -> Vec<Line<'static>> {
+    let key = |k: &str| k.to_string().fg(ACCENT).bold();
+    let say = |t: &str| t.to_string().fg(MUTED);
+    let Some(d) = d else { return Vec::new() };
+    if panel.renaming.is_some() {
+        return vec![Line::from(""), Line::from(vec!["  ".into(), say("Type a name people will use, like "), "Desk lamp".bold(), say(". "), key("Enter"), say(" saves.")])];
+    }
+    if panel.confirm_forget {
+        return vec![Line::from(""), Line::from(vec!["  ".into(), format!("Forget {}? ", d.name).fg(WARN), key("x"), say(" again to forget, anything else keeps it.")])];
+    }
+    let lines = match (&d.state, devices::primary(d)) {
+        (State::Pairing { .. }, _) => vec![
+            Line::from(vec!["  ".into(), "Look at the TV: it's asking whether to allow hopchat.".fg(WARN).bold()]),
+            Line::from(vec!["  ".into(), say("Choose "), "Allow".bold(), say(" with the remote. Nothing to do here.")]),
+        ],
+        (State::Failed(why), _) => vec![
+            Line::from(vec!["  ".into(), clip(why, 90).fg(ERR)]),
+            Line::from(vec!["  ".into(), key("Enter"), say(" tries again")]),
+        ],
+        (_, Primary::Pair) => vec![
+            Line::from(vec!["  ".into(), key("Enter"), say(" pairs it. The TV will ask to allow hopchat; have the remote ready.")]),
+            Line::from(vec!["  ".into(), say("For \"turn the TV on\" to work, enable "), "Turn on via Wi-Fi".bold(), say(" in its settings.")]),
+        ],
+        (_, Primary::Add) => vec![
+            Line::from(vec!["  ".into(), key("Enter"), say(" adds it. "), key("n"), say(" names it first, e.g. Kitchen.")]),
+            Line::from(vec!["  ".into(), say("Not sure which light this is? Add it, then "), key("t"), say(" blinks it.")]),
+        ],
+        (State::Offline, _) => vec![
+            Line::from(vec!["  ".into(), say("Not answering. Is it switched on, and on this network?")]),
+            Line::from(vec!["  ".into(), key("r"), say(" checks again · "), key("x"), say(" forgets it")]),
+        ],
+        _ => {
+            let test = match d.kind {
+                home::Kind::Light => " blinks it so you can find it",
+                home::Kind::Tv => " puts a hello on the screen",
+            };
+            vec![
+                Line::from(vec!["  ".into(), key("Enter"), say(test), say(" · "), key("n"), say(" renames · "), key("x"), say(" forgets")]),
+                Line::from(vec!["  ".into(), say("In a group, people ask for it by name: "), match d.kind {
+                    home::Kind::Light => format!("@home dim the {}", d.name.to_lowercase()),
+                    home::Kind::Tv => format!("@home put netflix on the {}", d.name.to_lowercase()),
+                }.fg(THEIRS)]),
+            ]
+        }
+    };
+    let mut out = vec![Line::from("")];
+    out.extend(lines);
+    out.truncate(3);
+    out
 }
 
 fn draw_picker(frame: &mut Frame, picker: &Picker) {
@@ -792,6 +1034,7 @@ fn draw_help(frame: &mut Frame) {
         key("Alt-← · Alt-→", "move by word"),
         Line::from(""),
         head("Elsewhere"),
+        key("Ctrl-D", "devices: find, pair and test them"),
         key("Ctrl-E", "protocol event log"),
         key("Ctrl-C · Ctrl-Q", "quit"),
         Line::from(""),

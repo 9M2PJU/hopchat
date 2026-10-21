@@ -229,6 +229,26 @@ impl Tv {
         }
     }
 
+    /// Whether something at `ip` speaks the webOS WebSocket API. Only the
+    /// handshake: nothing registers, so the TV shows nothing.
+    pub fn probe(ip: Ipv4Addr) -> bool {
+        let tv = Tv { ip, mac: None, client_key: None, cert: None };
+        match tv.open() {
+            Ok((mut ws, _)) => {
+                let _ = ws.close(None);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the TV's API port answers at all; a TV in standby doesn't.
+    pub fn reachable(&self) -> bool {
+        [TLS_PORT, PLAIN_PORT].iter().any(|port| {
+            TcpStream::connect_timeout(&SocketAddr::from((self.ip, *port)), Duration::from_millis(800)).is_ok()
+        })
+    }
+
     /// Wakes the TV with a magic packet. webOS keeps the network up in
     /// standby only with "Turn on via Wi-Fi" / "Mobile TV On" enabled.
     pub fn wake(&self) -> Result<(), String> {
@@ -253,6 +273,12 @@ fn set_read_timeout(ws: &Socket, timeout: Duration) {
         _ => return,
     };
     let _ = tcp.set_read_timeout(Some(timeout));
+}
+
+/// The TV's model, e.g. "OLED55C3PSA".
+pub fn model_name(s: &mut Session) -> Result<String, String> {
+    let info = s.request("ssap://system/getSystemInfo", json!({}))?;
+    Ok(info.get("modelName").and_then(Value::as_str).unwrap_or("LG TV").to_string())
 }
 
 pub fn power_off(s: &mut Session) -> Result<String, String> {

@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (home_tx, home_rx) = mpsc::channel();
     engine.set_home(home_tx.clone());
     {
-        let home = home::Home::open(&dir, input_tx.clone(), update_tx);
+        let home = home::Home::open(&dir, input_tx.clone(), update_tx, home_tx.clone());
         thread::spawn(move || home.run(home_rx));
     }
 
@@ -358,6 +358,7 @@ fn headless(
                 }
             }
             Update::Home(text) => println!("{text}"),
+            Update::HomeView(_) => {}
             Update::Error(e) => println!("error {e}"),
             Update::Protocol(event) => match *event {
                 Event::MessageDelivered {

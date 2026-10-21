@@ -1,6 +1,7 @@
 //! The terminal UI: conversations on the left, the open one in the middle,
 //! the protocol's own event stream on the right (toggle with Ctrl-E).
 
+mod devices;
 mod editor;
 mod picker;
 mod render;
@@ -24,6 +25,7 @@ use ratatui::DefaultTerminal;
 use crate::engine::{self, Command, Input, Quote, Update};
 use crate::history::{self, Body, Conversation, Entry, Quoted, Status, Transfer};
 use crate::home;
+use devices::Devices;
 use editor::Editor;
 use picker::{Outcome, Picker};
 
@@ -91,6 +93,7 @@ pub enum Mode {
     /// Picking a message in the open conversation, by entry index.
     Select(usize),
     Picker(Picker),
+    Devices(Devices),
     Help,
 }
 
@@ -125,6 +128,8 @@ pub struct App {
     title: String,
     quit: bool,
     home: Sender<home::Request>,
+    /// What home last reported, for the Devices panel.
+    pub home_view: home::View,
 }
 
 pub fn now_ms() -> i64 {
@@ -185,6 +190,7 @@ impl App {
             title: String::new(),
             quit: false,
             home,
+            home_view: home::View::default(),
         };
         app.selected = app.ordered().first().map(|c| c.data.address.clone());
         app
@@ -594,6 +600,7 @@ impl App {
                 self.note(render::ACCENT, text.clone());
                 self.flash(text);
             }
+            Update::HomeView(view) => self.home_view = *view,
             Update::Protocol(event) => self.on_protocol(*event),
             Update::Error(e) => {
                 self.note(render::ERR, format!("error      {e}"));
@@ -822,7 +829,20 @@ impl App {
                     self.mode = Mode::Picker(picker);
                 }
             }
+            Mode::Devices(mut panel) => match panel.key(key, &self.home_view) {
+                devices::Action::Close => {}
+                devices::Action::Stay => self.mode = Mode::Devices(panel),
+                devices::Action::Ask(request) => {
+                    let _ = self.home.send(request);
+                    self.mode = Mode::Devices(panel);
+                }
+                devices::Action::ToggleGroup => {
+                    self.toggle_home_here();
+                    self.mode = Mode::Devices(panel);
+                }
+            },
             Mode::Select(at) => self.select_key(at, key, send),
+            Mode::Normal if ctrl && key.code == KeyCode::Char('d') => self.open_devices(),
             Mode::Normal => self.normal_key(key, ctrl, alt, send),
         }
     }
@@ -1026,6 +1046,12 @@ impl App {
         match &mut self.mode {
             Mode::Picker(picker) => {
                 picker.filter.push_str(text.trim());
+                return;
+            }
+            Mode::Devices(panel) => {
+                if let Some(name) = &mut panel.renaming {
+                    name.extend(text.chars().filter(|c| !c.is_control()).take(32));
+                }
                 return;
             }
             Mode::Normal => {}
@@ -1257,6 +1283,7 @@ impl App {
                     self.convo_mut(&address).push(notice(text));
                 }
             }
+            "devices" | "home" if arg.is_empty() => self.open_devices(),
             "home" => {
                 let group = self.selected.clone().filter(|_| self.in_group());
                 let _ = self.home.send(home::Request::Configure {
@@ -1273,6 +1300,27 @@ impl App {
 }
 
 impl App {
+    fn open_devices(&mut self) {
+        self.mode = Mode::Devices(Devices::default());
+        let _ = self.home.send(home::Request::Scan);
+    }
+
+    /// The open group, and whether home is on in it.
+    pub fn home_here(&self) -> Option<(String, String, bool)> {
+        let convo = self.current().filter(|c| c.data.group && c.online)?;
+        let on = self.home_view.groups.contains(&convo.data.address);
+        Some((convo.data.address.clone(), convo.data.nick.clone(), on))
+    }
+
+    fn toggle_home_here(&mut self) {
+        match self.home_here() {
+            Some((group, _, on)) => {
+                let _ = self.home.send(home::Request::SetGroup { group, on: !on });
+            }
+            None => self.flash_error("open a group first; g then lets that group use your devices"),
+        }
+    }
+
     fn in_group(&self) -> bool {
         self.current().is_some_and(|c| c.data.group)
     }
@@ -1547,6 +1595,48 @@ mod render_tests {
                     + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn renders_the_devices_panel() {
+        use crate::home::{DeviceView, Kind, ModelState, State, View};
+        let mut app = test_app();
+        let send = |_: Command| {};
+        app.apply(
+            Update::Group { id: "g1".into(), name: "house".into(), members: vec!["off1alice000000000000".into()] },
+            &send,
+        );
+        app.selected = Some("g1".into());
+        let device = |name: &str, kind, ip: [u8; 4], added, state, detail: &str| DeviceView {
+            id: name.into(),
+            kind,
+            name: name.into(),
+            ip: ip.into(),
+            added,
+            state,
+            detail: detail.into(),
+        };
+        app.home_view = View {
+            devices: vec![
+                device("Desk lamp", Kind::Light, [192, 168, 1, 10], true, State::Ready, "on · 100% · focus"),
+                device("TV", Kind::Tv, [192, 168, 1, 30], false, State::Pairing { until: Instant::now() + Duration::from_secs(48) }, ""),
+                device("Light 2", Kind::Light, [192, 168, 1, 11], false, State::New, "Wiz · colour"),
+            ],
+            scanning: true,
+            model: "qwen2.5:7b".into(),
+            model_state: ModelState::NoServer,
+            groups: Vec::new(),
+        };
+        app.mode = Mode::Devices(Devices { selected: 1, ..Default::default() });
+        let screen = screen(&mut app);
+        println!("{screen}");
+        for needle in [
+            "Devices", "scanning", "Your devices", "Desk lamp", "on · 100% · focus", "Found on this network",
+            "waiting for the TV · 4", "it's asking whether to allow hopchat", "Wiz · colour",
+            "ollama serve", "house", "g lets this group in",
+        ] {
+            assert!(screen.contains(needle), "missing {needle:?}");
+        }
     }
 
     #[test]

@@ -25,11 +25,12 @@ Two terminals on one machine work too. Each name gets its own identity under `~/
 | Tab / Shift-Tab, Alt-1…9 | switch conversation |
 | ↑ on an empty line | select a message: `r` reply, `o` open, `f` show in folder, `y` copy, `R` retry |
 | PgUp / PgDn, mouse wheel | scroll |
+| Ctrl-D | devices: find, pair and test them |
 | Ctrl-E | protocol event log |
 | F1 | help |
 | Ctrl-C / Ctrl-Q | quit |
 
-Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/quit`, and for groups `/group`, `/invite`, `/members`, `/leave`, `/home`.
+Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/quit`, for groups `/group`, `/invite`, `/members`, `/leave`, and for devices `/devices`, `/home`.
 
 ## Groups
 
@@ -51,11 +52,17 @@ A local model (via [Ollama](https://ollama.com)) turns the request into device a
 Setup on the host:
 
 1. `ollama serve`, with a tool-calling model pulled (`ollama pull qwen2.5:7b` is the default; `/home model NAME` picks another).
-2. The Wiz bulb is found by itself on first start. If it isn't, use `/home bulb 192.168.1.10`.
-3. `/home tv 192.168.1.30` pairs the LG TV. Accept the prompt on the TV within a minute. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings.
-4. In each group that should have access: `/home on` (and `/home off` to revoke it).
+2. Press **Ctrl-D** (or `/devices`). hopchat scans the network for Wiz lights and LG TVs and lists what it finds.
+   - **A light:** Enter adds it, `t` blinks it so you can tell which one it is, and `n` gives it a name people will use ("Desk lamp").
+   - **A TV:** Enter pairs it. The TV asks whether to allow hopchat; choose *Allow* with the remote. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings. A TV only shows up while it's switched on.
+   - The panel also shows whether the model is ready, and the exact command to run if it isn't.
+3. Open a group and press `g` in the panel (or type `/home on`) to let that group use the devices. `g` again, or `/home off`, revokes it.
 
-Being in the group is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. Home only answers while the host's hopchat is running. Settings are kept in `~/.hopchat/<name>/home.json`. That file holds the TV's client key and its pinned certificate: the TV's certificate is self-signed, so hopchat trusts the one it sees at pairing and refuses a different one later.
+If a device is on another subnet or the scan can't see it, `/home add 192.168.1.40` adds it by address.
+
+Devices are remembered by MAC address, so one that gets a new IP from the router is followed, not lost. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home tells people so.
+
+Being in the group is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. Home only answers while the host's hopchat is running. Settings are kept in `~/.hopchat/<name>/home.json`. That file holds each TV's client key and its pinned certificate: the TV's certificate is self-signed, so hopchat trusts the one it sees at pairing and refuses a different one later.
 
 Devices: Wiz bulbs (local UDP, port 38899) and LG webOS TVs (the WebSocket API on port 3001 over TLS, or 3000 on older sets). The code is in `src/home/`.
 

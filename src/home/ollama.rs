@@ -8,6 +8,29 @@ use serde_json::{json, Value};
 /// How long one model turn may take; a cold 7B load on a laptop is slow.
 const TURN: Duration = Duration::from_secs(120);
 
+/// Whether Ollama answers at `url` and has `model` pulled.
+pub fn check(url: &str, model: &str) -> super::ModelState {
+    use super::ModelState;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .new_agent();
+    let Ok(mut response) = agent.get(format!("{}/api/tags", url.trim_end_matches('/'))).call() else {
+        return ModelState::NoServer;
+    };
+    let Ok(tags) = response.body_mut().read_json::<Value>() else {
+        return ModelState::NoServer;
+    };
+    let wanted = if model.contains(':') { model.to_string() } else { format!("{model}:latest") };
+    let pulled = tags
+        .get("models")
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|m| m.get("name").and_then(Value::as_str) == Some(wanted.as_str()))
+        });
+    if pulled { ModelState::Ready } else { ModelState::Missing }
+}
+
 pub struct Ollama {
     pub url: String,
     pub model: String,
