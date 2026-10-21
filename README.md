@@ -31,7 +31,7 @@ Two terminals on one machine work too. Each name gets its own identity under `~/
 | F1 | help |
 | Ctrl-C / Ctrl-Q | quit |
 
-Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/quit`, for groups `/group`, `/invite`, `/members`, `/leave`, and for devices `/devices`, `/home`.
+Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/quit`, for groups `/group`, `/invite`, `/members`, `/leave`, for devices `/devices`, `/home`, and for the model `/ai`.
 
 ## Groups
 
@@ -67,6 +67,22 @@ Being in the group is the permission: everyone MLS has admitted to a group where
 
 Devices: Wiz bulbs (local UDP, port 38899) and LG webOS TVs (the WebSocket API on port 3001 over TLS, or 3000 on older sets). The code is in `src/home/`.
 
+## One model for the whole group
+
+Only one person in a group needs to run a model. Everyone else can use it.
+
+**Ask it anything.** In a group, the person whose machine runs the model types `/ai on` (or presses `i` in the Devices panel). After that, anyone in the group can mention `@ai`:
+
+```
+@ai what's a good name for a sourdough starter?
+@ai summarise what alice just said
+@ai and in French?
+```
+
+The answer comes back as a 🤖 reply to the question. Each group's recent questions and answers are remembered, so follow-ups work. `/ai forget` clears that memory, and `/ai off` stops answering.
+
+Answers come from the model in step 1 of the setup above (or `/home model NAME`). Like `@home`, being in the group is the permission, and nothing leaves your network.
+
 ## Headless modes
 
 ```
@@ -75,6 +91,8 @@ hopchat --name alice --say "hello" --to bot       # sends one message, prints wh
 hopchat --name alice --file ./notes.pdf --to bot  # sends one file
 hopchat --name alice --group house --home --to bob --say "@home is the light on?"
                                                   # starts a group, invites bob, lets it use the devices
+hopchat --name alice --group quiz --ai --to bob --say "@ai what is 2+2?"
+                                                  # the same, and lets the group ask the model
 ```
 
 Without `--to`, `--say` and `--file` go to the first peer whose secure session comes up.

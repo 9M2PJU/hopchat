@@ -5,7 +5,11 @@
 //! on, goes to a local model with one tool per thing the devices can do;
 //! its answer goes back into the group. Group membership is the
 //! permission: anyone MLS admitted to that group may ask.
+//!
+//! The same model also answers `@ai`, for anything at all, in the groups
+//! the host has switched that on for (see [`ai`]).
 
+pub mod ai;
 mod assistant;
 mod discover;
 mod ollama;
@@ -84,6 +88,9 @@ pub struct Config {
     /// Groups whose members may use the devices.
     #[serde(default)]
     pub groups: Vec<String>,
+    /// Groups whose members may ask the model anything with `@ai`.
+    #[serde(default)]
+    pub ai_groups: Vec<String>,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default = "default_ollama")]
@@ -119,6 +126,7 @@ impl Default for Config {
         Self {
             devices: Vec::new(),
             groups: Vec::new(),
+            ai_groups: Vec::new(),
             model: default_model(),
             ollama: default_ollama(),
             bulb: None,
@@ -203,12 +211,16 @@ pub struct View {
     pub model_state: ModelState,
     /// Groups home is switched on in.
     pub groups: Vec<String>,
+    /// Groups that may ask the model with `@ai`.
+    pub ai_groups: Vec<String>,
 }
 
 /// What the rest of hopchat asks of home.
 pub enum Request {
     /// A group message that mentioned [`MENTION`].
     Ask { group: String, from: String, text: String },
+    /// A group message that mentioned [`ai::MENTION`].
+    Chat(ai::Question),
     /// `/home …` typed in a conversation (`group` when it is one).
     Configure { group: Option<String>, args: String },
     Scan,
@@ -225,14 +237,20 @@ pub enum Request {
     Checked { id: String, state: State, detail: String },
     Paired { id: String, result: Result<(webos::Learned, String), String> },
     ModelChecked(ModelState),
+    Answered { question: ai::Question, asked: serde_json::Value, answer: Result<String, String> },
 }
 
 /// Whether `text` addresses home, and the request with the mention removed.
 pub fn addressed(text: &str) -> Option<String> {
+    mentioned(text, MENTION)
+}
+
+/// Whether `text` mentions `word`, and the text with the mention removed.
+fn mentioned(text: &str, word: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
-    let at = lower.find(MENTION)?;
+    let at = lower.find(word)?;
     // "@homer" is someone else.
-    let end = at + MENTION.len();
+    let end = at + word.len();
     if lower[end..].chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
@@ -253,6 +271,8 @@ pub struct Home {
     live: HashMap<String, (State, String)>,
     scanning: bool,
     model_state: ModelState,
+    /// Each group's recent `@ai` chat, oldest first.
+    memory: HashMap<String, Vec<serde_json::Value>>,
 }
 
 impl Home {
@@ -273,6 +293,7 @@ impl Home {
             live: HashMap::new(),
             scanning: false,
             model_state: ModelState::Unknown,
+            memory: HashMap::new(),
         }
     }
 
@@ -341,13 +362,18 @@ impl Home {
             model: self.config.model.clone(),
             model_state: self.model_state.clone(),
             groups: self.config.groups.clone(),
+            ai_groups: self.config.ai_groups.clone(),
         }
     }
 
     fn say(&self, group: &str, text: String) {
+        self.say_as(group, SIGNATURE, text);
+    }
+
+    fn say_as(&self, group: &str, signature: &str, text: String) {
         let _ = self.engine.send(Input::Ui(Command::SendGroup {
             group: group.to_string(),
-            text: format!("{SIGNATURE}{text}"),
+            text: format!("{signature}{text}"),
             reply: None,
             from_home: true,
         }));
@@ -371,6 +397,8 @@ impl Home {
                     self.say(&group, answer);
                 }
             }
+            Request::Chat(question) => self.ai_ask(question),
+            Request::Answered { question, asked, answer } => self.ai_answered(question, asked, answer),
             Request::Configure { group, args } => {
                 let reply = self.configure(group.as_deref(), &args);
                 self.note(reply);
@@ -687,6 +715,7 @@ impl Home {
         let verb = words.next().unwrap_or("status");
         let value = words.next();
         match (verb, value) {
+            ("ai", verb) => self.ai_configure(group, verb.unwrap_or("status")),
             ("on", _) => {
                 let Some(group) = group else {
                     return "open a group first: /home on lets that group use your devices".into();
@@ -795,6 +824,58 @@ mod tests {
         assert_eq!(addressed("dim it @home").as_deref(), Some("dim it"));
         assert_eq!(addressed("ask @homer"), None);
         assert_eq!(addressed("no mention"), None);
+    }
+
+    /// A home whose messages to the engine can be read.
+    fn wired_home() -> (Home, std::sync::mpsc::Receiver<Input>) {
+        let (engine, from_home) = std::sync::mpsc::channel();
+        let (ui, _) = std::sync::mpsc::channel();
+        let (me, _) = std::sync::mpsc::channel();
+        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        home.config = Config::default();
+        (home, from_home)
+    }
+
+    #[test]
+    fn ai_mentions() {
+        assert_eq!(ai::addressed("@ai what's a monad?").as_deref(), Some("what's a monad?"));
+        assert_eq!(ai::addressed("hey @AI: translate this").as_deref(), Some("hey translate this"));
+        assert_eq!(ai::addressed("said@aim"), None);
+        assert_eq!(ai::addressed("@home lights off"), None);
+    }
+
+    #[test]
+    fn older_settings_have_no_ai_groups() {
+        let config: Config = serde_json::from_value(json!({"groups": ["g"]})).unwrap();
+        assert!(config.ai_groups.is_empty());
+    }
+
+    #[test]
+    fn ai_answers_reply_to_the_question_and_remember() {
+        let (mut home, engine) = wired_home();
+        home.config.ai_groups.push("g".into());
+        for n in 0..20 {
+            let q = ai::Question {
+                group: "g".into(),
+                from: "bob".into(),
+                id: format!("m{n}"),
+                sender: "off1bob".into(),
+                text: format!("question {n}"),
+            };
+            let asked = json!({"role": "user", "content": format!("bob: question {n}")});
+            home.handle(Request::Answered { question: q, asked, answer: Ok(format!("answer {n}")) });
+        }
+        let Ok(Input::Ui(Command::SendGroup { group, text, reply: Some(quote), from_home: true })) = engine.try_recv() else {
+            panic!("expected an answer in the group");
+        };
+        assert_eq!((group.as_str(), text.as_str()), ("g", "🤖 answer 0"));
+        assert_eq!((quote.id.as_str(), quote.sender.as_str()), ("m0", "off1bob"));
+        let memory = &home.memory["g"];
+        assert_eq!(memory.len(), 24, "twelve questions and their answers");
+        assert_eq!(memory.last().unwrap()["content"], "answer 19");
+        // Switched off: no answer, and the memory goes.
+        home.handle(Request::Configure { group: Some("g".into()), args: "ai off".into() });
+        assert!(!home.memory.contains_key("g"));
     }
 
     #[test]

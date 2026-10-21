@@ -190,11 +190,13 @@ pub struct Engine {
     /// Files waiting for a session or a free slot, oldest first.
     outbox: VecDeque<PendingFile>,
     downloads: PathBuf,
-    /// Where group messages that mention `@home` go, when home is running.
+    /// Where group messages that mention `@home` or `@ai` go, when home is
+    /// running.
     home: Option<Sender<home::Request>>,
     /// Beacon nicks, for telling home who is asking.
     nicks: HashMap<String, String>,
     nick: String,
+    address: String,
 }
 
 /// A fresh transfer id: our own, so the UI can track a file from the moment
@@ -256,7 +258,7 @@ pub fn open(
     protocol.start()?;
 
     let me = LocalIdentity {
-        address,
+        address: address.clone(),
         nick: nick.to_string(),
         preamble,
     };
@@ -271,6 +273,7 @@ pub fn open(
             home: None,
             nicks: HashMap::new(),
             nick: nick.to_string(),
+            address,
         },
         me,
         store_key,
@@ -459,33 +462,46 @@ impl Engine {
                     .unwrap_or_else(new_file_id);
                 self.update(Update::GroupQueued {
                     group: group.clone(),
-                    id,
+                    id: id.clone(),
                     text: text.clone(),
                     reply,
                 });
                 if !from_home {
-                    self.to_home(&group, self.nick.clone(), &text);
+                    self.to_home(&group, &self.address, &id, &text);
                 }
             }
             Err(e) => self.error(format!("send failed: {e}")),
         }
     }
 
-    /// Hands a group message that mentions home to it.
-    fn to_home(&self, group: &str, from: String, text: &str) {
-        // Another member's home talking (its "mention @home" hint included)
-        // is not a request.
-        if text.starts_with(home::SIGNATURE) {
+    /// Hands a group message that mentions home, or the model, to home.
+    fn to_home(&self, group: &str, sender: &str, id: &str, text: &str) {
+        // Another member's home or model talking (its "mention @home" hint
+        // included) is not a request.
+        if text.starts_with(home::SIGNATURE) || text.starts_with(home::ai::SIGNATURE) {
             return;
         }
-        if let Some(home) = &self.home
-            && let Some(text) = home::addressed(text)
-        {
+        let Some(home) = &self.home else { return };
+        let from = if sender == self.address {
+            self.nick.clone()
+        } else {
+            self.nicks.get(sender).cloned().unwrap_or_else(|| sender.to_string())
+        };
+        if let Some(text) = home::addressed(text) {
             let _ = home.send(home::Request::Ask {
                 group: group.to_string(),
-                from,
+                from: from.clone(),
                 text,
             });
+        }
+        if let Some(question) = home::ai::addressed(text) {
+            let _ = home.send(home::Request::Chat(home::ai::Question {
+                group: group.to_string(),
+                from,
+                id: id.to_string(),
+                sender: sender.to_string(),
+                text: question,
+            }));
         }
     }
 
@@ -666,8 +682,7 @@ impl Engine {
                 ref reply_to_msg,
                 ..
             } => {
-                let who = self.nicks.get(sender).cloned().unwrap_or_else(|| sender.clone());
-                self.to_home(group_id, who, content);
+                self.to_home(group_id, sender, message_id, content);
                 self.update(Update::GroupIncoming {
                     group: group_id.clone(),
                     from: sender.clone(),

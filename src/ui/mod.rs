@@ -846,6 +846,10 @@ impl App {
                     self.toggle_home_here();
                     self.mode = Mode::Devices(panel);
                 }
+                devices::Action::ToggleAi => {
+                    self.toggle_ai_here();
+                    self.mode = Mode::Devices(panel);
+                }
             },
             Mode::Groups(mut panel) => {
                 let people = self.candidates(&panel);
@@ -1331,6 +1335,13 @@ impl App {
                     args: arg.to_string(),
                 });
             }
+            "ai" => {
+                let group = self.selected.clone().filter(|_| self.in_group());
+                let _ = self.home.send(home::Request::Configure {
+                    group,
+                    args: format!("ai {arg}"),
+                });
+            }
             "log" => self.show_log = !self.show_log,
             "help" | "?" => self.mode = Mode::Help,
             "quit" | "exit" | "q" => self.quit = true,
@@ -1394,6 +1405,26 @@ impl App {
         let convo = self.current().filter(|c| c.data.group && c.online)?;
         let on = self.home_view.groups.contains(&convo.data.address);
         Some((convo.data.address.clone(), convo.data.nick.clone(), on))
+    }
+
+    /// The open group, and whether it may ask the model with `@ai`.
+    pub fn ai_here(&self) -> Option<(String, String, bool)> {
+        let (group, name, _) = self.home_here()?;
+        let on = self.home_view.ai_groups.contains(&group);
+        Some((group, name, on))
+    }
+
+    fn toggle_ai_here(&mut self) {
+        match self.ai_here() {
+            Some((group, _, on)) => {
+                let verb = if on { "off" } else { "on" };
+                let _ = self.home.send(home::Request::Configure {
+                    group: Some(group),
+                    args: format!("ai {verb}"),
+                });
+            }
+            None => self.flash_error("open a group first; i then lets that group ask your model"),
+        }
     }
 
     fn toggle_home_here(&mut self) {
@@ -1710,6 +1741,7 @@ mod render_tests {
             model: "qwen2.5:7b".into(),
             model_state: ModelState::NoServer,
             groups: Vec::new(),
+            ..Default::default()
         };
         app.mode = Mode::Devices(Devices { selected: 1, ..Default::default() });
         let screen = screen(&mut app);
@@ -1717,7 +1749,7 @@ mod render_tests {
         for needle in [
             "Devices", "scanning", "Your devices", "Desk lamp", "on · 100% · focus", "Found on this network",
             "waiting for the TV · 4", "it's asking whether to allow hopchat", "Wiz · colour",
-            "ollama serve", "house", "g lets this group in",
+            "ollama serve", "house", "g lets this group in", "i lets it ask with @ai",
         ] {
             assert!(screen.contains(needle), "missing {needle:?}");
         }

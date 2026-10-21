@@ -21,6 +21,8 @@ pub enum Action {
     Ask(Request),
     /// Switch home on or off for the open group.
     ToggleGroup,
+    /// Switch `@ai` on or off for the open group.
+    ToggleAi,
 }
 
 impl Devices {
@@ -65,6 +67,7 @@ impl Devices {
             KeyCode::End => self.selected = last,
             KeyCode::Char('r') => return Action::Ask(Request::Scan),
             KeyCode::Char('g') => return Action::ToggleGroup,
+            KeyCode::Char('i') => return Action::ToggleAi,
             KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('p') => {
                 if let Some(d) = current {
                     return Action::Ask(match primary(d) {

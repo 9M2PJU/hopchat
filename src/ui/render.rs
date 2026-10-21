@@ -41,6 +41,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/leave", "leave this group"),
     ("/devices", "find, pair and test your smart devices (also Ctrl-D)"),
     ("/home", "/home on|off lets this group use your devices · /home add IP"),
+    ("/ai", "/ai on|off lets this group ask your model anything with @ai · /ai forget"),
     ("/me", "show and copy your own address"),
     ("/clear", "delete this conversation from this device"),
     ("/log", "show or hide the protocol event log"),
@@ -682,6 +683,7 @@ impl App {
                 ("x", "forget"),
                 ("r", "rescan"),
                 ("g", "access"),
+                ("i", "@ai"),
                 ("Esc", "close"),
             ],
             Mode::Normal => &[
@@ -752,7 +754,7 @@ impl App {
         let [list, help, footer] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .areas(inner);
 
@@ -853,7 +855,30 @@ impl App {
         };
         let mut access_line = vec!["  Access  ".fg(MUTED)];
         access_line.extend(access);
-        vec![rule, Line::from(model_line), Line::from(access_line)]
+        let ai = match self.ai_here() {
+            Some((_, name, true)) => vec![
+                "# ".fg(ACCENT),
+                name.bold(),
+                " can ask the model with @ai".fg(OK),
+                "  · i switches off".fg(FAINT),
+            ],
+            Some((_, name, false)) => vec![
+                "# ".fg(FAINT),
+                name.bold(),
+                " can't ask the model".fg(MUTED),
+                "  · i lets it ask with @ai".fg(ACCENT),
+            ],
+            None => {
+                let n = view.ai_groups.len();
+                vec![
+                    format!("on in {n} group{}", if n == 1 { "" } else { "s" }).fg(MUTED),
+                    "  · open a group, then i to let it ask the model".fg(FAINT),
+                ]
+            }
+        };
+        let mut ai_line = vec!["  @ai     ".fg(MUTED)];
+        ai_line.extend(ai);
+        vec![rule, Line::from(model_line), Line::from(access_line), Line::from(ai_line)]
     }
 }
 

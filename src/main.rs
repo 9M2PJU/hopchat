@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::thread;
 
 const USAGE: &str = "usage: hopchat [--name NICK] [--dir PATH] [--downloads PATH]
-               [--echo | --say TEXT | --file PATH] [--to NICK] [--group NAME [--home]]
+               [--echo | --say TEXT | --file PATH] [--to NICK] [--group NAME [--home] [--ai]]
 
   --name NICK       what peers see you as (default: $USER)
   --dir PATH        where your identity and history live (default: ~/.hopchat/NICK)
@@ -26,6 +26,7 @@ const USAGE: &str = "usage: hopchat [--name NICK] [--dir PATH] [--downloads PATH
   --group NAME      no UI: create group NAME, invite peers as they connect
                     (only --to NICK, if given), and --say into the group
   --home            with --group: let the group use this machine's devices
+  --ai              with --group: let the group ask this machine's model with @ai
 
 Run two copies with different names to chat with yourself on one machine.";
 
@@ -39,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut to: Option<String> = None;
     let mut group: Option<String> = None;
     let mut home_on = false;
+    let mut ai_on = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -51,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--to" => to = Some(args.next().ok_or(USAGE)?),
             "--group" => group = Some(args.next().ok_or(USAGE)?),
             "--home" => home_on = true,
+            "--ai" => ai_on = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -116,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             to,
             group,
             home_on,
+            ai_on,
         };
         headless(&me, update_rx, input_tx, home_tx, script);
         return Ok(());
@@ -177,6 +181,7 @@ struct Script {
     to: Option<String>,
     group: Option<String>,
     home_on: bool,
+    ai_on: bool,
 }
 
 /// No TUI: prints what happens. `--echo` answers every message it gets;
@@ -198,6 +203,7 @@ fn headless(
         to,
         group,
         home_on,
+        ai_on,
     } = script;
     use std::collections::{HashMap, HashSet};
 
@@ -328,6 +334,12 @@ fn headless(
                         let _ = home.send(home::Request::Configure {
                             group: Some(id.clone()),
                             args: "on".into(),
+                        });
+                    }
+                    if ai_on {
+                        let _ = home.send(home::Request::Configure {
+                            group: Some(id.clone()),
+                            args: "ai on".into(),
                         });
                     }
                 }
