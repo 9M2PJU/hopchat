@@ -3,8 +3,9 @@
 
 use serde_json::{json, Value};
 
+use super::driver::backend_of;
 use super::ollama::{Ollama, Turn};
-use super::{webos, wiz, Device, Home, Kind};
+use super::Home;
 
 /// Model turns per request: act, maybe act again on what it saw, then say.
 const MAX_TURNS: usize = 4;
@@ -62,27 +63,20 @@ impl Home {
         }
     }
 
-    fn lights(&self) -> Vec<&Device> {
-        self.config.devices.iter().filter(|d| d.kind == Kind::Light).collect()
-    }
-
-    /// TVs that finished pairing; one without a key can't be driven.
-    fn tvs(&self) -> Vec<&Device> {
-        self.config
-            .devices
-            .iter()
-            .filter(|d| d.kind == Kind::Tv && d.key.is_some())
-            .collect()
-    }
-
     pub(super) fn system_prompt(&self) -> String {
-        let mut devices: Vec<String> = self
-            .lights()
+        let lights = self.lights();
+        let tvs = self.tvs();
+        let devices: Vec<String> = lights
             .iter()
-            .map(|d| format!("- light \"{}\" ({})", d.name, d.caps().describe()))
+            .map(|(_, d)| d)
+            .chain(tvs.iter().map(|(_, d)| d))
+            .filter_map(|d| {
+                let backend = backend_of(d)?;
+                Some(format!("- {} \"{}\" ({})", backend.category().word(), d.name, backend.about(d)))
+            })
             .collect();
-        devices.extend(self.tvs().iter().map(|d| format!("- TV \"{}\" (LG webOS)", d.name)));
-        let several = self.lights().len() > 1;
+        let several = lights.len() > 1;
+        let scenes = self.scenes();
         format!(
             "You are home, the assistant for a household's devices, answering in a group chat. \
              The devices are:\n{}\n\
@@ -91,234 +85,38 @@ impl Home {
              state. {}A light that only does white tones cannot show colours; say so instead of \
              trying. After acting, reply with one short, friendly sentence saying what you did. \
              If a request has nothing to do with the devices, say briefly that you only handle \
-             the devices. Light scenes: {}.",
+             the devices.{}",
             devices.join("\n"),
             if several {
                 "When they say \"the lights\" without naming one, use all of them. "
             } else {
                 ""
             },
-            wiz::SCENES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "),
+            if scenes.is_empty() { String::new() } else { format!(" Light scenes: {}.", scenes.join(", ")) },
         )
     }
 
+    /// One set of tools per category that has a device here.
     pub(super) fn tools(&self) -> Value {
-        let tool = |name: &str, description: &str, properties: Value| {
-            json!({"type": "function", "function": {
-                "name": name,
-                "description": description,
-                "parameters": {"type": "object", "properties": properties},
-            }})
-        };
-        let mut tools = Vec::new();
-        let lights = self.lights();
-        if !lights.is_empty() {
-            let mut names: Vec<String> = lights.iter().map(|d| d.name.clone()).collect();
-            names.push("all".into());
-            let mut props = json!({
-                "light": {"type": "string", "enum": names, "description": "which light; all for every one"},
-                "on": {"type": "boolean", "description": "true to switch on, false to switch off"},
-                "brightness": {"type": "integer", "description": "percent, 10 to 100"},
-                "scene": {"type": "string", "description": "one of the light scene names"},
-            });
-            if lights.iter().any(|d| d.caps().white) {
-                props["kelvin"] = json!({"type": "integer", "description": "white temperature, 2200 (warm) to 6500 (cool)"});
-            }
-            if lights.iter().any(|d| d.caps().colour) {
-                props["color"] = json!({"type": "string", "description": "a colour name like red or purple, or #rrggbb"});
-            }
-            tools.push(tool(
-                "light_set",
-                "Change a light. Give only what should change. Setting brightness, temperature, \
-                 colour or a scene also turns it on.",
-                props,
-            ));
-            tools.push(tool(
-                "light_status",
-                "Read what the lights are doing now.",
-                json!({"light": {"type": "string", "description": "which light; omit for all"}}),
-            ));
-        }
-        let tvs = self.tvs();
-        if !tvs.is_empty() {
-            let pick = |mut props: Value| {
-                if tvs.len() > 1 {
-                    let names: Vec<String> = tvs.iter().map(|d| d.name.clone()).collect();
-                    props["tv"] = json!({"type": "string", "enum": names});
-                }
-                props
-            };
-            tools.push(tool("tv_power", "Turn the TV on or off.", pick(json!({"on": {"type": "boolean"}}))));
-            tools.push(tool(
-                "tv_volume",
-                "Set, raise, lower or mute the TV's volume.",
-                pick(json!({
-                    "level": {"type": "integer", "description": "absolute volume, 0 to 100"},
-                    "change": {"type": "integer", "description": "steps up (positive) or down (negative)"},
-                    "mute": {"type": "boolean"},
-                })),
-            ));
-            tools.push(tool(
-                "tv_open_app",
-                "Open an app on the TV, such as Netflix, YouTube, Prime Video, Disney+, Spotify or Live TV.",
-                pick(json!({"app": {"type": "string"}})),
-            ));
-            tools.push(tool(
-                "tv_input",
-                "Switch the TV's input, such as HDMI_1.",
-                pick(json!({"input": {"type": "string"}})),
-            ));
-            tools.push(tool(
-                "tv_media",
-                "Control what is playing.",
-                pick(json!({"action": {"type": "string", "enum": ["play", "pause", "stop", "rewind", "fastForward"]}})),
-            ));
-            tools.push(tool(
-                "tv_message",
-                "Pop up a short message on the TV screen.",
-                pick(json!({"text": {"type": "string"}})),
-            ));
-            tools.push(tool("tv_status", "Read what the TV is showing and its volume.", pick(json!({}))));
-        }
+        let mut tools = self.light_tools();
+        tools.extend(self.tv_tools());
         Value::Array(tools)
     }
 
     pub(super) fn run_tool(&mut self, name: &str, args: &Value) -> Result<String, String> {
         self.note(format!("home: {name} {args}"));
-        match name {
-            "light_set" => {
-                let rgb = match text(args, "color") {
-                    Some(c) => Some(colour(&c).ok_or_else(|| format!("I don't know the colour {c}"))?),
-                    None => None,
-                };
-                let scene = match text(args, "scene") {
-                    Some(s) => Some(wiz::scene_id(&s).ok_or_else(|| format!("no scene called {s}"))?),
-                    None => None,
-                };
-                let pilot = wiz::Pilot {
-                    on: flag(args, "on"),
-                    brightness: number(args, "brightness").map(|b| b.clamp(0.0, 100.0) as u8),
-                    kelvin: number(args, "kelvin").map(|k| k.clamp(0.0, 10000.0) as u16),
-                    rgb,
-                    scene,
-                };
-                let lights = self.pick_lights(text(args, "light").as_deref())?;
-                let results: Vec<String> = lights
-                    .iter()
-                    .map(|d| {
-                        let caps = d.caps();
-                        if pilot.rgb.is_some() && !caps.colour {
-                            return format!("{} only does white tones, not colours", d.name);
-                        }
-                        if pilot.kelvin.is_some() && !caps.white {
-                            return format!("{} only dims; it has no white temperature", d.name);
-                        }
-                        let bulb = wiz::Bulb { ip: d.ip };
-                        match bulb.set(&pilot).and_then(|()| bulb.status()) {
-                            Ok(state) => format!("{} is now {state}", d.name),
-                            Err(e) => format!("{}: {e}", d.name),
-                        }
-                    })
-                    .collect();
-                Ok(results.join("; "))
-            }
-            "light_status" => {
-                let lights = self.pick_lights(text(args, "light").as_deref())?;
-                let results: Vec<String> = lights
-                    .iter()
-                    .map(|d| match (wiz::Bulb { ip: d.ip }).status() {
-                        Ok(state) => format!("{} is {state}", d.name),
-                        Err(e) => format!("{}: {e}", d.name),
-                    })
-                    .collect();
-                Ok(results.join("; "))
-            }
-            "tv_power" => {
-                let id = self.pick_tv(args)?;
-                match flag(args, "on") {
-                    Some(true) => {
-                        if self.tv_do(&id, webos::status).is_ok() {
-                            return Ok("the TV is already on".into());
-                        }
-                        self.tv(&id)?.wake()?;
-                        Ok("sent the TV a wake-up signal".into())
-                    }
-                    Some(false) => self.tv_do(&id, webos::power_off),
-                    None => Err("say whether to turn the TV on or off".into()),
-                }
-            }
-            "tv_volume" => {
-                let id = self.pick_tv(args)?;
-                let level = number(args, "level").map(|l| l.clamp(0.0, 100.0) as u8);
-                let change = number(args, "change").map(|c| c.clamp(-20.0, 20.0) as i8);
-                let mute = flag(args, "mute");
-                self.tv_do(&id, |s| webos::volume(s, level, change, mute))
-            }
-            "tv_open_app" => {
-                let id = self.pick_tv(args)?;
-                let app = text(args, "app").ok_or("which app?")?;
-                self.tv_do(&id, |s| webos::launch(s, &app))
-            }
-            "tv_input" => {
-                let id = self.pick_tv(args)?;
-                let input = text(args, "input").ok_or("which input?")?;
-                self.tv_do(&id, |s| webos::input(s, &input))
-            }
-            "tv_media" => {
-                let id = self.pick_tv(args)?;
-                let action = text(args, "action").ok_or("which action?")?;
-                self.tv_do(&id, |s| webos::media(s, &action))
-            }
-            "tv_message" => {
-                let id = self.pick_tv(args)?;
-                let message = text(args, "text").ok_or("what should it say?")?;
-                self.tv_do(&id, |s| webos::toast(s, &message))
-            }
-            "tv_status" => {
-                let id = self.pick_tv(args)?;
-                self.tv_do(&id, webos::status)
-            }
-            other => Err(format!("there's no tool called {other}")),
-        }
+        self.run_light(name, args)
+            .or_else(|| self.run_tv(name, args))
+            .unwrap_or_else(|| Err(format!("there's no tool called {name}")))
     }
+}
 
-    /// The lights a request names; none named, or "all", means every one.
-    fn pick_lights(&self, name: Option<&str>) -> Result<Vec<Device>, String> {
-        let lights = self.lights();
-        let wanted = name.map(str::to_ascii_lowercase).filter(|n| n != "all" && !n.is_empty());
-        let picked: Vec<Device> = match &wanted {
-            None => lights.into_iter().cloned().collect(),
-            // "Light" is one light, not "Light 2" and "Light 3" too.
-            Some(n) => match lights.iter().find(|d| d.name.eq_ignore_ascii_case(n)) {
-                Some(d) => vec![(*d).clone()],
-                None => lights
-                    .into_iter()
-                    .filter(|d| d.name.to_ascii_lowercase().contains(n.as_str()))
-                    .cloned()
-                    .collect(),
-            },
-        };
-        if picked.is_empty() {
-            return Err(match wanted {
-                Some(n) => format!("there's no light called {n}"),
-                None => "no lights are set up".into(),
-            });
-        }
-        Ok(picked)
-    }
-
-    fn pick_tv(&self, args: &Value) -> Result<String, String> {
-        let tvs = self.tvs();
-        match text(args, "tv").map(|t| t.to_ascii_lowercase()) {
-            Some(n) => tvs
-                .iter()
-                .find(|d| d.name.eq_ignore_ascii_case(&n))
-                .or_else(|| tvs.iter().find(|d| d.name.to_ascii_lowercase().contains(&n)))
-                .map(|d| d.id())
-                .ok_or_else(|| format!("there's no TV called {n}")),
-            None => tvs.into_iter().next().map(Device::id).ok_or_else(|| "no TV is set up".into()),
-        }
-    }
+pub(super) fn tool(name: &str, description: &str, properties: Value) -> Value {
+    json!({"type": "function", "function": {
+        "name": name,
+        "description": description,
+        "parameters": {"type": "object", "properties": properties},
+    }})
 }
 
 // ----- lenient argument reading: small models send "50" as often as 50 ----

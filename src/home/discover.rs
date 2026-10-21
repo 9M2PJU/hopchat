@@ -1,49 +1,33 @@
-//! Finding devices on the local network: Wiz bulbs answer a UDP broadcast;
-//! LG TVs are found by sweeping this machine's /24 for the webOS API port,
-//! since many sets (and many routers) never answer SSDP.
+//! Finding devices on the local network: every backend looks in its own
+//! way, all at once, and this holds what they share.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{webos, wiz, Kind};
+use super::driver::{Found, BACKENDS};
 
-const WIZ_WAIT: Duration = Duration::from_secs(3);
 const PORT_WAIT: Duration = Duration::from_millis(400);
 const SWEEPERS: usize = 64;
 
-/// A device that answered, before anyone has added it.
-pub struct Found {
-    pub kind: Kind,
-    pub ip: Ipv4Addr,
-    pub mac: Option<String>,
-    /// The Wiz module name, for a light.
-    pub module: Option<String>,
-}
-
-/// Every light and TV that answers, reported through `each` as it is found.
+/// Every device any backend finds, reported through `each` as it is found.
 pub fn scan(each: impl Fn(Found) + Send + Clone + 'static) {
-    let lights = {
-        let each = each.clone();
-        thread::spawn(move || {
-            for (ip, mac) in wiz::discover(WIZ_WAIT) {
-                let module = wiz::Bulb { ip }.system().ok().map(|s| s.module);
-                each(Found { kind: Kind::Light, ip, mac, module });
-            }
+    let scans: Vec<_> = BACKENDS
+        .iter()
+        .map(|backend| {
+            let each = each.clone();
+            thread::spawn(move || backend.discover(&each))
         })
-    };
-    for ip in tv_candidates() {
-        if webos::Tv::probe(ip) {
-            let mac = webos::mac_of(ip).map(|m| webos::format_mac(&m));
-            each(Found { kind: Kind::Tv, ip, mac, module: None });
-        }
+        .collect();
+    for scan in scans {
+        let _ = scan.join();
     }
-    let _ = lights.join();
 }
 
-/// Addresses on this machine's /24 with a webOS API port open.
-fn tv_candidates() -> Vec<Ipv4Addr> {
+/// Addresses on this machine's /24 with any of `ports` open, for devices
+/// that answer no broadcast.
+pub fn sweep(ports: &[u16]) -> Vec<Ipv4Addr> {
     let Some(me) = local_ipv4() else { return Vec::new() };
     let [a, b, c, _] = me.octets();
     let hosts: Vec<Ipv4Addr> = (1..=254)
@@ -56,10 +40,11 @@ fn tv_candidates() -> Vec<Ipv4Addr> {
         .chunks(chunk)
         .map(|part| {
             let part = part.to_vec();
+            let ports = ports.to_vec();
             let tx = tx.clone();
             thread::spawn(move || {
                 for ip in part {
-                    let open = [3001u16, 3000].iter().any(|port| {
+                    let open = ports.iter().any(|port| {
                         TcpStream::connect_timeout(&SocketAddr::from((ip, *port)), PORT_WAIT).is_ok()
                     });
                     if open {

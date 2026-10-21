@@ -15,6 +15,11 @@ use sha2::{Digest, Sha256};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+use super::discover;
+use super::driver::{Backend, Category, Found, PairHelp};
+use super::tv::TvDriver;
+use super::{Device, State};
+
 const TLS_PORT: u16 = 3001;
 const PLAIN_PORT: u16 = 3000;
 const CONNECT: Duration = Duration::from_secs(3);
@@ -269,6 +274,181 @@ impl Tv {
             socket.send_to(&packet, (Ipv4Addr::BROADCAST, port)).map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+}
+
+/// LG webOS TVs, as a home backend. A paired TV keeps its client key, the
+/// certificate it pinned and its model in [`Device::data`].
+pub struct WebOs;
+
+const PAIR_HELP: PairHelp = PairHelp {
+    before: [
+        " pairs it. The TV will ask to allow hopchat; have the remote ready.",
+        "For \"turn the TV on\" to work, enable Turn on via Wi-Fi in its settings.",
+    ],
+    during: [
+        "Look at the TV: it's asking whether to allow hopchat.",
+        "Choose Allow with the remote. Nothing to do here.",
+    ],
+};
+
+fn field<'a>(d: &'a Device, key: &str) -> Option<&'a str> {
+    d.data.get(key).and_then(Value::as_str)
+}
+
+fn set_field(d: &mut Device, key: &str, value: String) {
+    if !d.data.is_object() {
+        d.data = json!({});
+    }
+    d.data[key] = json!(value);
+}
+
+fn tv_of(d: &Device) -> Tv {
+    Tv {
+        ip: d.ip,
+        mac: d.mac.as_deref().and_then(parse_mac),
+        client_key: field(d, "key").map(str::to_string),
+        cert: field(d, "cert").map(str::to_string),
+    }
+}
+
+/// Runs `f` against the TV, keeping the key and certificate it paired
+/// with.
+fn session<T>(d: &mut Device, f: impl FnOnce(&mut Session) -> Result<T, String>) -> Result<T, String> {
+    let (result, learned) = tv_of(d).with(f);
+    if let Some(cert) = learned.cert
+        && field(d, "cert").is_none()
+    {
+        set_field(d, "cert", cert);
+    }
+    if let Some(key) = learned.client_key {
+        set_field(d, "key", key);
+    }
+    result
+}
+
+impl Backend for WebOs {
+    fn id(&self) -> &'static str {
+        "webos"
+    }
+
+    fn category(&self) -> Category {
+        Category::Tv
+    }
+
+    fn label(&self) -> &'static str {
+        "LG TVs"
+    }
+
+    // Swept for by port: many sets (and many routers) never answer SSDP.
+    fn discover(&self, each: &dyn Fn(Found)) {
+        for ip in discover::sweep(&[TLS_PORT, PLAIN_PORT]) {
+            if let Some(found) = self.probe(ip) {
+                each(found);
+            }
+        }
+    }
+
+    fn probe(&self, ip: Ipv4Addr) -> Option<Found> {
+        Tv::probe(ip).then(|| Found {
+            backend: "webos",
+            ip,
+            mac: mac_of(ip).map(|m| format_mac(&m)),
+            data: Value::Null,
+        })
+    }
+
+    fn about(&self, _d: &Device) -> String {
+        "LG webOS".into()
+    }
+
+    fn found_detail(&self, _d: &Device) -> String {
+        "LG webOS TV".into()
+    }
+
+    fn check(&self, d: &Device) -> (State, String) {
+        if tv_of(d).reachable() {
+            (State::Ready, field(d, "model").unwrap_or("on").to_string())
+        } else {
+            (State::Offline, "off or in standby".into())
+        }
+    }
+
+    fn test(&self, d: &mut Device) -> Result<String, String> {
+        session(d, |s| toast(s, "👋 hello from hopchat")).map(|_| format!("{} shows a hello", d.name))
+    }
+
+    fn test_help(&self) -> &'static str {
+        " puts a hello on the screen"
+    }
+
+    fn pairing(&self) -> Option<&'static PairHelp> {
+        Some(&PAIR_HELP)
+    }
+
+    fn pair(&self, d: &mut Device) -> Result<String, String> {
+        // A fresh pairing: whatever key and certificate it had are stale.
+        let mut fresh = Device { data: Value::Null, ..d.clone() };
+        let model = session(&mut fresh, |s| {
+            let model = model_name(s).unwrap_or_else(|_| "LG TV".into());
+            let _ = toast(s, "hopchat is connected 👋");
+            Ok(model)
+        })?;
+        for key in ["key", "cert"] {
+            if let Some(value) = field(&fresh, key).map(str::to_string) {
+                set_field(d, key, value);
+            }
+        }
+        set_field(d, "model", model.clone());
+        if d.mac.is_none() {
+            d.mac = mac_of(d.ip).map(|m| format_mac(&m));
+        }
+        Ok(model)
+    }
+
+    fn ready(&self, d: &Device) -> bool {
+        field(d, "key").is_some()
+    }
+
+    fn as_tv(&self) -> Option<&dyn TvDriver> {
+        Some(self)
+    }
+}
+
+impl TvDriver for WebOs {
+    fn power(&self, d: &mut Device, on: bool) -> Result<String, String> {
+        if !on {
+            return session(d, power_off);
+        }
+        if session(d, status).is_ok() {
+            return Ok("the TV is already on".into());
+        }
+        tv_of(d).wake()?;
+        Ok("sent the TV a wake-up signal".into())
+    }
+
+    fn volume(&self, d: &mut Device, level: Option<u8>, change: Option<i8>, mute: Option<bool>) -> Result<String, String> {
+        session(d, |s| volume(s, level, change, mute))
+    }
+
+    fn status(&self, d: &mut Device) -> Result<String, String> {
+        session(d, status)
+    }
+
+    fn open_app(&self, d: &mut Device, app: &str) -> Result<String, String> {
+        session(d, |s| launch(s, app))
+    }
+
+    fn input(&self, d: &mut Device, wanted: &str) -> Result<String, String> {
+        session(d, |s| input(s, wanted))
+    }
+
+    fn media(&self, d: &mut Device, action: &str) -> Result<String, String> {
+        session(d, |s| media(s, action))
+    }
+
+    fn message(&self, d: &mut Device, text: &str) -> Result<String, String> {
+        session(d, |s| toast(s, text))
     }
 }
 

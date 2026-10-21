@@ -1220,7 +1220,8 @@ impl App {
         if view.devices.is_empty() {
             lines.push(Line::from(""));
             if view.scanning {
-                lines.push(Line::from(format!("  {} Looking for Wiz lights and LG TVs on this network…", spinner()).fg(theme::muted())));
+                let wanted: Vec<&str> = home::driver::BACKENDS.iter().map(|b| b.label()).collect();
+                lines.push(Line::from(format!("  {} Looking for {} on this network…", spinner(), and_list(&wanted)).fg(theme::muted())));
             } else {
                 lines.push(Line::from("  Nothing found.".fg(theme::muted())));
                 lines.push(Line::from(""));
@@ -1231,7 +1232,7 @@ impl App {
             lines.push(Line::from(""));
             lines.push(Line::from(format!("  {} looking for more…", spinner()).fg(theme::faint())));
         }
-        if !view.scanning && !view.devices.iter().any(|d| d.kind == home::Kind::Tv) {
+        if !view.scanning && !view.devices.iter().any(|d| d.category == home::Category::Tv) {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 "  📺 No TV? ".fg(theme::muted()),
@@ -1719,10 +1720,7 @@ fn candidate_line(person: &Candidate, panel: &GroupPanel, selected: bool, width:
 }
 
 fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) -> Line<'static> {
-    let icon = match d.kind {
-        home::Kind::Light => "💡",
-        home::Kind::Tv => "📺",
-    };
+    let icon = d.category.icon();
     let (dot, state) = match &d.state {
         State::Ready => ("●".fg(ok()), d.detail.clone().fg(theme::text())),
         State::Offline => ("○".fg(theme::faint()), d.detail.clone().fg(theme::muted())),
@@ -1730,7 +1728,7 @@ fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) ->
         State::New => ("✦".fg(accent()), d.detail.clone().fg(theme::muted())),
         State::Pairing { until } => {
             let left = until.saturating_duration_since(std::time::Instant::now()).as_secs();
-            (spinner().fg(warn()), format!("waiting for the TV · {left}s").fg(warn()))
+            (spinner().fg(warn()), format!("waiting for the {} · {left}s", d.category.word()).fg(warn()))
         }
         State::Failed(_) => ("✗".fg(err()), "didn't work".fg(err())),
     };
@@ -1759,6 +1757,15 @@ fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) ->
     if selected { line.style(Style::new().bg(selected_bg())) } else { line }
 }
 
+/// "a", "a and b", "a, b and c".
+fn and_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// Two lines under the list saying what the selected device needs.
 fn device_help(d: Option<&DeviceView>, panel: &Devices, width: usize) -> Vec<Line<'static>> {
     let key = |k: &str| k.to_string().fg(key_color()).bold();
@@ -1770,38 +1777,35 @@ fn device_help(d: Option<&DeviceView>, panel: &Devices, width: usize) -> Vec<Lin
     if panel.confirm_forget {
         return vec![Line::from(""), Line::from(vec!["  ".into(), format!("Forget {}? ", clip(&d.name, NAME_ROOM)).fg(warn()), key("x"), say(" again to forget, anything else keeps it.")])];
     }
-    let lines = match (&d.state, devices::primary(d)) {
-        (State::Pairing { .. }, _) => vec![
-            Line::from(vec!["  ".into(), "Look at the TV: it's asking whether to allow hopchat.".fg(warn()).bold()]),
-            Line::from(vec!["  ".into(), say("Choose "), "Allow".bold(), say(" with the remote. Nothing to do here.")]),
+    let lines = match (&d.state, devices::primary(d), d.pairing) {
+        (State::Pairing { .. }, _, Some(help)) => vec![
+            Line::from(vec!["  ".into(), help.during[0].fg(warn()).bold()]),
+            Line::from(vec!["  ".into(), say(help.during[1])]),
         ],
-        (State::Failed(why), _) => vec![
+        (State::Failed(why), _, _) => vec![
             Line::from(vec!["  ".into(), clip(why, width.saturating_sub(4)).fg(err())]),
             Line::from(vec!["  ".into(), key("Enter"), say(" tries again")]),
         ],
-        (_, Primary::Pair) => vec![
-            Line::from(vec!["  ".into(), key("Enter"), say(" pairs it. The TV will ask to allow hopchat; have the remote ready.")]),
-            Line::from(vec!["  ".into(), say("For \"turn the TV on\" to work, enable "), "Turn on via Wi-Fi".bold(), say(" in its settings.")]),
+        (_, Primary::Pair, Some(help)) => vec![
+            Line::from(vec!["  ".into(), key("Enter"), say(help.before[0])]),
+            Line::from(vec!["  ".into(), say(help.before[1])]),
         ],
-        (_, Primary::Add) => vec![
+        (_, Primary::Add, _) => vec![
             Line::from(vec!["  ".into(), key("Enter"), say(" adds it. "), key("n"), say(" names it first, e.g. Kitchen.")]),
-            Line::from(vec!["  ".into(), say("Not sure which light this is? Add it, then "), key("t"), say(" blinks it.")]),
+            Line::from(vec!["  ".into(), say(&format!("Not sure which {} this is? Add it, then ", d.category.word())), key("t"), say(&format!("{}.", d.test_help))]),
         ],
-        (State::Offline, _) => vec![
+        (State::Offline, _, _) => vec![
             Line::from(vec!["  ".into(), say("Not answering. Is it switched on, and on this network?")]),
             Line::from(vec!["  ".into(), key("r"), say(" checks again · "), key("x"), say(" forgets it")]),
         ],
         _ => {
-            let test = match d.kind {
-                home::Kind::Light => " blinks it so you can find it",
-                home::Kind::Tv => " puts a hello on the screen",
-            };
             vec![
-                Line::from(vec!["  ".into(), key("Enter"), say(test), say(" · "), key("n"), say(" renames · "), key("x"), say(" forgets")]),
-                Line::from(vec!["  ".into(), say("In a group, people ask for it by name: "), match d.kind {
-                    home::Kind::Light => format!("@home dim the {}", clip(&d.name.to_lowercase(), NAME_ROOM)),
-                    home::Kind::Tv => format!("@home put netflix on the {}", clip(&d.name.to_lowercase(), NAME_ROOM)),
-                }.fg(theirs())]),
+                Line::from(vec!["  ".into(), key("Enter"), say(d.test_help), say(" · "), key("n"), say(" renames · "), key("x"), say(" forgets")]),
+                Line::from(vec![
+                    "  ".into(),
+                    say("In a group, people ask for it by name: "),
+                    format!("@home {}", d.category.example(&clip(&d.name.to_lowercase(), NAME_ROOM))).fg(theirs()),
+                ]),
             ]
         }
     };
@@ -2077,7 +2081,7 @@ fn me_hint(view: &home::View) -> Vec<Line<'static>> {
     ];
     let names: Vec<&str> = view.devices.iter().filter(|d| d.added).map(|d| d.name.as_str()).collect();
     let example = match view.devices.iter().find(|d| d.added) {
-        Some(d) if d.kind == home::Kind::Tv => format!(" turn the {} down a bit", d.name.to_lowercase()),
+        Some(d) if d.category == home::Category::Tv => format!(" turn the {} down a bit", d.name.to_lowercase()),
         Some(d) => format!(" dim the {} to 30%", d.name.to_lowercase()),
         None => " turn the lights down".to_string(),
     };

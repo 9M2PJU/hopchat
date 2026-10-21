@@ -3,7 +3,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::home::{self, DeviceView, Request, State, View};
+use crate::home::{DeviceView, Request, State, View};
 
 #[derive(Default)]
 pub struct Devices {
@@ -112,10 +112,10 @@ pub enum Primary {
 }
 
 pub fn primary(d: &DeviceView) -> Primary {
-    match (&d.state, d.kind, d.added) {
+    match (&d.state, d.pairing.is_some(), d.added) {
         (State::Pairing { .. }, _, _) => Primary::Wait,
         (State::Failed(_), _, false) => Primary::Retry,
-        (State::New, home::Kind::Tv, _) => Primary::Pair,
+        (State::New, true, _) => Primary::Pair,
         (_, _, false) => Primary::Add,
         _ => Primary::Test,
     }
@@ -126,10 +126,13 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    fn device(added: bool, kind: home::Kind, state: State) -> DeviceView {
+    fn device(added: bool, backend: &str, state: State) -> DeviceView {
+        let backend = crate::home::driver::backend(backend).unwrap();
         DeviceView {
             id: "id".into(),
-            kind,
+            category: backend.category(),
+            pairing: backend.pairing(),
+            test_help: backend.test_help(),
             name: "Light".into(),
             ip: [10, 0, 0, 1].into(),
             added,
@@ -140,19 +143,19 @@ mod tests {
 
     #[test]
     fn enter_does_the_next_sensible_thing() {
-        use home::Kind::{Light, Tv};
-        assert_eq!(primary(&device(false, Light, State::New)), Primary::Add);
-        assert_eq!(primary(&device(false, Tv, State::New)), Primary::Pair);
+        let (light, tv) = ("wiz", "webos");
+        assert_eq!(primary(&device(false, light, State::New)), Primary::Add);
+        assert_eq!(primary(&device(false, tv, State::New)), Primary::Pair);
         // An added TV whose pairing never finished pairs again.
-        assert_eq!(primary(&device(true, Tv, State::New)), Primary::Pair);
-        assert_eq!(primary(&device(false, Tv, State::Failed("no".into()))), Primary::Retry);
-        assert_eq!(primary(&device(true, Tv, State::Pairing { until: Instant::now() })), Primary::Wait);
-        assert_eq!(primary(&device(true, Light, State::Ready)), Primary::Test);
+        assert_eq!(primary(&device(true, tv, State::New)), Primary::Pair);
+        assert_eq!(primary(&device(false, tv, State::Failed("no".into()))), Primary::Retry);
+        assert_eq!(primary(&device(true, tv, State::Pairing { until: Instant::now() })), Primary::Wait);
+        assert_eq!(primary(&device(true, light, State::Ready)), Primary::Test);
     }
 
     #[test]
     fn forgetting_takes_two_presses() {
-        let view = View { devices: vec![device(true, home::Kind::Light, State::Ready)], ..Default::default() };
+        let view = View { devices: vec![device(true, "wiz", State::Ready)], ..Default::default() };
         let mut panel = Devices::default();
         let x = KeyEvent::from(KeyCode::Char('x'));
         assert!(matches!(panel.key(x, &view), Action::Stay));
@@ -166,7 +169,7 @@ mod tests {
 
     #[test]
     fn renaming_edits_then_saves() {
-        let view = View { devices: vec![device(true, home::Kind::Light, State::Ready)], ..Default::default() };
+        let view = View { devices: vec![device(true, "wiz", State::Ready)], ..Default::default() };
         let mut panel = Devices::default();
         panel.key(KeyEvent::from(KeyCode::Char('n')), &view);
         assert_eq!(panel.renaming.as_deref(), Some("Light"));

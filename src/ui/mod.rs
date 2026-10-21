@@ -2142,7 +2142,7 @@ mod render_tests {
 
     #[test]
     fn renders_the_devices_panel() {
-        use crate::home::{DeviceView, Kind, ModelState, State, View};
+        use crate::home::{driver, DeviceView, ModelState, State, View};
         let mut app = test_app();
         let send = |_: Command| {};
         app.apply(
@@ -2150,9 +2150,11 @@ mod render_tests {
             &send,
         );
         app.selected = Some("g1".into());
-        let device = |name: &str, kind, ip: [u8; 4], added, state, detail: &str| DeviceView {
+        let device = |name: &str, backend, ip: [u8; 4], added, state, detail: &str| DeviceView {
             id: name.into(),
-            kind,
+            category: driver::backend(backend).unwrap().category(),
+            pairing: driver::backend(backend).unwrap().pairing(),
+            test_help: driver::backend(backend).unwrap().test_help(),
             name: name.into(),
             ip: ip.into(),
             added,
@@ -2161,9 +2163,9 @@ mod render_tests {
         };
         app.home_view = View {
             devices: vec![
-                device("Desk lamp", Kind::Light, [192, 168, 1, 10], true, State::Ready, "on · 100% · focus"),
-                device("TV", Kind::Tv, [192, 168, 1, 30], false, State::Pairing { until: Instant::now() + Duration::from_secs(48) }, ""),
-                device("Light 2", Kind::Light, [192, 168, 1, 11], false, State::New, "Wiz · colour"),
+                device("Desk lamp", "wiz", [192, 168, 1, 10], true, State::Ready, "on · 100% · focus"),
+                device("TV", "webos", [192, 168, 1, 30], false, State::Pairing { until: Instant::now() + Duration::from_secs(48) }, ""),
+                device("Light 2", "wiz", [192, 168, 1, 11], false, State::New, "Wiz · colour"),
             ],
             scanning: true,
             model: "qwen2.5:7b".into(),

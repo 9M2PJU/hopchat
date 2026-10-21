@@ -5,47 +5,126 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use super::driver::{Backend, Category, Found};
+use super::light::{scene_key, Caps, LightDriver, Pilot};
+use super::{Device, State};
+
 const PORT: u16 = 38899;
 const WAIT: Duration = Duration::from_millis(1500);
+/// How long a scan listens for bulbs answering its broadcast.
+const DISCOVER: Duration = Duration::from_secs(3);
 
-/// What a bulb should change to; anything left `None` stays as it is.
-#[derive(Default, Debug, PartialEq)]
-pub struct Pilot {
-    pub on: Option<bool>,
-    /// 10–100 %.
-    pub brightness: Option<u8>,
-    /// 2200–6500 K.
-    pub kelvin: Option<u16>,
-    pub rgb: Option<(u8, u8, u8)>,
-    pub scene: Option<u8>,
+/// Wiz lights, as a home backend.
+pub struct Wiz;
+
+/// The module name a bulb reported, kept in [`Device::data`].
+fn module(d: &Device) -> &str {
+    d.data.get("module").and_then(Value::as_str).unwrap_or_default()
 }
 
-impl Pilot {
-    /// The `setPilot` params, clamped to what the bulb accepts. Colour wins
-    /// over white temperature, which wins over a scene: the bulb holds one.
-    fn params(&self) -> Value {
-        let mut p = serde_json::Map::new();
-        if let Some(on) = self.on {
-            p.insert("state".into(), json!(on));
-        }
-        if let Some(b) = self.brightness {
-            p.insert("dimming".into(), json!(b.clamp(10, 100)));
-        }
-        if let Some((r, g, b)) = self.rgb {
-            p.insert("r".into(), json!(r));
-            p.insert("g".into(), json!(g));
-            p.insert("b".into(), json!(b));
-        } else if let Some(k) = self.kelvin {
-            p.insert("temp".into(), json!(k.clamp(2200, 6500)));
-        } else if let Some(scene) = self.scene {
-            p.insert("sceneId".into(), json!(scene.clamp(1, 32)));
-        }
-        // Changing anything but power implies the light should be on.
-        if !p.is_empty() && !p.contains_key("state") {
-            p.insert("state".into(), json!(true));
-        }
-        Value::Object(p)
+fn found(ip: Ipv4Addr, mac: Option<String>, module: Option<String>) -> Found {
+    let data = module.map(|m| json!({"module": m})).unwrap_or(Value::Null);
+    Found { backend: "wiz", ip, mac, data }
+}
+
+impl Backend for Wiz {
+    fn id(&self) -> &'static str {
+        "wiz"
     }
+
+    fn category(&self) -> Category {
+        Category::Light
+    }
+
+    fn label(&self) -> &'static str {
+        "Wiz lights"
+    }
+
+    fn discover(&self, each: &dyn Fn(Found)) {
+        for (ip, mac) in discover(DISCOVER) {
+            let module = (Bulb { ip }).system().ok().map(|s| s.module);
+            each(found(ip, mac, module));
+        }
+    }
+
+    fn probe(&self, ip: Ipv4Addr) -> Option<Found> {
+        let system = (Bulb { ip }).system().ok()?;
+        let mac = Some(system.mac).filter(|m| !m.is_empty());
+        Some(found(ip, mac, Some(system.module)))
+    }
+
+    fn about(&self, d: &Device) -> String {
+        caps_of(module(d)).describe().into()
+    }
+
+    fn found_detail(&self, d: &Device) -> String {
+        format!("Wiz · {}", self.about(d))
+    }
+
+    fn check(&self, d: &Device) -> (State, String) {
+        match (Bulb { ip: d.ip }).status() {
+            Ok(status) => (State::Ready, status),
+            Err(_) => (State::Offline, "not answering".into()),
+        }
+    }
+
+    fn test(&self, d: &mut Device) -> Result<String, String> {
+        (Bulb { ip: d.ip }).blink().map(|()| format!("{} blinked", d.name))
+    }
+
+    fn test_help(&self) -> &'static str {
+        " blinks it so you can find it"
+    }
+
+    fn as_light(&self) -> Option<&dyn LightDriver> {
+        Some(self)
+    }
+}
+
+impl LightDriver for Wiz {
+    fn caps(&self, d: &Device) -> Caps {
+        caps_of(module(d))
+    }
+
+    fn scenes(&self) -> &'static [&'static str] {
+        SCENE_NAMES
+    }
+
+    fn set(&self, d: &Device, pilot: &Pilot) -> Result<(), String> {
+        (Bulb { ip: d.ip }).set(pilot)
+    }
+
+    fn status(&self, d: &Device) -> Result<String, String> {
+        (Bulb { ip: d.ip }).status()
+    }
+}
+
+/// The `setPilot` params for `pilot`, clamped to what the bulb accepts.
+/// Colour wins over white temperature, which wins over a scene: the bulb
+/// holds one.
+fn params(pilot: &Pilot) -> Result<Value, String> {
+    let mut p = serde_json::Map::new();
+    if let Some(on) = pilot.on {
+        p.insert("state".into(), json!(on));
+    }
+    if let Some(b) = pilot.brightness {
+        p.insert("dimming".into(), json!(b.clamp(10, 100)));
+    }
+    if let Some((r, g, b)) = pilot.rgb {
+        p.insert("r".into(), json!(r));
+        p.insert("g".into(), json!(g));
+        p.insert("b".into(), json!(b));
+    } else if let Some(k) = pilot.kelvin {
+        p.insert("temp".into(), json!(k.clamp(2200, 6500)));
+    } else if let Some(scene) = &pilot.scene {
+        let id = scene_id(scene).ok_or_else(|| format!("no scene called {scene}"))?;
+        p.insert("sceneId".into(), json!(id));
+    }
+    // Changing anything but power implies the light should be on.
+    if !p.is_empty() && !p.contains_key("state") {
+        p.insert("state".into(), json!(true));
+    }
+    Ok(Value::Object(p))
 }
 
 /// Wiz's built-in scenes, by the names people say.
@@ -60,8 +139,19 @@ pub const SCENES: &[(&str, u8)] = &[
     ("pulse", 31), ("steampunk", 32),
 ];
 
+/// The scene names alone, for [`LightDriver::scenes`].
+const SCENE_NAMES: &[&str] = &{
+    let mut names = [""; SCENES.len()];
+    let mut i = 0;
+    while i < SCENES.len() {
+        names[i] = SCENES[i].0;
+        i += 1;
+    }
+    names
+};
+
 pub fn scene_id(name: &str) -> Option<u8> {
-    let name = name.trim().to_ascii_lowercase().replace(['_', '-'], " ");
+    let name = scene_key(name);
     SCENES.iter().find(|(n, _)| *n == name).map(|(_, id)| *id)
 }
 
@@ -71,33 +161,17 @@ fn scene_name(id: u64) -> Option<&'static str> {
 
 /// What a bulb can show, from the module name it reports: `SHRGB` bulbs do
 /// colour and white tones, `SHTW` white tones, `SHDW` brightness only.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub struct Caps {
-    pub colour: bool,
-    pub white: bool,
-}
-
-impl Caps {
-    pub fn of(module: &str) -> Self {
-        let m = module.to_ascii_uppercase();
-        if m.contains("RGB") {
-            Self { colour: true, white: true }
-        } else if m.contains("TW") {
-            Self { colour: false, white: true }
-        } else if m.contains("DW") {
-            Self::default()
-        } else {
-            // Unknown module: let it try everything rather than refuse.
-            Self { colour: true, white: true }
-        }
-    }
-
-    pub fn describe(&self) -> &'static str {
-        match (self.colour, self.white) {
-            (true, _) => "colour",
-            (false, true) => "white tones",
-            (false, false) => "dimmable",
-        }
+pub fn caps_of(module: &str) -> Caps {
+    let m = module.to_ascii_uppercase();
+    if m.contains("RGB") {
+        Caps { colour: true, white: true }
+    } else if m.contains("TW") {
+        Caps { colour: false, white: true }
+    } else if m.contains("DW") {
+        Caps::default()
+    } else {
+        // Unknown module: let it try everything rather than refuse.
+        Caps { colour: true, white: true }
     }
 }
 
@@ -113,7 +187,7 @@ pub struct Bulb {
 
 impl Bulb {
     pub fn set(&self, pilot: &Pilot) -> Result<(), String> {
-        let params = pilot.params();
+        let params = params(pilot)?;
         if params.as_object().is_none_or(|p| p.is_empty()) {
             return Err("nothing to change".into());
         }
@@ -268,18 +342,21 @@ mod tests {
     #[test]
     fn pilot_is_clamped_and_implies_on() {
         let p = Pilot { brightness: Some(3), kelvin: Some(9000), ..Default::default() };
-        assert_eq!(p.params(), json!({"dimming": 10, "temp": 6500, "state": true}));
+        assert_eq!(params(&p), Ok(json!({"dimming": 10, "temp": 6500, "state": true})));
         let off = Pilot { on: Some(false), ..Default::default() };
-        assert_eq!(off.params(), json!({"state": false}));
+        assert_eq!(params(&off), Ok(json!({"state": false})));
         let both = Pilot { rgb: Some((255, 0, 0)), kelvin: Some(2700), ..Default::default() };
-        assert_eq!(both.params(), json!({"r": 255, "g": 0, "b": 0, "state": true}));
+        assert_eq!(params(&both), Ok(json!({"r": 255, "g": 0, "b": 0, "state": true})));
+        let scene = Pilot { scene: Some("Night-Light".into()), ..Default::default() };
+        assert_eq!(params(&scene), Ok(json!({"sceneId": 14, "state": true})));
+        assert!(params(&Pilot { scene: Some("disco".into()), ..Default::default() }).is_err());
     }
 
     #[test]
     fn capabilities_from_module_names() {
-        assert_eq!(Caps::of("ESP01_SHTW1C_31"), Caps { colour: false, white: true });
-        assert_eq!(Caps::of("ESP01_SHRGB1C_31"), Caps { colour: true, white: true });
-        assert_eq!(Caps::of("ESP06_SHDW9_01"), Caps { colour: false, white: false });
+        assert_eq!(caps_of("ESP01_SHTW1C_31"), Caps { colour: false, white: true });
+        assert_eq!(caps_of("ESP01_SHRGB1C_31"), Caps { colour: true, white: true });
+        assert_eq!(caps_of("ESP06_SHDW9_01"), Caps { colour: false, white: false });
     }
 
     #[test]

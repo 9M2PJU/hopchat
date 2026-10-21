@@ -19,7 +19,10 @@ pub mod ai;
 mod assistant;
 pub mod lend;
 mod discover;
+pub mod driver;
+mod light;
 mod ollama;
+mod tv;
 pub mod webos;
 pub mod wiz;
 
@@ -33,10 +36,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::engine::{Command, Input, Update};
 use crate::lobby::LOBBY;
 use crate::me::ME;
+pub use driver::Category;
+use driver::{backend_of, PairHelp, BACKENDS};
 
 /// The word that addresses the devices in a group.
 pub const MENTION: &str = "@home";
@@ -44,7 +50,8 @@ pub const MENTION: &str = "@home";
 pub const SIGNATURE: &str = "🏠 ";
 const MAX_REQUEST_CHARS: usize = 500;
 const MAX_NAME_CHARS: usize = 32;
-/// How long the TV shows its "allow this device?" prompt.
+/// How long a device waits for someone to allow pairing, as a TV shows its
+/// "allow this device?" prompt.
 const PAIRING: Duration = Duration::from_secs(60);
 /// How often to look again at whether the model is ready, so one started
 /// later is used and offered.
@@ -52,48 +59,64 @@ const MODEL_CHECK: Duration = Duration::from_secs(30);
 /// Turns lent out at once; the rest are turned away.
 const MAX_LENDING: usize = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    Light,
-    Tv,
-}
-
 /// A device someone added.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Device {
-    pub kind: Kind,
+    /// The [`Backend::id`] of what drives it. Earlier versions called this
+    /// `kind`, and said "light" or "tv".
+    #[serde(alias = "kind")]
+    pub backend: String,
     pub name: String,
     pub ip: Ipv4Addr,
     /// What identifies it when DHCP hands it a new address.
     #[serde(default)]
     pub mac: Option<String>,
-    /// The Wiz module name, or the TV's model.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// The TV's client key, issued when it paired.
-    #[serde(default)]
-    pub key: Option<String>,
-    /// The TV certificate pinned when it paired.
-    #[serde(default)]
-    pub cert: Option<String>,
+    /// Whatever its backend keeps about it: a Wiz module name, a TV's
+    /// client key and pinned certificate.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub data: Value,
+    // What earlier versions kept beside the rest, folded into `data` when
+    // read.
+    #[serde(default, skip_serializing)]
+    model: Option<String>,
+    #[serde(default, skip_serializing)]
+    key: Option<String>,
+    #[serde(default, skip_serializing)]
+    cert: Option<String>,
 }
 
 impl Device {
+    pub fn new(backend: &str, name: String, ip: Ipv4Addr, mac: Option<String>, data: Value) -> Self {
+        Self { backend: backend.into(), name, ip, mac, data, model: None, key: None, cert: None }
+    }
+
     pub fn id(&self) -> String {
         self.mac.clone().unwrap_or_else(|| self.ip.to_string())
     }
 
-    fn caps(&self) -> wiz::Caps {
-        wiz::Caps::of(self.model.as_deref().unwrap_or_default())
-    }
-
-    fn same(&self, kind: Kind, ip: Ipv4Addr, mac: Option<&str>) -> bool {
-        self.kind == kind
+    fn same(&self, backend: &str, ip: Ipv4Addr, mac: Option<&str>) -> bool {
+        self.backend == backend
             && match (self.mac.as_deref(), mac) {
                 (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
                 _ => self.ip == ip,
             }
+    }
+
+    fn migrate(&mut self) {
+        match self.backend.as_str() {
+            "light" => self.backend = "wiz".into(),
+            "tv" => self.backend = "webos".into(),
+            _ => {}
+        }
+        let model = if self.backend == "wiz" { "module" } else { "model" };
+        for (field, value) in [(model, self.model.take()), ("key", self.key.take()), ("cert", self.cert.take())] {
+            if let Some(value) = value {
+                if !self.data.is_object() {
+                    self.data = json!({});
+                }
+                self.data[field] = json!(value);
+            }
+        }
     }
 }
 
@@ -181,26 +204,16 @@ impl Default for Config {
 impl Config {
     fn migrate(&mut self) {
         if let Some(ip) = self.bulb.take() {
-            self.devices.push(Device {
-                kind: Kind::Light,
-                name: "Light".into(),
-                ip,
-                mac: None,
-                model: None,
-                key: None,
-                cert: None,
-            });
+            self.devices.push(Device::new("wiz", "Light".into(), ip, None, Value::Null));
         }
         if let Some(ip) = self.tv.take() {
-            self.devices.push(Device {
-                kind: Kind::Tv,
-                name: "TV".into(),
-                ip,
-                mac: self.tv_mac.take(),
-                model: None,
-                key: self.tv_key.take(),
-                cert: self.tv_cert.take(),
-            });
+            let mut tv = Device::new("webos", "TV".into(), ip, self.tv_mac.take(), Value::Null);
+            tv.key = self.tv_key.take();
+            tv.cert = self.tv_cert.take();
+            self.devices.push(tv);
+        }
+        for d in &mut self.devices {
+            d.migrate();
         }
     }
 }
@@ -215,7 +228,7 @@ pub enum State {
     Ready,
     /// Added, but not answering.
     Offline,
-    /// Waiting for someone to accept the prompt on the TV.
+    /// Waiting for someone to allow it, as with the prompt on a TV.
     Pairing { until: Instant },
     Failed(String),
 }
@@ -223,7 +236,11 @@ pub enum State {
 #[derive(Clone)]
 pub struct DeviceView {
     pub id: String,
-    pub kind: Kind,
+    pub category: Category,
+    /// `Some` for a device that pairs, saying how.
+    pub pairing: Option<&'static PairHelp>,
+    /// What testing it does, after "Enter".
+    pub test_help: &'static str,
     pub name: String,
     pub ip: Ipv4Addr,
     pub added: bool,
@@ -268,18 +285,19 @@ pub enum Request {
     /// `/home …` typed in a conversation (`group` when it is one).
     Configure { group: Option<String>, args: String },
     Scan,
-    /// Add a found device: a light at once, a TV by pairing.
+    /// Add a found device: at once, or by pairing for one that pairs.
     Add(String),
     Forget(String),
-    /// Blink a light, or put a message on a TV.
+    /// Show which device it is: blink a light, put a message on a TV.
     Test(String),
     Rename(String, String),
     SetGroup { group: String, on: bool },
     // Results from home's own worker threads.
-    Found(discover::Found),
+    Found(driver::Found),
     ScanDone,
     Checked { id: String, state: State, detail: String },
-    Paired { id: String, result: Result<(webos::Learned, String), String> },
+    /// A pairing finished: the device with what it learned, and its detail.
+    Paired { id: String, result: Result<(Box<Device>, String), String> },
     ModelChecked(ModelState),
     CheckModel,
     /// The peers that currently lend their model, from the engine.
@@ -389,43 +407,27 @@ impl Home {
     }
 
     fn view(&self) -> View {
-        let live = |d: &Device, fallback: State| {
-            self.live
-                .get(&d.id())
-                .cloned()
-                .unwrap_or((fallback, String::new()))
+        let view = |d: &Device, added: bool| {
+            let backend = backend_of(d)?;
+            let fallback = if added { State::Checking } else { State::New };
+            let (state, detail) = self.live.get(&d.id()).cloned().unwrap_or((fallback, String::new()));
+            // An added device that never finished pairing is offered again.
+            let state = if added && !backend.ready(d) && matches!(state, State::Ready) { State::New } else { state };
+            Some(DeviceView {
+                id: d.id(),
+                category: backend.category(),
+                pairing: backend.pairing(),
+                test_help: backend.test_help(),
+                name: d.name.clone(),
+                ip: d.ip,
+                added,
+                state,
+                detail,
+            })
         };
-        let mut devices: Vec<DeviceView> = Vec::new();
-        for d in &self.config.devices {
-            let (state, detail) = live(d, State::Checking);
-            // An added TV that never finished pairing is offered again.
-            let state = if d.kind == Kind::Tv && d.key.is_none() && matches!(state, State::Ready) {
-                State::New
-            } else {
-                state
-            };
-            devices.push(DeviceView {
-                id: d.id(),
-                kind: d.kind,
-                name: d.name.clone(),
-                ip: d.ip,
-                added: true,
-                state,
-                detail,
-            });
-        }
-        for d in &self.found {
-            let (state, detail) = live(d, State::New);
-            devices.push(DeviceView {
-                id: d.id(),
-                kind: d.kind,
-                name: d.name.clone(),
-                ip: d.ip,
-                added: false,
-                state,
-                detail,
-            });
-        }
+        let devices: Vec<DeviceView> = (self.config.devices.iter().filter_map(|d| view(d, true)))
+            .chain(self.found.iter().filter_map(|d| view(d, false)))
+            .collect();
         View {
             devices,
             scanning: self.scanning,
@@ -564,30 +566,18 @@ impl Home {
 
     /// Looks at an added device in the background and reports its state.
     fn check(&self, d: Device) {
+        let Some(backend) = backend_of(&d) else { return };
         let me = self.me.clone();
         thread::spawn(move || {
-            let id = d.id();
-            let (state, detail) = match d.kind {
-                Kind::Light => match (wiz::Bulb { ip: d.ip }).status() {
-                    Ok(status) => (State::Ready, status),
-                    Err(_) => (State::Offline, "not answering".into()),
-                },
-                Kind::Tv => {
-                    let tv = webos::Tv { ip: d.ip, mac: None, client_key: None, cert: None };
-                    if tv.reachable() {
-                        (State::Ready, d.model.clone().unwrap_or_else(|| "on".into()))
-                    } else {
-                        (State::Offline, "off or in standby".into())
-                    }
-                }
-            };
-            let _ = me.send(Request::Checked { id, state, detail });
+            let (state, detail) = backend.check(&d);
+            let _ = me.send(Request::Checked { id: d.id(), state, detail });
         });
     }
 
-    fn on_found(&mut self, f: discover::Found) {
+    fn on_found(&mut self, f: driver::Found) {
+        let Some(backend) = driver::backend(f.backend) else { return };
         // Something we already have, perhaps at a new address.
-        if let Some(d) = self.config.devices.iter_mut().find(|d| d.same(f.kind, f.ip, f.mac.as_deref())) {
+        if let Some(d) = self.config.devices.iter_mut().find(|d| d.same(f.backend, f.ip, f.mac.as_deref())) {
             let mut changed = false;
             let mut moved = None;
             if d.ip != f.ip {
@@ -605,9 +595,17 @@ impl Home {
                 }
                 changed = true;
             }
-            if d.model.is_none() && f.module.is_some() {
-                d.model = f.module.clone();
-                changed = true;
+            // Anything the backend learned that it didn't have yet.
+            if let Value::Object(learned) = &f.data {
+                if !d.data.is_object() {
+                    d.data = json!({});
+                }
+                for (key, value) in learned {
+                    if d.data.get(key).is_none_or(Value::is_null) {
+                        d.data[key] = value.clone();
+                        changed = true;
+                    }
+                }
             }
             let d = d.clone();
             if changed {
@@ -619,28 +617,12 @@ impl Home {
             self.check(d);
             return;
         }
-        if self.found.iter().any(|d| d.same(f.kind, f.ip, f.mac.as_deref())) {
+        if self.found.iter().any(|d| d.same(f.backend, f.ip, f.mac.as_deref())) {
             return;
         }
-        let base = match f.kind {
-            Kind::Light => "Light",
-            Kind::Tv => "TV",
-        };
-        let name = self.free_name(base);
-        let detail = match f.kind {
-            Kind::Light => format!("Wiz · {}", wiz::Caps::of(f.module.as_deref().unwrap_or_default()).describe()),
-            Kind::Tv => "LG webOS TV".into(),
-        };
-        let d = Device {
-            kind: f.kind,
-            name,
-            ip: f.ip,
-            mac: f.mac,
-            model: f.module,
-            key: None,
-            cert: None,
-        };
-        self.live.insert(d.id(), (State::New, detail));
+        let name = self.free_name(backend.category().noun());
+        let d = Device::new(f.backend, name, f.ip, f.mac, f.data);
+        self.live.insert(d.id(), (State::New, backend.found_detail(&d)));
         self.found.push(d);
     }
 
@@ -659,68 +641,54 @@ impl Home {
     fn add(&mut self, id: &str) {
         let candidate = match self.found.iter().position(|d| d.id() == id) {
             Some(at) => Some(self.found[at].clone()),
-            // An added TV whose pairing never finished can pair again.
+            // An added device whose pairing never finished can pair again.
             None => self
                 .config
                 .devices
                 .iter()
-                .find(|d| d.id() == id && d.kind == Kind::Tv && d.key.is_none())
+                .find(|d| d.id() == id && backend_of(d).is_some_and(|b| b.pairing().is_some() && !b.ready(d)))
                 .cloned(),
         };
         let Some(d) = candidate else { return };
-        match d.kind {
-            Kind::Light => {
-                self.found.retain(|f| f.id() != id);
-                let name = d.name.clone();
-                self.config.devices.push(d.clone());
-                self.save();
-                self.live.insert(d.id(), (State::Checking, String::new()));
-                self.check(d);
-                self.note(format!("added {name}"));
-            }
-            Kind::Tv => {
-                if matches!(self.live.get(id), Some((State::Pairing { .. }, _))) {
-                    return;
-                }
-                self.live.insert(
-                    d.id(),
-                    (State::Pairing { until: Instant::now() + PAIRING }, String::new()),
-                );
-                let me = self.me.clone();
-                thread::spawn(move || {
-                    let tv = webos::Tv { ip: d.ip, mac: None, client_key: None, cert: None };
-                    let (result, learned) = tv.with(|s| {
-                        let model = webos::model_name(s).unwrap_or_else(|_| "LG TV".into());
-                        let _ = webos::toast(s, "hopchat is connected 👋");
-                        Ok(model)
-                    });
-                    let result = result.map(|model| (learned, model));
-                    let _ = me.send(Request::Paired { id: d.id(), result });
-                });
-            }
+        let Some(backend) = backend_of(&d) else { return };
+        if backend.pairing().is_none() {
+            self.found.retain(|f| f.id() != id);
+            let name = d.name.clone();
+            self.config.devices.push(d.clone());
+            self.save();
+            self.live.insert(d.id(), (State::Checking, String::new()));
+            self.check(d);
+            return self.note(format!("added {name}"));
         }
+        if matches!(self.live.get(id), Some((State::Pairing { .. }, _))) {
+            return;
+        }
+        self.live.insert(d.id(), (State::Pairing { until: Instant::now() + PAIRING }, String::new()));
+        let me = self.me.clone();
+        thread::spawn(move || {
+            let id = d.id();
+            let mut d = d;
+            let result = backend.pair(&mut d).map(|detail| (Box::new(d), detail));
+            let _ = me.send(Request::Paired { id, result });
+        });
     }
 
-    fn on_paired(&mut self, id: &str, result: Result<(webos::Learned, String), String>) {
+    fn on_paired(&mut self, id: &str, result: Result<(Box<Device>, String), String>) {
         match result {
-            Ok((learned, model)) => {
-                let mut d = match self.found.iter().position(|d| d.id() == id) {
+            Ok((mut paired, detail)) => {
+                let d = match self.found.iter().position(|d| d.id() == id) {
                     Some(at) => self.found.remove(at),
                     None => match self.config.devices.iter().position(|d| d.id() == id) {
                         Some(at) => self.config.devices.remove(at),
                         None => return,
                     },
                 };
-                d.key = learned.client_key.or(d.key);
-                d.cert = learned.cert.or(d.cert);
-                d.model = Some(model.clone());
-                if d.mac.is_none() {
-                    d.mac = webos::mac_of(d.ip).map(|m| webos::format_mac(&m));
-                }
-                let name = d.name.clone();
+                // It may have been renamed while it paired.
+                paired.name = d.name;
+                let name = paired.name.clone();
                 self.live.remove(id);
-                self.live.insert(d.id(), (State::Ready, model));
-                self.config.devices.push(d);
+                self.live.insert(paired.id(), (State::Ready, detail));
+                self.config.devices.push(*paired);
                 self.save();
                 self.note(format!("paired with {name}"));
             }
@@ -735,13 +703,8 @@ impl Home {
         let Some(d) = self.config.devices.iter().find(|d| d.id() == id).cloned() else {
             return self.note("add it first, then test it".into());
         };
-        let result = match d.kind {
-            Kind::Light => (wiz::Bulb { ip: d.ip }).blink().map(|()| format!("{} blinked", d.name)),
-            Kind::Tv => self
-                .tv_do(id, |s| webos::toast(s, "👋 hello from hopchat"))
-                .map(|_| format!("{} shows a hello", d.name)),
-        };
-        match result {
+        let Some(backend) = backend_of(&d) else { return };
+        match self.drive(id, |d| backend.test(d)).unwrap_or_else(|| Err("it's gone".into())) {
             Ok(text) => {
                 self.note(text);
                 self.check(d);
@@ -753,45 +716,18 @@ impl Home {
         }
     }
 
-    fn tv(&self, id: &str) -> Result<webos::Tv, String> {
-        let d = self
-            .config
-            .devices
-            .iter()
-            .find(|d| d.id() == id && d.kind == Kind::Tv)
-            .ok_or("no TV is set up")?;
-        Ok(webos::Tv {
-            ip: d.ip,
-            mac: d.mac.as_deref().and_then(webos::parse_mac),
-            client_key: d.key.clone(),
-            cert: d.cert.clone(),
-        })
-    }
-
-    /// Runs `f` against a TV and keeps the key and certificate it paired
-    /// with.
-    fn tv_do<T>(
-        &mut self,
-        id: &str,
-        f: impl FnOnce(&mut webos::Session) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let tv = self.tv(id)?;
-        let (result, learned) = tv.with(f);
-        if let Some(d) = self.config.devices.iter_mut().find(|d| d.id() == id) {
-            let mut changed = false;
-            if learned.cert.is_some() && d.cert.is_none() {
-                d.cert = learned.cert;
-                changed = true;
-            }
-            if let Some(key) = learned.client_key {
-                d.key = Some(key);
-                changed = true;
-            }
-            if changed {
-                self.save();
-            }
+    /// Runs `f` on an added device and keeps whatever its backend learned
+    /// doing it, such as a TV's new client key. `None` if there's no such
+    /// device.
+    fn drive<T>(&mut self, id: &str, f: impl FnOnce(&mut Device) -> T) -> Option<T> {
+        let at = self.config.devices.iter().position(|d| d.id() == id)?;
+        let mut d = self.config.devices[at].clone();
+        let out = f(&mut d);
+        if d.data != self.config.devices[at].data {
+            self.config.devices[at].data = d.data;
+            self.save();
         }
-        result
+        Some(out)
     }
 
     // ----- /home ---------------------------------------------------------
@@ -921,14 +857,12 @@ impl Home {
     /// For a device the scan can't see (another subnet, broadcasts
     /// blocked): asks the address what it is, then offers it like a find.
     fn add_by_address(&mut self, ip: Ipv4Addr) -> String {
-        if let Ok(system) = (wiz::Bulb { ip }).system() {
-            let mac = Some(system.mac).filter(|m| !m.is_empty());
-            self.on_found(discover::Found { kind: Kind::Light, ip, mac, module: Some(system.module) });
-        } else if webos::Tv::probe(ip) {
-            let mac = webos::mac_of(ip).map(|m| webos::format_mac(&m));
-            self.on_found(discover::Found { kind: Kind::Tv, ip, mac, module: None });
-        } else {
-            return format!("nothing at {ip} answers as a Wiz light or an LG TV");
+        match BACKENDS.iter().find_map(|b| b.probe(ip)) {
+            Some(found) => self.on_found(found),
+            None => {
+                let labels: Vec<&str> = BACKENDS.iter().map(|b| b.label()).collect();
+                return format!("nothing at {ip} answers as any of: {}", labels.join(", "));
+            }
         }
         match self.found.iter().find(|d| d.ip == ip).map(Device::id) {
             Some(id) => {
@@ -945,7 +879,6 @@ mod tests {
     use super::assistant::{colour, flag, number, text};
     use super::ollama::{self, Ollama, Turn};
     use super::*;
-    use serde_json::json;
 
     fn home_with(devices: Vec<Device>) -> Home {
         let (engine, _) = std::sync::mpsc::channel();
@@ -957,15 +890,7 @@ mod tests {
     }
 
     fn light(name: &str, ip: [u8; 4], module: &str) -> Device {
-        Device {
-            kind: Kind::Light,
-            name: name.into(),
-            ip: ip.into(),
-            mac: Some(format!("mac-{name}")),
-            model: Some(module.into()),
-            key: None,
-            cert: None,
-        }
+        Device::new("wiz", name.into(), ip.into(), Some(format!("mac-{name}")), json!({"module": module}))
     }
 
     #[test]
@@ -1143,15 +1068,7 @@ mod tests {
         assert!(answer(&engine).is_none(), "the rest of a group needs /home on");
         home.handle(ask("g", true));
         assert!(answer(&engine).is_none(), "with no devices here, the group's host answers");
-        home.config.devices.push(Device {
-            kind: Kind::Light,
-            name: "Lamp".into(),
-            ip: Ipv4Addr::new(192, 168, 1, 10),
-            mac: None,
-            model: None,
-            key: None,
-            cert: None,
-        });
+        home.config.devices.push(Device::new("wiz", "Lamp".into(), Ipv4Addr::new(192, 168, 1, 10), None, Value::Null));
         assert!(home.answers("g", true), "its owner is answered in any group once it has devices");
         assert!(!home.answers("g", false));
         home.config.devices.clear();
@@ -1237,28 +1154,55 @@ mod tests {
         let mut config: Config = serde_json::from_value(old).unwrap();
         config.migrate();
         assert_eq!(config.devices.len(), 2);
-        assert_eq!(config.devices[1].key.as_deref(), Some("k"));
+        assert_eq!((config.devices[0].backend.as_str(), config.devices[1].backend.as_str()), ("wiz", "webos"));
+        assert_eq!(config.devices[1].data, json!({"key": "k"}));
         let saved = serde_json::to_value(&config).unwrap();
         assert!(saved.get("bulb").is_none(), "legacy fields are not written back");
     }
 
     #[test]
+    fn devices_of_the_kind_era_find_their_backends() {
+        let old = json!({"devices": [
+            {"kind": "light", "name": "Desk", "ip": "10.0.0.5", "mac": "m1", "model": "ESP01_SHTW1C_31"},
+            {"kind": "tv", "name": "TV", "ip": "10.0.0.6", "model": "OLED55C3", "key": "k", "cert": "c"},
+        ]});
+        let mut config: Config = serde_json::from_value(old).unwrap();
+        config.migrate();
+        let [desk, tv] = &config.devices[..] else { panic!() };
+        assert_eq!((desk.backend.as_str(), &desk.data), ("wiz", &json!({"module": "ESP01_SHTW1C_31"})));
+        assert_eq!((tv.backend.as_str(), &tv.data), ("webos", &json!({"model": "OLED55C3", "key": "k", "cert": "c"})));
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(saved["devices"][1], json!({
+            "backend": "webos", "name": "TV", "ip": "10.0.0.6", "mac": null,
+            "data": {"model": "OLED55C3", "key": "k", "cert": "c"},
+        }));
+        // Read back as it was written, and a backend this hopchat doesn't know is kept, not driven.
+        let mut again: Config = serde_json::from_value(saved).unwrap();
+        again.migrate();
+        assert_eq!(again.devices[1].data, tv.data);
+        let mut home = home_with(vec![Device::new("hue", "Strip".into(), [10, 0, 0, 7].into(), None, Value::Null)]);
+        assert!(home.view().devices.is_empty() && home.lights().is_empty());
+        home.handle(Request::Configure { group: None, args: "status".into() });
+        assert_eq!(home.config.devices.len(), 1);
+    }
+
+    #[test]
     fn found_devices_get_free_names_and_follow_their_mac() {
         let mut home = home_with(vec![light("Light", [10, 0, 0, 5], "ESP01_SHTW1C_31")]);
-        home.on_found(discover::Found {
-            kind: Kind::Light,
+        home.on_found(driver::Found {
+            backend: "wiz",
             ip: [10, 0, 0, 6].into(),
             mac: Some("other".into()),
-            module: Some("ESP01_SHRGB1C_31".into()),
+            data: json!({"module": "ESP01_SHRGB1C_31"}),
         });
         assert_eq!(home.found[0].name, "Light 2");
         assert_eq!(home.live[&home.found[0].id()].1, "Wiz · colour");
         // The added light, answering from a new address.
-        home.on_found(discover::Found {
-            kind: Kind::Light,
+        home.on_found(driver::Found {
+            backend: "wiz",
             ip: [10, 0, 0, 9].into(),
             mac: Some("mac-Light".into()),
-            module: None,
+            data: Value::Null,
         });
         assert_eq!(home.config.devices[0].ip, Ipv4Addr::new(10, 0, 0, 9));
         assert_eq!(home.found.len(), 1, "a known device is not offered again");
@@ -1296,9 +1240,7 @@ mod tests {
     #[test]
     #[ignore = "needs a local Ollama with the model pulled"]
     fn model_picks_the_right_tools() {
-        let mut tv = light("Living room", [10, 0, 0, 2], "");
-        tv.kind = Kind::Tv;
-        tv.key = Some("k".into());
+        let tv = Device::new("webos", "Living room".into(), [10, 0, 0, 2].into(), None, json!({"key": "k"}));
         let home = home_with(vec![
             light("Desk lamp", [10, 0, 0, 1], "ESP01_SHTW1C_31"),
             light("Strip", [10, 0, 0, 3], "ESP03_SHRGB1C_01"),
