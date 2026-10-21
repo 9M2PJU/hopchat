@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use super::ollama::{text_of, Ollama};
 use super::{Home, Request};
 use crate::engine::{Command, Input, Quote};
+use crate::lobby::LOBBY;
 
 /// The word that addresses the model in a group.
 pub const MENTION: &str = "@ai";
@@ -32,6 +33,8 @@ pub struct Question {
     pub id: String,
     pub sender: String,
     pub text: String,
+    /// The person at this machine asked.
+    pub mine: bool,
 }
 
 impl Home {
@@ -39,8 +42,14 @@ impl Home {
         self.config.ai_groups.iter().any(|g| g == group)
     }
 
+    /// Where it is switched on, and in the lobby for the person at this
+    /// machine.
+    fn ai_answers(&self, q: &Question) -> bool {
+        self.ai_enabled(&q.group) || (q.mine && q.group == LOBBY)
+    }
+
     pub(super) fn ai_ask(&mut self, q: Question) {
-        if !self.ai_enabled(&q.group) {
+        if !self.ai_answers(&q) {
             return;
         }
         let text: String = q.text.chars().take(MAX_QUESTION_CHARS).collect();
@@ -61,7 +70,7 @@ impl Home {
 
     pub(super) fn ai_answered(&mut self, q: Question, asked: Value, answer: Result<String, String>) {
         // Switched off while it was thinking.
-        if !self.ai_enabled(&q.group) {
+        if !self.ai_answers(&q) {
             return;
         }
         let text = match answer {
@@ -112,6 +121,9 @@ impl Home {
                     format!("is listening. Mention {MENTION} to ask anything; a model someone here shares will answer.")
                 };
                 self.say_as(group, SIGNATURE, hello);
+                if group == LOBBY {
+                    return format!("everyone in the lobby can ask {} now", self.config.model);
+                }
                 format!("this group can ask {} now", self.config.model)
             }
             "off" => {
@@ -119,6 +131,10 @@ impl Home {
                 self.config.ai_groups.retain(|g| g != group);
                 self.memory.remove(group);
                 self.save();
+                if group == LOBBY {
+                    self.say_as(group, SIGNATURE, "is only answering its owner now.".into());
+                    return "only you can ask your model in the lobby now".into();
+                }
                 self.say_as(group, SIGNATURE, "has gone quiet.".into());
                 "this group can't ask your model any more".into()
             }

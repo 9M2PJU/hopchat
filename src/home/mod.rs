@@ -6,6 +6,10 @@
 //! its answer goes back into the group. Group membership is the
 //! permission: anyone MLS admitted to that group may ask.
 //!
+//! In the lobby (see [`crate::lobby`]) home always answers the person at
+//! this machine, with nothing to switch on; `/home on` there lets everyone
+//! nearby in too.
+//!
 //! The same model also answers `@ai`, for anything at all, in the groups
 //! the host has switched that on for (see [`ai`]). The model needn't be on
 //! this machine: with none ready here, a group member's is borrowed (see
@@ -31,6 +35,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{Command, Input, Update};
+use crate::lobby::LOBBY;
 
 /// The word that addresses the devices in a group.
 pub const MENTION: &str = "@home";
@@ -238,8 +243,9 @@ pub struct View {
 
 /// What the rest of hopchat asks of home.
 pub enum Request {
-    /// A group message that mentioned [`MENTION`].
-    Ask { group: String, from: String, text: String },
+    /// A group message that mentioned [`MENTION`]; `mine` when the person
+    /// at this machine wrote it.
+    Ask { group: String, from: String, text: String, mine: bool },
     /// A group message that mentioned [`ai::MENTION`].
     Chat(ai::Question),
     /// `/home …` typed in a conversation (`group` when it is one).
@@ -336,6 +342,12 @@ impl Home {
 
     pub fn enabled(&self, group: &str) -> bool {
         self.config.groups.iter().any(|g| g == group)
+    }
+
+    /// Whether home answers a request in `group`: where it is switched
+    /// on, and in the lobby for the person at this machine.
+    fn answers(&self, group: &str, mine: bool) -> bool {
+        self.enabled(group) || (mine && group == LOBBY)
     }
 
     fn save(&self) {
@@ -435,8 +447,8 @@ impl Home {
 
     fn handle(&mut self, request: Request) {
         match request {
-            Request::Ask { group, from, text } => {
-                if self.enabled(&group) {
+            Request::Ask { group, from, text, mine } => {
+                if self.answers(&group, mine) {
                     let text: String = text.chars().take(MAX_REQUEST_CHARS).collect();
                     let answer = self.ask(&group, &from, &text);
                     self.say(&group, answer);
@@ -778,12 +790,20 @@ impl Home {
                 let names: Vec<String> = self.config.devices.iter().map(|d| d.name.clone()).collect();
                 let what = if names.is_empty() { "the devices".to_string() } else { names.join(", ") };
                 self.say(group, format!("is listening. Mention {MENTION} to use {what}."));
-                "home is on in this group".into()
+                if group == LOBBY {
+                    "everyone in the lobby can use your devices now".into()
+                } else {
+                    "home is on in this group".into()
+                }
             }
             ("off", _) => {
                 let Some(group) = group else { return "open the group to switch off".into() };
                 self.config.groups.retain(|g| g != group);
                 self.save();
+                if group == LOBBY {
+                    self.say(group, "is only listening to its owner now.".into());
+                    return "only you can use your devices in the lobby now".into();
+                }
                 self.say(group, "has stopped listening.".into());
                 "home is off in this group".into()
             }
@@ -1058,6 +1078,7 @@ mod tests {
                 id: format!("m{n}"),
                 sender: "off1bob".into(),
                 text: format!("question {n}"),
+                mine: false,
             };
             let asked = json!({"role": "user", "content": format!("bob: question {n}")});
             home.handle(Request::Answered { question: q, asked, answer: Ok(format!("answer {n}")) });
@@ -1073,6 +1094,61 @@ mod tests {
         // Switched off: no answer, and the memory goes.
         home.handle(Request::Configure { group: Some("g".into()), args: "ai off".into() });
         assert!(!home.memory.contains_key("g"));
+    }
+
+    #[test]
+    fn the_lobby_answers_its_owner_with_nothing_switched_on() {
+        let (mut home, engine) = wired_home();
+        let answer = |engine: &std::sync::mpsc::Receiver<Input>| match engine.try_recv() {
+            Ok(Input::Ui(Command::SendGroup { group, text, .. })) => Some((group, text)),
+            _ => None,
+        };
+        // With no devices, home answers at once, without a model.
+        let ask = |group: &str, mine| Request::Ask {
+            group: group.into(),
+            from: "someone".into(),
+            text: "lights off".into(),
+            mine,
+        };
+        home.handle(ask(LOBBY, false));
+        assert!(answer(&engine).is_none(), "anyone else needs /home on");
+        home.handle(ask("g", true));
+        assert!(answer(&engine).is_none(), "a group still needs /home on");
+        home.handle(ask(LOBBY, true));
+        let (group, text) = answer(&engine).expect("an answer in the lobby");
+        assert_eq!(group, LOBBY);
+        assert!(text.starts_with(SIGNATURE) && text.contains("no devices"), "{text}");
+
+        let question = |mine| ai::Question {
+            group: LOBBY.into(),
+            from: "someone".into(),
+            id: "lb_1".into(),
+            sender: "off1someone".into(),
+            text: "hi".into(),
+            mine,
+        };
+        let answered = |mine| Request::Answered {
+            question: question(mine),
+            asked: json!({"role": "user", "content": "someone: hi"}),
+            answer: Ok("hello".into()),
+        };
+        home.handle(answered(false));
+        assert!(answer(&engine).is_none(), "anyone else needs /ai on");
+        home.handle(answered(true));
+        assert_eq!(answer(&engine), Some((LOBBY.to_string(), "🤖 hello".to_string())));
+
+        // Switched on in the lobby, everyone nearby may ask.
+        home.handle(Request::Configure { group: Some(LOBBY.into()), args: "on".into() });
+        assert!(answer(&engine).is_some_and(|(_, t)| t.contains("is listening")));
+        home.handle(ask(LOBBY, false));
+        assert!(answer(&engine).is_some_and(|(_, t)| t.contains("no devices")));
+        // And off again, the owner still is.
+        home.handle(Request::Configure { group: Some(LOBBY.into()), args: "off".into() });
+        assert!(answer(&engine).is_some_and(|(_, t)| t.contains("only listening to its owner")));
+        home.handle(ask(LOBBY, false));
+        assert!(answer(&engine).is_none());
+        home.handle(ask(LOBBY, true));
+        assert!(answer(&engine).is_some());
     }
 
     #[test]

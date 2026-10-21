@@ -589,7 +589,8 @@ impl Engine {
             return;
         }
         let Some(home) = &self.home else { return };
-        let from = if sender == self.address {
+        let mine = sender == self.address;
+        let from = if mine {
             self.nick.clone()
         } else {
             self.nicks.get(sender).cloned().unwrap_or_else(|| sender.to_string())
@@ -599,6 +600,7 @@ impl Engine {
                 group: group.to_string(),
                 from: from.clone(),
                 text,
+                mine,
             });
         }
         if let Some(question) = home::ai::addressed(text) {
@@ -608,6 +610,7 @@ impl Engine {
                 id: id.to_string(),
                 sender: sender.to_string(),
                 text: question,
+                mine,
             }));
         }
     }
