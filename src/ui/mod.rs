@@ -404,12 +404,18 @@ impl App {
                 self.refresh_lobby();
                 let who = self.nick_of(&address);
                 self.note(render::ERR, format!("link down  {who}"));
+                self.flash(format!("{who} dropped off the mesh"));
             }
             Update::SessionReady { address } => {
-                self.convo_mut(&address).secure = true;
+                let convo = self.convo_mut(&address);
+                let fresh = !convo.secure;
+                convo.secure = true;
                 self.refresh_lobby();
                 let who = self.nick_of(&address);
                 self.note(render::OK, format!("mls ready  {who}"));
+                if fresh {
+                    self.flash(format!("{who} jacked in · click them to talk privately"));
+                }
             }
             Update::Queued { to, id, text, reply } => {
                 self.owners.insert(id.clone(), to.clone());

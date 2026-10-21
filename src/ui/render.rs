@@ -1632,8 +1632,17 @@ fn lobby_hint(others: bool, open: bool) -> Vec<Line<'static>> {
     } else {
         "Just you so far. People on your network appear here by themselves."
     };
+    let private = if others {
+        Line::from(vec![
+            "Click someone on the left".fg(TEXT).bold(),
+            " (or Tab) for a private chat, end-to-end encrypted.".fg(MUTED),
+        ])
+    } else {
+        Line::from("")
+    };
     vec![
         Line::from(who.fg(MUTED)).centered(),
+        private.centered(),
         Line::from(""),
         Line::from(vec![
             "@home".fg(YELLOW).bold(),
