@@ -288,11 +288,15 @@ impl Home {
         let wanted = name.map(str::to_ascii_lowercase).filter(|n| n != "all" && !n.is_empty());
         let picked: Vec<Device> = match &wanted {
             None => lights.into_iter().cloned().collect(),
-            Some(n) => lights
-                .into_iter()
-                .filter(|d| d.name.to_ascii_lowercase().contains(n.as_str()))
-                .cloned()
-                .collect(),
+            // "Light" is one light, not "Light 2" and "Light 3" too.
+            Some(n) => match lights.iter().find(|d| d.name.eq_ignore_ascii_case(n)) {
+                Some(d) => vec![(*d).clone()],
+                None => lights
+                    .into_iter()
+                    .filter(|d| d.name.to_ascii_lowercase().contains(n.as_str()))
+                    .cloned()
+                    .collect(),
+            },
         };
         if picked.is_empty() {
             return Err(match wanted {
@@ -305,11 +309,15 @@ impl Home {
 
     fn pick_tv(&self, args: &Value) -> Result<String, String> {
         let tvs = self.tvs();
-        let found = match text(args, "tv").map(|t| t.to_ascii_lowercase()) {
-            Some(n) => tvs.into_iter().find(|d| d.name.to_ascii_lowercase().contains(&n)),
-            None => tvs.into_iter().next(),
-        };
-        found.map(Device::id).ok_or_else(|| "no TV is set up".into())
+        match text(args, "tv").map(|t| t.to_ascii_lowercase()) {
+            Some(n) => tvs
+                .iter()
+                .find(|d| d.name.eq_ignore_ascii_case(&n))
+                .or_else(|| tvs.iter().find(|d| d.name.to_ascii_lowercase().contains(&n)))
+                .map(|d| d.id())
+                .ok_or_else(|| format!("there's no TV called {n}")),
+            None => tvs.into_iter().next().map(Device::id).ok_or_else(|| "no TV is set up".into()),
+        }
     }
 }
 

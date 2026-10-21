@@ -219,9 +219,12 @@ fn restore(before: &Value, was_on: bool) -> Value {
             p.insert("sceneId".into(), json!(id));
         }
         _ => {
-            for key in ["temp", "r", "g", "b"] {
-                if let Some(v) = before.get(key).filter(|v| v.as_u64().is_some_and(|n| n > 0)) {
-                    p.insert(key.into(), v.clone());
+            if let Some(v) = before.get("temp").filter(|v| v.as_u64().is_some_and(|n| n > 0)) {
+                p.insert("temp".into(), v.clone());
+            } else if ["r", "g", "b"].iter().any(|k| before.get(*k).is_some()) {
+                // A colour needs all three channels back: pure red has g and b at 0.
+                for key in ["r", "g", "b"] {
+                    p.insert(key.into(), before.get(key).cloned().unwrap_or(json!(0)));
                 }
             }
         }

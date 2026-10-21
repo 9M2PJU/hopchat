@@ -140,8 +140,24 @@ fn default_ollama() -> String {
     std::env::var("OLLAMA_HOST")
         .ok()
         .filter(|h| !h.is_empty())
-        .map(|h| if h.starts_with("http") { h } else { format!("http://{h}") })
+        .map(|h| ollama_url(&h))
         .unwrap_or_else(|| "http://127.0.0.1:11434".into())
+}
+
+/// `OLLAMA_HOST` as Ollama's own client reads it: the port defaults to
+/// 11434, and a host left empty or as 0.0.0.0 means this machine.
+fn ollama_url(host: &str) -> String {
+    let (scheme, rest) = match host.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("http", host),
+    };
+    let rest = rest.trim_end_matches('/');
+    let (name, port) = match rest.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => (name, port),
+        _ => (rest, "11434"),
+    };
+    let name = if name.is_empty() || name == "0.0.0.0" { "127.0.0.1" } else { name };
+    format!("{scheme}://{name}:{port}")
 }
 
 impl Default for Config {
@@ -281,12 +297,13 @@ pub fn addressed(text: &str) -> Option<String> {
 /// Whether `text` mentions `word`, and the text with the mention removed.
 fn mentioned(text: &str, word: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
-    let at = lower.find(word)?;
-    // "@homer" is someone else.
+    let wordy = |c: char| c.is_alphanumeric() || c == '_';
+    // "@homer" is someone else, and "bob@home.net" is an address.
+    let (at, _) = lower.match_indices(word).find(|&(at, _)| {
+        !lower[..at].chars().next_back().is_some_and(wordy)
+            && !lower[at + word.len()..].chars().next().is_some_and(wordy)
+    })?;
     let end = at + word.len();
-    if lower[end..].chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
     let after = text[end..].trim_start().trim_start_matches([',', ':']);
     let rest = format!("{} {after}", &text[..at]);
     Some(rest.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -958,6 +975,11 @@ mod tests {
         assert_eq!(addressed("dim it @home").as_deref(), Some("dim it"));
         assert_eq!(addressed("ask @homer"), None);
         assert_eq!(addressed("no mention"), None);
+        assert_eq!(addressed("tell @homer then @home lights off").as_deref(), Some("tell @homer then lights off"));
+        assert_eq!(addressed("mail bob@home.net"), None);
+        assert_eq!(ollama_url("0.0.0.0"), "http://127.0.0.1:11434");
+        assert_eq!(ollama_url("box:8080"), "http://box:8080");
+        assert_eq!(ollama_url("https://box/"), "https://box:11434");
     }
 
     /// A home whose messages to the engine can be read.
