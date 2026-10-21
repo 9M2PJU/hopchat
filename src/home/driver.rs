@@ -76,6 +76,8 @@ pub struct Found {
     pub backend: &'static str,
     pub ip: Ipv4Addr,
     pub mac: Option<String>,
+    /// Which thing behind that address, as in [`Device::unit`].
+    pub unit: Option<String>,
     /// Whatever the backend keeps about it, as in [`Device::data`].
     pub data: Value,
 }

@@ -24,7 +24,7 @@ fn module(d: &Device) -> &str {
 
 fn found(ip: Ipv4Addr, mac: Option<String>, module: Option<String>) -> Found {
     let data = module.map(|m| json!({"module": m})).unwrap_or(Value::Null);
-    Found { backend: "wiz", ip, mac, data }
+    Found { backend: "wiz", ip, mac, unit: None, data }
 }
 
 impl Backend for Wiz {

@@ -71,6 +71,11 @@ pub struct Device {
     /// What identifies it when DHCP hands it a new address.
     #[serde(default)]
     pub mac: Option<String>,
+    /// Which of the things behind that address it is, for a hub that
+    /// drives many (a Home Assistant entity); `None` for a device that is
+    /// its own address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
     /// Whatever its backend keeps about it: a Wiz module name, a TV's
     /// client key and pinned certificate.
     #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -87,15 +92,21 @@ pub struct Device {
 
 impl Device {
     pub fn new(backend: &str, name: String, ip: Ipv4Addr, mac: Option<String>, data: Value) -> Self {
-        Self { backend: backend.into(), name, ip, mac, data, model: None, key: None, cert: None }
+        Self { backend: backend.into(), name, ip, mac, unit: None, data, model: None, key: None, cert: None }
     }
 
     pub fn id(&self) -> String {
-        self.mac.clone().unwrap_or_else(|| self.ip.to_string())
+        let at = self.mac.clone().unwrap_or_else(|| self.ip.to_string());
+        match &self.unit {
+            Some(unit) => format!("{at}/{unit}"),
+            None => at,
+        }
     }
 
-    fn same(&self, backend: &str, ip: Ipv4Addr, mac: Option<&str>) -> bool {
+    fn same(&self, f: &driver::Found) -> bool {
+        let (backend, ip, mac) = (f.backend, f.ip, f.mac.as_deref());
         self.backend == backend
+            && self.unit == f.unit
             && match (self.mac.as_deref(), mac) {
                 (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
                 _ => self.ip == ip,
@@ -577,7 +588,7 @@ impl Home {
     fn on_found(&mut self, f: driver::Found) {
         let Some(backend) = driver::backend(f.backend) else { return };
         // Something we already have, perhaps at a new address.
-        if let Some(d) = self.config.devices.iter_mut().find(|d| d.same(f.backend, f.ip, f.mac.as_deref())) {
+        if let Some(d) = self.config.devices.iter_mut().find(|d| d.same(&f)) {
             let mut changed = false;
             let mut moved = None;
             if d.ip != f.ip {
@@ -617,11 +628,11 @@ impl Home {
             self.check(d);
             return;
         }
-        if self.found.iter().any(|d| d.same(f.backend, f.ip, f.mac.as_deref())) {
+        if self.found.iter().any(|d| d.same(&f)) {
             return;
         }
         let name = self.free_name(backend.category().noun());
-        let d = Device::new(f.backend, name, f.ip, f.mac, f.data);
+        let d = Device { unit: f.unit, ..Device::new(f.backend, name, f.ip, f.mac, f.data) };
         self.live.insert(d.id(), (State::New, backend.found_detail(&d)));
         self.found.push(d);
     }
@@ -1193,6 +1204,7 @@ mod tests {
             backend: "wiz",
             ip: [10, 0, 0, 6].into(),
             mac: Some("other".into()),
+            unit: None,
             data: json!({"module": "ESP01_SHRGB1C_31"}),
         });
         assert_eq!(home.found[0].name, "Light 2");
@@ -1202,10 +1214,31 @@ mod tests {
             backend: "wiz",
             ip: [10, 0, 0, 9].into(),
             mac: Some("mac-Light".into()),
+            unit: None,
             data: Value::Null,
         });
         assert_eq!(home.config.devices[0].ip, Ipv4Addr::new(10, 0, 0, 9));
         assert_eq!(home.found.len(), 1, "a known device is not offered again");
+    }
+
+    #[test]
+    fn things_behind_one_address_are_told_apart() {
+        let mut home = home_with(Vec::new());
+        let entity = |unit: &str| driver::Found {
+            backend: "wiz",
+            ip: [10, 0, 0, 4].into(),
+            mac: Some("hub".into()),
+            unit: Some(unit.into()),
+            data: Value::Null,
+        };
+        home.on_found(entity("light.desk"));
+        home.on_found(entity("light.strip"));
+        home.on_found(entity("light.desk"));
+        let ids: Vec<String> = home.found.iter().map(Device::id).collect();
+        assert_eq!(ids, ["hub/light.desk", "hub/light.strip"]);
+        let saved = serde_json::to_value(&home.found[0]).unwrap();
+        assert_eq!(saved["unit"], "light.desk");
+        assert!(serde_json::to_value(light("Desk", [10, 0, 0, 5], "m")).unwrap().get("unit").is_none());
     }
 
     #[test]
