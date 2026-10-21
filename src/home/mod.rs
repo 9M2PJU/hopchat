@@ -1350,6 +1350,39 @@ mod tests {
         assert_eq!(home.config.ha, Some(hub("new")));
     }
 
+    /// `/home ha URL TOKEN` against a real Home Assistant, through to the
+    /// tools the model calls. `HA_URL=… HA_TOKEN=… cargo test -- --ignored
+    /// live`, with HA's `demo:` integration.
+    #[test]
+    #[ignore = "needs a Home Assistant with the demo integration"]
+    fn live_home_assistant() {
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, _) = std::sync::mpsc::channel();
+        let (me, requests) = std::sync::mpsc::channel();
+        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        home.config = Config::default();
+        let (url, token) = (std::env::var("HA_URL").unwrap(), std::env::var("HA_TOKEN").unwrap());
+        assert_eq!(home.configure(None, &format!("ha {url} {token}")), "connecting to Home Assistant…");
+        let connected = requests.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(matches!(connected, Request::HaConnected(Ok(_))));
+        home.handle(connected);
+        let names: Vec<String> = home.found.iter().map(|d| d.name.clone()).collect();
+        println!("found: {names:?}");
+        for name in ["Bed Light", "Lounge room", "AC"] {
+            let id = home.found.iter().find(|d| d.name == name).unwrap().id();
+            home.add(&id);
+        }
+        let tools = home.tools().to_string();
+        assert!(tools.contains("light_set") && tools.contains("tv_open_app") && tools.contains("switch_set"));
+        println!("{}", home.system_prompt());
+        let run = |home: &mut Home, tool: &str, args: Value| home.run_tool(tool, &args).unwrap();
+        assert_eq!(run(&mut home, "light_set", json!({"light": "bed light", "brightness": "25%", "color": "blue"})), "Bed Light is now on · 25% · #0000ff");
+        assert_eq!(run(&mut home, "light_set", json!({"light": "bed light", "scene": "Rainbow"})), "Bed Light is now on · 25% · rainbow");
+        assert_eq!(run(&mut home, "tv_open_app", json!({"app": "youtube"})), "Lounge room switched to youtube");
+        assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": true})), "AC is now on");
+        assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": false})), "AC is now off");
+    }
+
     #[test]
     fn switches_are_named_never_all() {
         let plug = |name: &str, entity: &str| Device {
@@ -1402,10 +1435,12 @@ mod tests {
     #[ignore = "needs a local Ollama with the model pulled"]
     fn model_picks_the_right_tools() {
         let tv = Device::new("webos", "Living room".into(), [10, 0, 0, 2].into(), None, json!({"key": "k"}));
+        let kettle = Device { unit: Some("switch.kettle".into()), ..Device::new("ha_switch", "Kettle".into(), [10, 0, 0, 4].into(), None, Value::Null) };
         let home = home_with(vec![
             light("Desk lamp", [10, 0, 0, 1], "ESP01_SHTW1C_31"),
             light("Strip", [10, 0, 0, 3], "ESP03_SHRGB1C_01"),
             tv,
+            kettle,
         ]);
         let model = Ollama::new(home.config.ollama.clone(), home.config.model.clone());
         let cases: &[(&str, &[&str])] = &[
@@ -1414,6 +1449,7 @@ mod tests {
             ("dim the desk lamp to 20% and put on netflix", &["light_set", "tv_open_app"]),
             ("turn the volume down a bit", &["tv_volume"]),
             ("is the tv on?", &["tv_status"]),
+            ("put the kettle on", &["switch_set"]),
         ];
         for (ask, want) in cases {
             let messages = vec![

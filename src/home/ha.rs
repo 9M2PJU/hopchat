@@ -114,47 +114,54 @@ impl Hub {
     fn agent() -> ureq::Agent {
         ureq::Agent::config_builder()
             .timeout_global(Some(WAIT))
-            .http_status_as_error(true)
+            // An HTTP error from HA says why in its body; keep it.
+            .http_status_as_error(false)
             .build()
             .new_agent()
     }
 
-    fn error(&self, e: ureq::Error) -> String {
-        match e {
-            ureq::Error::StatusCode(401) => {
-                "Home Assistant refused the token; make a new one under your HA profile, Security".into()
-            }
-            ureq::Error::StatusCode(code) => format!("Home Assistant answered HTTP {code}"),
-            ureq::Error::Timeout(_) => "Home Assistant took too long to answer".into(),
+    /// The JSON HA answered, or why not: its own message when it gives one,
+    /// as in "Entity … does not support action media_player.volume_set".
+    fn answer(&self, sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value, String> {
+        let mut response = sent.map_err(|e| match e {
+            ureq::Error::Timeout(_) => "Home Assistant took too long to answer".to_string(),
             _ => format!("can't reach Home Assistant at {}", self.url),
+        })?;
+        let code = response.status().as_u16();
+        let body: Value = response.body_mut().read_json().unwrap_or_default();
+        match code {
+            200..=299 => Ok(body),
+            401 => Err("Home Assistant refused the token; make a new one under your HA profile, Security".into()),
+            _ => Err(match body.get("message").and_then(Value::as_str) {
+                Some(message) => format!("Home Assistant: {message}"),
+                None => format!("Home Assistant answered HTTP {code}"),
+            }),
         }
     }
 
     fn get(&self, path: &str) -> Result<Value, String> {
-        let mut response = Self::agent()
+        let sent = Self::agent()
             .get(format!("{}{path}", self.url))
             .header("Authorization", format!("Bearer {}", self.token))
-            .call()
-            .map_err(|e| self.error(e))?;
-        response.body_mut().read_json().map_err(|e| e.to_string())
+            .call();
+        self.answer(sent)
     }
 
     /// Calls a service, such as `light.turn_on`, on one entity.
     fn call(&self, service: &str, entity: &str, mut body: Value) -> Result<(), String> {
         let (domain, service) = service.split_once('.').unwrap_or((service, ""));
         body["entity_id"] = json!(entity);
-        Self::agent()
+        let sent = Self::agent()
             .post(format!("{}/api/services/{domain}/{service}", self.url))
             .header("Authorization", format!("Bearer {}", self.token))
-            .send_json(&body)
-            .map_err(|e| self.error(e))?;
-        Ok(())
+            .send_json(&body);
+        self.answer(sent).map(drop)
     }
 
     /// One entity's state and attributes.
     fn state(&self, entity: &str) -> Result<Value, String> {
         self.get(&format!("/api/states/{entity}")).map_err(|e| {
-            if e.ends_with("HTTP 404") { format!("Home Assistant has no {entity}") } else { e }
+            if e.ends_with("HTTP 404") || e.contains("Entity not found") { format!("Home Assistant has no {entity}") } else { e }
         })
     }
 
@@ -274,8 +281,21 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
                 .collect();
             let colour = modes.iter().any(|m| matches!(*m, "hs" | "rgb" | "rgbw" | "rgbww" | "xy"));
             let white = modes.contains(&"color_temp");
-            let effects = attrs.get("effect_list").cloned().unwrap_or(json!([]));
-            Some(("ha_light", json!({"name": name, "colour": colour, "white": white, "effects": effects})))
+            // HA lists "off" among the effects, as the way to stop one.
+            let effects: Vec<&str> = attrs
+                .get("effect_list")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let stops = effects.iter().any(|e| is_off(e));
+            let effects: Vec<&str> = effects.into_iter().filter(|e| !is_off(e)).collect();
+            let mut data = json!({"name": name, "colour": colour, "white": white, "effects": effects});
+            if stops {
+                data["stops"] = json!(true);
+            }
+            Some(("ha_light", data))
         }
         // A speaker or receiver is a media player too, but not a TV.
         "media_player" if attrs.get("device_class").and_then(Value::as_str) == Some("tv") => {
@@ -284,6 +304,11 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
         "switch" => Some(("ha_switch", json!({"name": name}))),
         _ => None,
     }
+}
+
+/// Whether an effect is the absence of one.
+fn is_off(effect: &str) -> bool {
+    matches!(scene_key(effect).as_str(), "off" | "none")
 }
 
 fn flag(d: &Device, key: &str) -> bool {
@@ -407,6 +432,9 @@ impl LightDriver for HaLight {
                 return Err(format!("{} has no scene called {scene}", d.name));
             };
             body["effect"] = json!(effect);
+        } else if (pilot.kelvin.is_some() || pilot.rgb.is_some()) && flag(d, "stops") {
+            // Or the colour asked for hides behind whatever effect is running.
+            body["effect"] = json!("off");
         }
         hub.call("light.turn_on", entity, body)
     }
@@ -428,7 +456,7 @@ fn describe_light(state: &Value) -> String {
     if let Some(b) = attrs.get("brightness").and_then(Value::as_f64) {
         parts.push(format!("{}%", (b * 100.0 / 255.0).round() as u8));
     }
-    let effect = attrs.get("effect").and_then(Value::as_str).filter(|e| !e.is_empty() && *e != "none");
+    let effect = attrs.get("effect").and_then(Value::as_str).filter(|e| !e.is_empty() && !is_off(e));
     let mode = attrs.get("color_mode").and_then(Value::as_str).unwrap_or_default();
     if let Some(effect) = effect {
         parts.push(effect.to_string());
@@ -709,11 +737,14 @@ mod tests {
     fn lights_say_what_they_can_do() {
         let state = json!({"entity_id": "light.strip", "state": "on", "attributes": {
             "friendly_name": "Strip", "supported_color_modes": ["color_temp", "hs"],
-            "effect_list": ["Rainbow", "Night-Light"],
+            "effect_list": ["Rainbow", "Night-Light", "off"],
         }});
         let (backend, data) = describe("light.strip", &state).unwrap();
         assert_eq!(backend, "ha_light");
-        assert_eq!(data, json!({"name": "Strip", "colour": true, "white": true, "effects": ["Rainbow", "Night-Light"]}));
+        assert_eq!(
+            data,
+            json!({"name": "Strip", "colour": true, "white": true, "effects": ["Rainbow", "Night-Light"], "stops": true})
+        );
         let dimmer = json!({"state": "off", "attributes": {"supported_color_modes": ["brightness"]}});
         let (_, data) = describe("light.hall", &dimmer).unwrap();
         assert_eq!((data["name"].as_str(), data["colour"].as_bool(), data["white"].as_bool()), (Some("light.hall"), Some(false), Some(false)));
@@ -728,6 +759,8 @@ mod tests {
         assert_eq!(describe_light(&red), "on · 100% · #ff0000");
         let effect = json!({"state": "on", "attributes": {"color_mode": "hs", "effect": "Rainbow"}});
         assert_eq!(describe_light(&effect), "on · Rainbow");
+        let stopped = json!({"state": "on", "attributes": {"color_mode": "color_temp", "effect": "off", "color_temp_kelvin": 3000}});
+        assert_eq!(describe_light(&stopped), "on · 3000K");
         assert_eq!(describe_light(&json!({"state": "off", "attributes": {}})), "off");
     }
 
@@ -758,5 +791,55 @@ mod tests {
         let muted = json!({"state": "on", "attributes": {"app_name": "YouTube", "is_volume_muted": true}});
         assert_eq!(describe_tv(&muted), "on · YouTube · muted");
         assert_eq!(describe_tv(&json!({"state": "off", "attributes": {}})), "off");
+    }
+
+    /// Lists and drives a real Home Assistant. `HA_URL=… HA_TOKEN=… cargo
+    /// test -- --ignored live`; HA's `demo:` integration has everything it
+    /// drives.
+    #[test]
+    #[ignore = "needs a Home Assistant with the demo integration"]
+    fn live() {
+        let hub = Hub { url: url(&std::env::var("HA_URL").unwrap()).unwrap(), token: std::env::var("HA_TOKEN").unwrap() };
+        println!("home: {}", hub.check().unwrap());
+        let found = hub.entities().unwrap();
+        let device = |entity: &str| {
+            let f = found.iter().find(|f| f.unit.as_deref() == Some(entity)).unwrap_or_else(|| panic!("{entity} not listed"));
+            Device { unit: f.unit.clone(), ..Device::new(f.backend, entity.into(), f.ip, None, f.data.clone()) }
+        };
+        let units: Vec<&str> = found.iter().filter_map(|f| f.unit.as_deref()).collect();
+        println!("listed: {units:?}");
+        assert!(!units.contains(&"media_player.walkman"), "only TVs are TVs");
+
+        let mut bed = device("light.bed_light");
+        assert_eq!(HaLight.caps(&bed), Caps { colour: true, white: true });
+        HaLight.set(&bed, &Pilot { brightness: Some(40), kelvin: Some(2700), ..Default::default() }).unwrap();
+        assert_eq!(HaLight.status(&bed).unwrap(), "on · 40% · 2700K");
+        HaLight.set(&bed, &Pilot { rgb: Some((255, 0, 0)), ..Default::default() }).unwrap();
+        assert!(HaLight.status(&bed).unwrap().ends_with("#ff0000"), "{}", HaLight.status(&bed).unwrap());
+        HaLight.set(&bed, &Pilot { on: Some(false), ..Default::default() }).unwrap();
+        assert_eq!(HaLight.check(&bed), (State::Ready, "off".into()));
+        HaLight.test(&mut bed).unwrap();
+        assert_eq!(HaLight.status(&bed).unwrap(), "off", "testing an off light leaves it off");
+
+        let mut tv = device("media_player.lounge_room");
+        assert_eq!(HaTv.open_app(&mut tv, "YouTube").unwrap(), "media_player.lounge_room switched to youtube");
+        assert!(HaTv.open_app(&mut tv, "netflix").unwrap_err().contains("it has dvd, youtube"));
+        // The demo TV has no volume control, and says so through HA.
+        let volume = HaTv.volume(&mut tv, Some(30), None, None).unwrap_err();
+        assert!(volume.contains("does not support action media_player.volume_set"), "{volume}");
+        assert!(HaTv.status(&mut tv).unwrap().contains("Chapter 1"));
+        HaTv.power(&mut tv, false).unwrap();
+        assert_eq!(HaTv.status(&mut tv).unwrap(), "off");
+        HaTv.power(&mut tv, true).unwrap();
+
+        let ac = device("switch.ac");
+        SwitchDriver::set(&HaSwitch, &ac, true).unwrap();
+        assert_eq!(SwitchDriver::status(&HaSwitch, &ac).unwrap(), "on");
+        SwitchDriver::set(&HaSwitch, &ac, false).unwrap();
+        assert_eq!(SwitchDriver::status(&HaSwitch, &ac).unwrap(), "off");
+
+        let wrong = Hub { token: "nope".into(), ..hub.clone() };
+        assert!(wrong.check().unwrap_err().contains("refused the token"));
+        assert_eq!(hub.state("light.nope").unwrap_err(), "Home Assistant has no light.nope");
     }
 }
