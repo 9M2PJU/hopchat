@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Connector, Message, WebSocket};
+use tungstenite::{Message, WebSocket};
 
 const TLS_PORT: u16 = 3001;
 const PLAIN_PORT: u16 = 3000;
@@ -148,7 +148,13 @@ impl Tv {
                 .build()
                 .map_err(|e| e.to_string())?;
             let url = format!("wss://{}:{TLS_PORT}/", self.ip);
-            let (ws, _) = tungstenite::client_tls_with_config(url.as_str(), stream, None, Some(Connector::NativeTls(tls)))
+            // Handshaken here, not by tungstenite: it panics when the read
+            // timeout cuts a slow handshake short.
+            let stream = tls.connect(&self.ip.to_string(), stream).map_err(|e| match e {
+                native_tls::HandshakeError::Failure(e) => format!("TLS to the TV failed: {e}"),
+                native_tls::HandshakeError::WouldBlock(_) => "TLS to the TV failed: no answer in time".into(),
+            })?;
+            let (ws, _) = tungstenite::client(url.as_str(), MaybeTlsStream::NativeTls(stream))
                 .map_err(|e| format!("TLS to the TV failed: {e}"))?;
             let fingerprint = match ws.get_ref() {
                 MaybeTlsStream::NativeTls(t) => t
