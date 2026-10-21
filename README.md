@@ -12,8 +12,11 @@ Two terminals on one machine work too. Each name gets its own identity under `~/
 
 ## What you get
 
+- **A neon terminal from a future without internet**: it boots with the name in lights (any key skips), a strip along the top shows how much mesh is around, and everyone gets their own colour, the same in the sidebar and their messages. While nobody is around, the lobby shows a sonar sweep.
+- **Nothing to memorise**: the keys along the bottom are buttons, so click them. Click a chat on the left to open it. Click a message to reply, open, copy or retry it. Type `@` in a group or the lobby and it offers `@home` and `@ai`; Tab completes.
+
 - **Files**: press Ctrl-O to browse, drag files onto the window, or type `/file PATH`. Each transfer shows a live progress bar with rate and time left. Transfers are chunked and MLS-encrypted, up to 100 MB each. Received files are saved to `~/Downloads/hopchat` (override with `--downloads`), never overwriting anything and never escaping that folder.
-- **Delivery you can see**: `◷` queued, `✓` on the wire, `✓✓` delivered, blue `✓✓ read` once they've seen it, `✗` failed (press `R` to retry).
+- **Delivery you can see**: `◷` queued, `✓` on the wire, `✓✓` delivered, cyan `✓✓ read` once they've seen it, `✗` failed (press `R` to retry).
 - **Replies, typing indicators, unread badges**, plus a bell and a window-title count when a message arrives while you're elsewhere.
 - **History that survives restarts**: each conversation is sealed with XChaCha20-Poly1305 under your profile's key in `~/.hopchat/<name>/history`. Messages written while a peer is away are delivered when they come back.
 - **A real composer**: multi-line input (Shift/Alt-Enter or Ctrl-J), word motions, slash commands with completion.
@@ -23,7 +26,7 @@ Two terminals on one machine work too. Each name gets its own identity under `~/
 | Enter | send (with any attached files) |
 | Ctrl-O | attach files |
 | Tab / Shift-Tab, Alt-1…9 | switch conversation |
-| ↑ on an empty line | select a message: `r` reply, `o` open, `f` show in folder, `y` copy, `R` retry |
+| click a message, or ↑ on an empty line | select it: `r` reply, `o` open, `f` show in folder, `y` copy, `R` retry |
 | PgUp / PgDn, mouse wheel | scroll |
 | Ctrl-G | new group: name it, pick people, Enter |
 | Ctrl-D | devices: find, pair and test them |
