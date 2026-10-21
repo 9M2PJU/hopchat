@@ -3,7 +3,7 @@ name = "hopchat"
 version = "0.1.0"
 edition = "2024"
 description = "Offline terminal chat over an Offline Protocol mesh: no internet, no server"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 getrandom = "0.4.3"
