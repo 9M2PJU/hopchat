@@ -93,6 +93,10 @@ pub struct Task {
     pub done_ms: Option<i64>,
     #[serde(default)]
     pub origin: Option<Origin>,
+    /// A snoozed repeat's own next time, which it goes back to after the
+    /// snooze rings.
+    #[serde(default)]
+    pub snoozed_from: Option<i64>,
 }
 
 impl Task {
@@ -363,6 +367,17 @@ pub fn when(words: &[&str], now: DateTime<Local>) -> Option<(DateTime<Local>, Op
         return None;
     }
     let explicit_day = day.is_some() || weekday.is_some();
+    let at = time.or(part).unwrap_or(if explicit_day { hm(9, 0) } else { now.time() });
+    let pm = |t: NaiveTime| NaiveTime::from_hms_opt(t.hour() + 12, t.minute(), 0).unwrap_or(t);
+    let mut at = match (time, part) {
+        // "7 tonight", "8 in the evening": a bare hour after noon.
+        (Some(t), Some(p)) if t.hour() < 12 && p.hour() >= 15 && t.hour() != 0 => pm(t),
+        _ => at,
+    };
+    if loose && part.is_none() && (1..=6).contains(&at.hour()) {
+        // Nobody means 3 in the morning by "at 3".
+        at = pm(at);
+    }
     let date = match (day, weekday) {
         (Some(d), _) => d,
         (None, Some(wd)) => {
@@ -371,10 +386,7 @@ pub fn when(words: &[&str], now: DateTime<Local>) -> Option<(DateTime<Local>, Op
             let ahead = (wd.num_days_from_monday() as i64 - today.weekday().num_days_from_monday() as i64)
                 .rem_euclid(7);
             let ahead = if ahead == 0 {
-                match time.or(part) {
-                    Some(t) if t > now.time() => 0,
-                    _ => 7,
-                }
+                if (time.is_some() || part.is_some()) && at > now.time() { 0 } else { 7 }
             } else {
                 ahead
             };
@@ -382,21 +394,16 @@ pub fn when(words: &[&str], now: DateTime<Local>) -> Option<(DateTime<Local>, Op
         }
         _ => today,
     };
-    let at = time.or(part).unwrap_or(if explicit_day { hm(9, 0) } else { now.time() });
-    let pm = |t: NaiveTime| NaiveTime::from_hms_opt(t.hour() + 12, t.minute(), 0).unwrap_or(t);
-    let mut at = match (time, part) {
-        // "7 tonight", "8 in the evening": a bare hour after noon.
-        (Some(t), Some(p)) if t.hour() < 12 && p.hour() >= 15 && t.hour() != 0 => pm(t),
-        _ => at,
-    };
-    if loose && part.is_none() && (1..12).contains(&at.hour()) {
-        if at.hour() <= 6 {
-            // Nobody means 3 in the morning by "at 3".
-            at = pm(at);
-        } else if !explicit_day && repeat.is_none() && local_at(date, at)? <= now && local_at(date, pm(at))? > now {
-            // "at 9" said after nine in the morning means tonight.
-            at = pm(at);
-        }
+    if loose
+        && part.is_none()
+        && (7..12).contains(&at.hour())
+        && !explicit_day
+        && repeat.is_none()
+        && local_at(date, at)? <= now
+        && local_at(date, pm(at))? > now
+    {
+        // "at 9" said after nine in the morning means tonight.
+        at = pm(at);
     }
     let mut due = local_at(date, at)?;
     if !explicit_day && due <= now {
@@ -589,7 +596,7 @@ fn clock(words: &[String], after_at: bool) -> Option<(NaiveTime, usize, bool)> {
     }
     let (h, m) = match body.split_once([':', '.']) {
         Some((h, m)) => (h.parse::<u32>().ok()?, m.parse::<u32>().ok().filter(|_| m.len() == 2)?),
-        None if body.len() == 4 && meridiem.is_none() && after_at => {
+        None if body.len() == 4 && body.is_ascii() && meridiem.is_none() && after_at => {
             (body[..2].parse::<u32>().ok()?, body[2..].parse::<u32>().ok()?)
         }
         None if !body.is_empty() && body.len() <= 2 => (body.parse::<u32>().ok()?, 0),
@@ -750,6 +757,7 @@ impl Tasks {
             fired: false,
             done_ms: None,
             origin,
+            snoozed_from: None,
         });
         self.dirty = true;
         self.items.last().unwrap()
@@ -772,6 +780,7 @@ impl Tasks {
             task.repeat = draft.repeat;
             task.fired = false;
             task.done_ms = None;
+            task.snoozed_from = None;
         }
     }
 
@@ -790,6 +799,9 @@ impl Tasks {
     pub fn snooze(&mut self, id: &str, now_ms: i64) -> Option<i64> {
         let task = self.get_mut(id)?;
         let at = now_ms + SNOOZE_MS;
+        if task.repeat.is_some() && task.snoozed_from.is_none() {
+            task.snoozed_from = task.due_ms;
+        }
         task.due_ms = Some(at);
         task.fired = false;
         task.done_ms = None;
@@ -826,7 +838,8 @@ impl Tasks {
                 origin: task.origin.clone(),
                 due_ms: due,
             });
-            match (task.repeat, Local.timestamp_millis_opt(due).single()) {
+            let from = task.snoozed_from.take().unwrap_or(due);
+            match (task.repeat, Local.timestamp_millis_opt(from).single()) {
                 (Some(repeat), Some(at)) => task.due_ms = Some(repeat.next_after(at, now).timestamp_millis()),
                 _ => task.fired = true,
             }
@@ -917,7 +930,7 @@ pub fn as_text(task: &Task, now: DateTime<Local>) -> String {
         Some(Repeat::Weekdays) => format!("{} every weekday at {time}", task.text),
         Some(Repeat::Minutes(n)) if n % 60 == 0 => format!("{} every {} hours", task.text, n / 60),
         Some(Repeat::Minutes(n)) => format!("{} every {n} minutes", task.text),
-        Some(Repeat::Days(n)) => format!("{} every {n} days", task.text),
+        Some(Repeat::Days(n)) => format!("{} every {n} days at {time}", task.text),
         None if due <= now => task.text.clone(),
         None if (due.date_naive() - now.date_naive()).num_days() > 6 => {
             format!("{} on {} at {time}", task.text, due.format("%-d %b").to_string().to_lowercase())
@@ -1042,6 +1055,38 @@ mod tests {
         assert_eq!(tasks.due_count(), 0);
         let order: Vec<&str> = tasks.ordered().iter().map(|t| t.text.as_str()).collect();
         assert_eq!(order, ["water", "buy milk", "stretch"]);
+    }
+
+    #[test]
+    fn snoozed_repeats_keep_their_time() {
+        let mut tasks = Tasks::default();
+        tasks.add(read("water every day at 2:05pm"), None, 0);
+        let rang = at(21, 14, 6);
+        assert_eq!(tasks.fire(rang).len(), 1);
+        let id = tasks.items[0].id.clone();
+        let snoozed = tasks.snooze(&id, rang.timestamp_millis()).unwrap();
+        assert_eq!(tasks.fire(Local.timestamp_millis_opt(snoozed).unwrap()).len(), 1);
+        assert_eq!(tasks.items[0].due_ms, Some(at(22, 14, 5).timestamp_millis()));
+    }
+
+    #[test]
+    fn todays_weekday_with_a_loose_hour_is_today() {
+        assert_eq!(read("review wed at 3").due, Some(at(21, 15, 0)));
+    }
+
+    #[test]
+    fn wide_characters_after_at_stay_text() {
+        for s in ["lunch at 😀", "geschenk at für"] {
+            assert_eq!(read(s).due, None, "{s}");
+        }
+    }
+
+    #[test]
+    fn every_few_days_keeps_its_time_when_edited() {
+        let mut tasks = Tasks::default();
+        tasks.add(read("water plants every 2 days at 9am"), None, 0);
+        let text = as_text(&tasks.items[0], now());
+        assert_eq!(Draft::read(&text, now()).due.map(|d| d.time()), Some(hm(9, 0)), "{text}");
     }
 
     #[test]

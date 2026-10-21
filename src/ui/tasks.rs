@@ -172,6 +172,10 @@ impl TaskPanel {
             return Action::Stay;
         }
         let draft = self.draft();
+        if draft.text.is_empty() {
+            self.warning = Some("say what to do, not just when");
+            return Action::Stay;
+        }
         if draft.due.is_some_and(|d| d <= Local::now()) {
             self.warning = Some("that time has already passed");
             return Action::Stay;

@@ -1136,7 +1136,12 @@ impl App {
             // back to where it was set.
             KeyCode::Char('x' | ' ') if matches!(entry.body, Body::Reminder { .. }) => {
                 if let Body::Reminder { task, .. } = &entry.body {
-                    self.toggle_task(task);
+                    // Checking off a repeat would end the whole series.
+                    if self.tasks.get(task).is_some_and(|t| t.repeat.is_some() && !t.done()) {
+                        self.flash("that one repeats · delete it in Ctrl-T to stop it");
+                    } else {
+                        self.toggle_task(task);
+                    }
                 }
             }
             KeyCode::Char('s') if matches!(entry.body, Body::Reminder { .. }) => {
