@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{Command, Input, Update};
 use crate::lobby::LOBBY;
+use crate::me::ME;
 
 /// The word that addresses the devices in a group.
 pub const MENTION: &str = "@home";
@@ -344,10 +345,13 @@ impl Home {
         self.config.groups.iter().any(|g| g == group)
     }
 
-    /// Whether home answers a request in `group`: always for the person
-    /// at this machine, and for everyone else where it is switched on.
+    /// Whether home answers a request in `group`: for everyone where it is
+    /// switched on, and for the person at this machine in Me, the lobby,
+    /// and any group where there are devices here to drive. Without any,
+    /// it keeps quiet in a group, so the member hosting home there answers
+    /// alone instead of beside a "no devices" from every other member.
     fn answers(&self, group: &str, mine: bool) -> bool {
-        mine || self.enabled(group)
+        self.enabled(group) || (mine && (group == LOBBY || group == ME || !self.config.devices.is_empty()))
     }
 
     fn save(&self) {
@@ -452,6 +456,8 @@ impl Home {
                     let text: String = text.chars().take(MAX_REQUEST_CHARS).collect();
                     let answer = self.ask(&group, &from, &text);
                     self.say(&group, answer);
+                } else if mine {
+                    self.note("home: no devices here, so whoever hosts home in this group answers".into());
                 }
             }
             Request::Chat(question) => self.ai_ask(question),
@@ -922,7 +928,6 @@ mod tests {
     use super::assistant::{colour, flag, number, text};
     use super::ollama::{self, Ollama, Turn};
     use super::*;
-    use crate::me::ME;
     use serde_json::json;
 
     fn home_with(devices: Vec<Device>) -> Home {
@@ -1115,30 +1120,49 @@ mod tests {
         home.handle(ask("g", false));
         assert!(answer(&engine).is_none(), "the rest of a group needs /home on");
         home.handle(ask("g", true));
-        let (group, _) = answer(&engine).expect("its owner is answered in any group");
-        assert_eq!(group, "g");
+        assert!(answer(&engine).is_none(), "with no devices here, the group's host answers");
+        home.config.devices.push(Device {
+            kind: Kind::Light,
+            name: "Lamp".into(),
+            ip: Ipv4Addr::new(192, 168, 1, 10),
+            mac: None,
+            model: None,
+            key: None,
+            cert: None,
+        });
+        assert!(home.answers("g", true), "its owner is answered in any group once it has devices");
+        assert!(!home.answers("g", false));
+        home.config.devices.clear();
         home.handle(ask(LOBBY, true));
         let (group, text) = answer(&engine).expect("an answer in the lobby");
         assert_eq!(group, LOBBY);
         assert!(text.starts_with(SIGNATURE) && text.contains("no devices"), "{text}");
 
-        let question = |mine| ai::Question {
-            group: LOBBY.into(),
+        let question = |group: &str, mine| ai::Question {
+            group: group.into(),
             from: "someone".into(),
             id: "lb_1".into(),
             sender: "off1someone".into(),
             text: "hi".into(),
             mine,
         };
-        let answered = |mine| Request::Answered {
-            question: question(mine),
+        let answered = |group: &str, mine| Request::Answered {
+            question: question(group, mine),
             asked: json!({"role": "user", "content": "someone: hi"}),
             answer: Ok("hello".into()),
         };
-        home.handle(answered(false));
+        home.handle(answered(LOBBY, false));
         assert!(answer(&engine).is_none(), "anyone else needs /ai on");
-        home.handle(answered(true));
+        home.handle(answered(LOBBY, true));
         assert_eq!(answer(&engine), Some((LOBBY.to_string(), "🤖 hello".to_string())));
+        // In a group, the owner's own model answers only while it runs here;
+        // without one, whoever switched @ai on there answers alone.
+        home.handle(answered("g", true));
+        assert!(answer(&engine).is_none(), "no model here, no second answer in a group");
+        home.model_state = ModelState::Ready;
+        home.handle(answered("g", true));
+        assert_eq!(answer(&engine), Some(("g".to_string(), "🤖 hello".to_string())));
+        home.model_state = ModelState::default();
 
         // Switched on in the lobby, everyone nearby may ask.
         home.handle(Request::Configure { group: Some(LOBBY.into()), args: "on".into() });

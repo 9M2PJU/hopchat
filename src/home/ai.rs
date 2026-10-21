@@ -11,9 +11,10 @@ use std::thread;
 use serde_json::{json, Value};
 
 use super::ollama::{text_of, Ollama};
-use super::{Home, Request};
+use super::{Home, ModelState, Request};
 use crate::engine::{Command, Input, Quote};
 use crate::lobby::LOBBY;
+use crate::me::ME;
 
 /// The word that addresses the model in a group.
 pub const MENTION: &str = "@ai";
@@ -42,14 +43,20 @@ impl Home {
         self.config.ai_groups.iter().any(|g| g == group)
     }
 
-    /// Always for the person at this machine, and for everyone else
-    /// where it is switched on.
+    /// For everyone where it is switched on, and for the person at this
+    /// machine in Me, the lobby, and any group while a model runs here.
+    /// Without one it keeps quiet in a group rather than borrow the very
+    /// model whose owner switched `@ai` on there and is answering already.
     fn ai_answers(&self, q: &Question) -> bool {
-        q.mine || self.ai_enabled(&q.group)
+        self.ai_enabled(&q.group)
+            || (q.mine && (q.group == LOBBY || q.group == ME || self.model_state == ModelState::Ready))
     }
 
     pub(super) fn ai_ask(&mut self, q: Question) {
         if !self.ai_answers(&q) {
+            if q.mine {
+                self.note("ai: no model here, so whoever switched @ai on in this group answers".into());
+            }
             return;
         }
         let text: String = q.text.chars().take(MAX_QUESTION_CHARS).collect();
