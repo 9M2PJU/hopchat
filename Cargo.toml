@@ -1,0 +1,16 @@
+[package]
+name = "hopchat"
+version = "0.1.0"
+edition = "2024"
+description = "Offline terminal chat over an Offline Protocol mesh: no internet, no server"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+getrandom = "0.4.3"
+offline-protocol = { version = "0.30.0", default-features = false, features = ["file-store"] }
+offline-protocol-core = "0.30.0"
+offline-protocol-mls = "0.30.0"
+offline-protocol-transport = "0.30.0"
+ratatui = "0.30.2"
+serde_json = "1.0.154"
+socket2 = { version = "0.6.5", features = ["all"] }
