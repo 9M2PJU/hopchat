@@ -29,7 +29,35 @@ Two terminals on one machine work too. Each name gets its own identity under `~/
 | F1 | help |
 | Ctrl-C / Ctrl-Q | quit |
 
-Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/quit`.
+Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/quit`, and for groups `/group`, `/invite`, `/members`, `/leave`, `/home`.
+
+## Groups
+
+`/group house` starts a group; open it and `/invite bob` adds anyone nearby. Groups are MLS groups (RFC 9420) carried over the same peer-to-peer links, so they need no server either. Files still go one-to-one.
+
+## Home: talk to your devices
+
+Anyone in a group can talk to the smart devices on the machine that hosts them. Mention `@home`:
+
+```
+@home dim the lights to 20% and put on netflix
+@home make the lamp purple
+@home turn the tv down a bit
+@home is the light on?
+```
+
+A local model (via [Ollama](https://ollama.com)) turns the request into device actions, and home answers in the group with a 🏠. Nothing leaves your network.
+
+Setup on the host:
+
+1. `ollama serve`, with a tool-calling model pulled (`ollama pull qwen2.5:7b` is the default; `/home model NAME` picks another).
+2. The Wiz bulb is found by itself on first start. If it isn't, use `/home bulb 192.168.1.10`.
+3. `/home tv 192.168.1.30` pairs the LG TV. Accept the prompt on the TV within a minute. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings.
+4. In each group that should have access: `/home on` (and `/home off` to revoke it).
+
+Being in the group is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. Home only answers while the host's hopchat is running. Settings are kept in `~/.hopchat/<name>/home.json`. That file holds the TV's client key and its pinned certificate: the TV's certificate is self-signed, so hopchat trusts the one it sees at pairing and refuses a different one later.
+
+Devices: Wiz bulbs (local UDP, port 38899) and LG webOS TVs (the WebSocket API on port 3001 over TLS, or 3000 on older sets). The code is in `src/home/`.
 
 ## Headless modes
 
@@ -37,6 +65,8 @@ Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/qu
 hopchat --name bot --echo                         # answers every message and file: something to test against
 hopchat --name alice --say "hello" --to bot       # sends one message, prints what happens
 hopchat --name alice --file ./notes.pdf --to bot  # sends one file
+hopchat --name alice --group house --home --to bob --say "@home is the light on?"
+                                                  # starts a group, invites bob, lets it use the devices
 ```
 
 Without `--to`, `--say` and `--file` go to the first peer whose secure session comes up.

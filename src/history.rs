@@ -101,6 +101,9 @@ pub struct Entry {
     /// For theirs: whether we told them we read it.
     #[serde(default)]
     pub read: bool,
+    /// In a group: who wrote it, when it is not ours.
+    #[serde(default)]
+    pub sender: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -108,6 +111,11 @@ pub struct Conversation {
     pub address: String,
     pub nick: String,
     pub entries: Vec<Entry>,
+    /// A group conversation: `address` is the group id, `nick` its name.
+    #[serde(default)]
+    pub group: bool,
+    #[serde(default)]
+    pub members: Vec<String>,
     #[serde(skip)]
     pub dirty: bool,
 }
@@ -172,6 +180,8 @@ impl Store {
             address: convo.address.clone(),
             nick: convo.nick.clone(),
             entries: convo.entries[skip..].to_vec(),
+            group: convo.group,
+            members: convo.members.clone(),
             dirty: false,
         };
         let plain = serde_json::to_vec(&trimmed).map_err(std::io::Error::other)?;
@@ -221,7 +231,10 @@ mod tests {
                 hops: 0,
                 reply: None,
                 read: false,
+                sender: None,
             }],
+            group: false,
+            members: Vec::new(),
             dirty: true,
         };
         store.save(&convo).unwrap();

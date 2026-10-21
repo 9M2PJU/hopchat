@@ -23,6 +23,7 @@ use ratatui::DefaultTerminal;
 
 use crate::engine::{self, Command, Input, Quote, Update};
 use crate::history::{self, Body, Conversation, Entry, Quoted, Status, Transfer};
+use crate::home;
 use editor::Editor;
 use picker::{Outcome, Picker};
 
@@ -123,6 +124,7 @@ pub struct App {
     last_edit: Instant,
     title: String,
     quit: bool,
+    home: Sender<home::Request>,
 }
 
 pub fn now_ms() -> i64 {
@@ -135,6 +137,7 @@ impl App {
         me_address: String,
         store: Option<history::Store>,
         downloads: PathBuf,
+        home: Sender<home::Request>,
     ) -> Self {
         let mut convos = Vec::new();
         let mut owners = HashMap::new();
@@ -144,6 +147,7 @@ impl App {
                     owners.insert(e.id.clone(), data.address.clone());
                 }
                 let active_ms = data.entries.last().map_or(0, |e| e.at_ms);
+                // A group we are still in is announced by the engine at start.
                 convos.push(Convo {
                     data,
                     online: false,
@@ -180,6 +184,7 @@ impl App {
             last_edit: Instant::now(),
             title: String::new(),
             quit: false,
+            home,
         };
         app.selected = app.ordered().first().map(|c| c.data.address.clone());
         app
@@ -359,6 +364,7 @@ impl App {
                     hops: 0,
                     reply: reply.map(|q| quoted(q, &me)),
                     read: false,
+                    sender: None,
                 });
             }
             Update::Incoming {
@@ -379,6 +385,7 @@ impl App {
                     hops,
                     reply: reply.map(|q| quoted(q, &me)),
                     read: false,
+                    sender: None,
                 };
                 self.receive(&from, entry, &text);
             }
@@ -460,6 +467,7 @@ impl App {
                     hops: 1,
                     reply: None,
                     read: false,
+                    sender: None,
                 };
                 self.receive(&from, entry, &preview);
             }
@@ -502,6 +510,89 @@ impl App {
                         convo.data.dirty = true;
                     }
                 }
+            }
+            Update::Group { id, name, members } => {
+                let me = self.me_address.clone();
+                let convo = self.convo_mut(&id);
+                let fresh = !convo.data.group || !convo.online;
+                let joined: Vec<String> =
+                    members.iter().filter(|m| !convo.data.members.contains(m)).cloned().collect();
+                let had_members = !convo.data.members.is_empty();
+                convo.data.group = true;
+                convo.data.nick = name.clone();
+                convo.data.members = members;
+                convo.online = true;
+                convo.secure = true;
+                convo.data.dirty = true;
+                if had_members {
+                    for member in joined.into_iter().filter(|m| *m != me) {
+                        let who = self.nick_of(&member);
+                        self.convo_mut(&id).push(notice(format!("{who} joined")));
+                    }
+                }
+                if fresh {
+                    self.note(render::OK, format!("group      {name}"));
+                }
+            }
+            Update::GroupLeft { id } => {
+                let convo = self.convo_mut(&id);
+                convo.online = false;
+                convo.secure = false;
+                convo.push(notice("you are no longer in this group".into()));
+            }
+            Update::GroupQueued {
+                group,
+                id,
+                text,
+                reply,
+            } => {
+                self.owners.insert(id.clone(), group.clone());
+                let me = self.me_address.clone();
+                self.convo_mut(&group).push(Entry {
+                    id,
+                    mine: true,
+                    at_ms: now_ms(),
+                    body: Body::Text(text),
+                    status: Status::Queued,
+                    hops: 0,
+                    reply: reply.map(|q| quoted(q, &me)),
+                    read: false,
+                    sender: None,
+                });
+            }
+            Update::GroupIncoming {
+                group,
+                from,
+                id,
+                text,
+                reply_to,
+            } => {
+                let reply = reply_to.and_then(|rid| {
+                    let convo = self.convos.iter().find(|c| c.data.address == group)?;
+                    let e = convo.data.entries.iter().rev().find(|e| e.id == rid)?;
+                    Some(Quoted {
+                        id: rid,
+                        mine: e.mine,
+                        text: render::entry_summary(e),
+                    })
+                });
+                let preview = format!("{}: {text}", self.nick_of(&from));
+                let entry = Entry {
+                    id,
+                    mine: false,
+                    at_ms: now_ms(),
+                    body: Body::Text(text),
+                    status: Status::Sent,
+                    hops: 1,
+                    reply,
+                    read: false,
+                    sender: Some(from),
+                };
+                self.receive(&group, entry, &preview);
+            }
+            Update::Home(text) => {
+                self.note(render::ACCENT, text.clone());
+                self.flash(text);
             }
             Update::Protocol(event) => self.on_protocol(*event),
             Update::Error(e) => {
@@ -613,7 +704,7 @@ impl App {
             && let Some(convo) = self.current_mut()
         {
             convo.unread = 0;
-            if convo.online && convo.secure {
+            if convo.online && convo.secure && !convo.data.group {
                 let mut ids = Vec::new();
                 for entry in convo.data.entries.iter_mut().filter(|e| !e.mine && !e.read) {
                     entry.read = true;
@@ -672,6 +763,9 @@ impl App {
     fn edited(&mut self, send: &impl Fn(Command)) {
         self.last_edit = Instant::now();
         let Some(to) = self.selected.clone() else { return };
+        if self.in_group() {
+            return;
+        }
         if self.editor.is_empty() || self.editor.text().starts_with('/') {
             return self.stop_typing(send);
         }
@@ -896,6 +990,21 @@ impl App {
 
     fn retry(&mut self, entry: &Entry, send: &impl Fn(Command)) {
         let Some(to) = self.selected.clone() else { return };
+        if self.in_group() {
+            if let Body::Text(text) = &entry.body
+                && matches!(entry.status, Status::Failed(_))
+            {
+                send(Command::SendGroup {
+                    group: to,
+                    text: text.clone(),
+                    reply: None,
+                    from_home: false,
+                });
+            } else {
+                self.flash("nothing to retry");
+            }
+            return;
+        }
         match &entry.body {
             Body::Text(text) if matches!(entry.status, Status::Failed(_)) => send(Command::Send {
                 to,
@@ -1006,6 +1115,7 @@ impl App {
             hops: 0,
             reply: None,
             read: false,
+            sender: None,
         });
         send(Command::SendFile { to, path, file_id });
     }
@@ -1022,6 +1132,29 @@ impl App {
             }
             return;
         };
+        if self.in_group() {
+            if !self.attachments.is_empty() {
+                self.attachments.clear();
+                self.flash_error("files can't go to a group yet; send them to one person");
+            }
+            if !text.is_empty() {
+                let reply = self.reply_target().map(|e| Quote {
+                    id: e.id.clone(),
+                    sender: e.sender.clone().unwrap_or_else(|| self.me_address.clone()),
+                    text: render::entry_summary(e),
+                });
+                send(Command::SendGroup {
+                    group: to,
+                    text,
+                    reply,
+                    from_home: false,
+                });
+            }
+            self.editor.take();
+            self.reply = None;
+            self.scroll = 0;
+            return;
+        }
         for path in std::mem::take(&mut self.attachments) {
             self.send_file(to.clone(), path, send);
         }
@@ -1094,11 +1227,67 @@ impl App {
                 copy_to_clipboard(&self.me_address);
                 self.flash(format!("{text} (address copied)"));
             }
+            "group" | "newgroup" if !arg.is_empty() => {
+                send(Command::CreateGroup { name: arg.to_string() });
+            }
+            "group" | "newgroup" => self.flash_error("name it: /group NAME"),
+            "invite" | "add" => {
+                let Some(group) = self.selected.clone().filter(|_| self.in_group()) else {
+                    return self.flash_error("open a group first, then /invite NICK");
+                };
+                match self.find_peer(arg) {
+                    Some(member) => {
+                        let who = self.nick_of(&member);
+                        send(Command::Invite { group, member });
+                        self.flash(format!("inviting {who}…"));
+                    }
+                    None => self.flash_error(format!("no one nearby called {arg}")),
+                }
+            }
+            "leave" => match self.selected.clone().filter(|_| self.in_group()) {
+                Some(group) => send(Command::Leave { group }),
+                None => self.flash_error("/leave works in a group"),
+            },
+            "members" | "who" => {
+                if let Some(convo) = self.current().filter(|c| c.data.group) {
+                    let names: Vec<String> =
+                        convo.data.members.iter().map(|m| self.nick_of(m)).collect();
+                    let text = format!("members: {}", names.join(", "));
+                    let address = convo.data.address.clone();
+                    self.convo_mut(&address).push(notice(text));
+                }
+            }
+            "home" => {
+                let group = self.selected.clone().filter(|_| self.in_group());
+                let _ = self.home.send(home::Request::Configure {
+                    group,
+                    args: arg.to_string(),
+                });
+            }
             "log" => self.show_log = !self.show_log,
             "help" | "?" => self.mode = Mode::Help,
             "quit" | "exit" | "q" => self.quit = true,
             _ => self.flash_error(format!("unknown command /{name} · /help lists them")),
         }
+    }
+}
+
+impl App {
+    fn in_group(&self) -> bool {
+        self.current().is_some_and(|c| c.data.group)
+    }
+
+    /// A person by nick (case-insensitive) or by address.
+    fn find_peer(&self, who: &str) -> Option<String> {
+        let who = who.trim().trim_start_matches('@');
+        if who.is_empty() {
+            return None;
+        }
+        self.convos
+            .iter()
+            .filter(|c| !c.data.group)
+            .find(|c| c.data.address == who || c.data.nick.eq_ignore_ascii_case(who))
+            .map(|c| c.data.address.clone())
     }
 }
 
@@ -1156,6 +1345,7 @@ fn notice(text: String) -> Entry {
         hops: 0,
         reply: None,
         read: true,
+        sender: None,
     }
 }
 
@@ -1336,12 +1526,69 @@ mod render_tests {
             hops: 1,
             reply: None,
             read: true,
+            sender: None,
         }
+    }
+
+    fn test_app() -> App {
+        let (home, _) = std::sync::mpsc::channel();
+        App::new("alice".into(), "off1alice000000000000".into(), None, PathBuf::from("/tmp/dl"), home)
+    }
+
+    fn screen(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn renders_a_group_with_senders() {
+        let mut app = test_app();
+        let send = |_: Command| {};
+        app.apply(Update::PeerSeen { address: "off1bob00000000000000".into(), nick: "bob".into() }, &send);
+        app.apply(
+            Update::Group {
+                id: "g1".into(),
+                name: "house".into(),
+                members: vec!["off1alice000000000000".into(), "off1bob00000000000000".into()],
+            },
+            &send,
+        );
+        app.apply(
+            Update::GroupIncoming {
+                group: "g1".into(),
+                from: "off1bob00000000000000".into(),
+                id: "m1".into(),
+                text: "@home dim the lights".into(),
+                reply_to: None,
+            },
+            &send,
+        );
+        app.apply(
+            Update::GroupQueued { group: "g1".into(), id: "m2".into(), text: "🏠 light is now on at 30%".into(), reply: None },
+            &send,
+        );
+        app.selected = Some("g1".into());
+        let screen = screen(&mut app);
+        println!("{screen}");
+        for needle in ["# house", "2 members", "bob", "@home dim the lights", "you", "light is now on at 30%"] {
+            assert!(screen.contains(needle), "missing {needle:?}");
+        }
+        assert!(app.find_peer("BOB").is_some());
+        assert!(app.find_peer("house").is_none(), "a group is not a person to invite");
     }
 
     #[test]
     fn renders_a_conversation() {
-        let mut app = App::new("alice".into(), "off1alice000000000000".into(), None, PathBuf::from("/tmp/dl"));
+        let mut app = test_app();
         let convo = app.convo_mut("off1bob00000000000000");
         convo.data.nick = "bob".into();
         convo.online = true;
@@ -1365,6 +1612,7 @@ mod render_tests {
             hops: 0,
             reply: None,
             read: true,
+            sender: None,
         });
         convo.typing_until = Some(Instant::now() + Duration::from_secs(5));
         app.convo_mut("off1carol0000000000000").data.nick = "carol".into();

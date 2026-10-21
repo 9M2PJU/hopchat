@@ -5,6 +5,7 @@
 
 mod engine;
 mod history;
+mod home;
 mod net;
 mod ui;
 
@@ -13,7 +14,7 @@ use std::sync::mpsc;
 use std::thread;
 
 const USAGE: &str = "usage: hopchat [--name NICK] [--dir PATH] [--downloads PATH]
-               [--echo | --say TEXT | --file PATH] [--to NICK]
+               [--echo | --say TEXT | --file PATH] [--to NICK] [--group NAME [--home]]
 
   --name NICK       what peers see you as (default: $USER)
   --dir PATH        where your identity and history live (default: ~/.hopchat/NICK)
@@ -22,6 +23,9 @@ const USAGE: &str = "usage: hopchat [--name NICK] [--dir PATH] [--downloads PATH
   --say TEXT        no UI: send TEXT to the first peer that connects
   --file PATH       no UI: send the file at PATH to the first peer that connects
   --to NICK         with --say/--file: only send to a peer with this nick
+  --group NAME      no UI: create group NAME, invite peers as they connect
+                    (only --to NICK, if given), and --say into the group
+  --home            with --group: let the group use this machine's devices
 
 Run two copies with different names to chat with yourself on one machine.";
 
@@ -33,6 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut say: Option<String> = None;
     let mut file: Option<PathBuf> = None;
     let mut to: Option<String> = None;
+    let mut group: Option<String> = None;
+    let mut home_on = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -43,6 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--say" => say = Some(args.next().ok_or(USAGE)?),
             "--file" => file = Some(args.next().ok_or(USAGE)?.into()),
             "--to" => to = Some(args.next().ok_or(USAGE)?),
+            "--group" => group = Some(args.next().ok_or(USAGE)?),
+            "--home" => home_on = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -74,7 +82,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (update_tx, update_rx) = mpsc::channel();
     let (input_tx, input_rx) = mpsc::channel();
 
-    let (engine, me, store_key) = engine::open(&dir, &nick, downloads.clone(), update_tx)?;
+    let (mut engine, me, store_key) =
+        engine::open(&dir, &nick, downloads.clone(), update_tx.clone())?;
+
+    // Home answers @home in the groups it is switched on for.
+    let (home_tx, home_rx) = mpsc::channel();
+    engine.set_home(home_tx.clone());
+    {
+        let home = home::Home::open(&dir, input_tx.clone(), update_tx);
+        thread::spawn(move || home.run(home_rx));
+    }
 
     // The network reports into the engine's input queue.
     let (net_tx, net_rx) = mpsc::channel();
@@ -91,8 +108,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     thread::spawn(move || engine.run(input_rx));
 
-    if echo || say.is_some() || file.is_some() {
-        headless(&me, update_rx, input_tx, echo, say, file, to);
+    if echo || say.is_some() || file.is_some() || group.is_some() {
+        let script = Script {
+            echo,
+            say,
+            file,
+            to,
+            group,
+            home_on,
+        };
+        headless(&me, update_rx, input_tx, home_tx, script);
         return Ok(());
     }
 
@@ -103,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let app = ui::App::new(me.nick, me.address, store, downloads);
+    let app = ui::App::new(me.nick, me.address, store, downloads, home_tx);
     let mut terminal = ratatui::init();
     enable_extras();
     let result = app.run(&mut terminal, update_rx, input_tx);
@@ -144,18 +169,36 @@ fn disable_extras() {
     let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
 }
 
+/// What a headless run does.
+struct Script {
+    echo: bool,
+    say: Option<String>,
+    file: Option<PathBuf>,
+    to: Option<String>,
+    group: Option<String>,
+    home_on: bool,
+}
+
 /// No TUI: prints what happens. `--echo` answers every message it gets;
 /// `--say TEXT` and `--file PATH` send to the first peer whose secure
 /// session is up (and, with `--to NICK`, whose beacon carries that nick).
+/// With `--group NAME`, that peer is invited to a new group instead and
+/// `--say` goes to the group once they have joined.
 fn headless(
     me: &net::LocalIdentity,
     updates: mpsc::Receiver<engine::Update>,
     commands: mpsc::Sender<engine::Input>,
-    echo: bool,
-    mut say: Option<String>,
-    mut file: Option<PathBuf>,
-    to: Option<String>,
+    home: mpsc::Sender<home::Request>,
+    script: Script,
 ) {
+    let Script {
+        echo,
+        mut say,
+        mut file,
+        to,
+        group,
+        home_on,
+    } = script;
     use std::collections::{HashMap, HashSet};
 
     use engine::{Command, Input, Update};
@@ -167,13 +210,25 @@ fn headless(
     };
     let mut nicks: HashMap<String, String> = HashMap::new();
     let mut ready: HashSet<String> = HashSet::new();
+    // With --group: the group once it exists, and who to invite into it.
+    let mut group_id: Option<String> = None;
+    let mut invite: Vec<String> = Vec::new();
+    let mut invited: HashSet<String> = HashSet::new();
+    let mut say_group = if group.is_some() { say.take() } else { None };
+    if let Some(name) = &group {
+        send(Command::CreateGroup { name: name.clone() });
+    }
     // Sends once a ready peer is known to be the wanted one; the beacon
     // with its nick and its session can arrive in either order.
-    let mut deliver = |address: &str, nicks: &HashMap<String, String>| {
+    let mut deliver = |address: &str, nicks: &HashMap<String, String>, invite: &mut Vec<String>| {
         let wanted = to
             .as_ref()
             .is_none_or(|n| nicks.get(address) == Some(n));
         if !wanted {
+            return;
+        }
+        if group.is_some() {
+            invite.push(address.to_string());
             return;
         }
         if let Some(text) = say.take() {
@@ -192,12 +247,22 @@ fn headless(
         }
     };
     for update in updates {
+        if let Some(id) = &group_id {
+            for member in invite.drain(..) {
+                if invited.insert(member.clone()) {
+                    send(Command::Invite {
+                        group: id.clone(),
+                        member,
+                    });
+                }
+            }
+        }
         match update {
             Update::Typing { .. } => {}
             Update::PeerSeen { address, nick } => {
                 nicks.insert(address.clone(), nick);
                 if ready.contains(&address) {
-                    deliver(&address, &nicks);
+                    deliver(&address, &nicks, &mut invite);
                 }
             }
             Update::PeerUp { address } => println!("link up {address}"),
@@ -218,7 +283,7 @@ fn headless(
             Update::SessionReady { address } => {
                 println!("secure session with {address}");
                 ready.insert(address.clone());
-                deliver(&address, &nicks);
+                deliver(&address, &nicks, &mut invite);
             }
             Update::FileQueued {
                 file_id, name, size, ..
@@ -252,6 +317,47 @@ fn headless(
             } => println!("file from {from} lost: {name}: {reason}"),
             Update::ResendWanted { file_id, .. } => println!("resend wanted {file_id}"),
             Update::Read { from, ids } => println!("read by {from}: {}", ids.join(",")),
+            Update::Group { id, name, members } => {
+                println!("group {name} ({id}): {} members", members.len());
+                if group_id.is_none() && group.as_ref() == Some(&name) {
+                    group_id = Some(id.clone());
+                    if home_on {
+                        let _ = home.send(home::Request::Configure {
+                            group: Some(id.clone()),
+                            args: "on".into(),
+                        });
+                    }
+                }
+                if group_id.as_ref() == Some(&id)
+                    && members.len() > 1
+                    && let Some(text) = say_group.take()
+                {
+                    send(Command::SendGroup {
+                        group: id,
+                        text,
+                        reply: None,
+                        from_home: false,
+                    });
+                }
+            }
+            Update::GroupLeft { id } => println!("left group {id}"),
+            Update::GroupQueued { group, id, text, .. } => {
+                println!("queued {id} to group {group}: {text}")
+            }
+            Update::GroupIncoming {
+                group, from, text, ..
+            } => {
+                println!("group {group} message from {from}: {text}");
+                if echo && from != me.address && !text.starts_with("echo: ") {
+                    send(Command::SendGroup {
+                        group,
+                        text: format!("echo: {text}"),
+                        reply: None,
+                        from_home: false,
+                    });
+                }
+            }
+            Update::Home(text) => println!("{text}"),
             Update::Error(e) => println!("error {e}"),
             Update::Protocol(event) => match *event {
                 Event::MessageDelivered {

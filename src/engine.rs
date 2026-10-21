@@ -18,6 +18,7 @@ use offline_protocol_transport::{
     Transport, TransportStatus, TransportType, WifiDirectTransport,
 };
 
+use crate::home;
 use crate::net::{self, LocalIdentity, NetEvent};
 
 pub const APP_ID: &str = "dev.hopchat";
@@ -57,6 +58,23 @@ pub enum Command {
     Read {
         to: String,
         ids: Vec<String>,
+    },
+    CreateGroup {
+        name: String,
+    },
+    Invite {
+        group: String,
+        member: String,
+    },
+    Leave {
+        group: String,
+    },
+    SendGroup {
+        group: String,
+        text: String,
+        reply: Option<Quote>,
+        /// Written by home itself, so never handed back to it.
+        from_home: bool,
     },
 }
 
@@ -118,6 +136,29 @@ pub enum Update {
     ResendWanted { file_id: String, to: String },
     Typing { from: String, on: bool },
     Read { from: String, ids: Vec<String> },
+    /// A group we are in, as it stands now (joined, created or changed).
+    Group {
+        id: String,
+        name: String,
+        members: Vec<String>,
+    },
+    GroupLeft { id: String },
+    /// A group send was accepted locally under `id`.
+    GroupQueued {
+        group: String,
+        id: String,
+        text: String,
+        reply: Option<Quote>,
+    },
+    GroupIncoming {
+        group: String,
+        from: String,
+        id: String,
+        text: String,
+        reply_to: Option<String>,
+    },
+    /// Something home did or wants the person at this machine to know.
+    Home(String),
     Protocol(Box<Event>),
     Error(String),
 }
@@ -143,6 +184,11 @@ pub struct Engine {
     /// Files waiting for a session or a free slot, oldest first.
     outbox: VecDeque<PendingFile>,
     downloads: PathBuf,
+    /// Where group messages that mention `@home` go, when home is running.
+    home: Option<Sender<home::Request>>,
+    /// Beacon nicks, for telling home who is asking.
+    nicks: HashMap<String, String>,
+    nick: String,
 }
 
 /// A fresh transfer id: our own, so the UI can track a file from the moment
@@ -216,6 +262,9 @@ pub fn open(
             events,
             outbox: VecDeque::new(),
             downloads,
+            home: None,
+            nicks: HashMap::new(),
+            nick: nick.to_string(),
         },
         me,
         store_key,
@@ -265,11 +314,19 @@ impl Engine {
             }
     }
 
+    pub fn set_home(&mut self, home: Sender<home::Request>) {
+        self.home = Some(home);
+    }
+
     fn update(&self, update: Update) {
         let _ = self.updates.send(update);
     }
 
     pub fn run(mut self, inputs: Receiver<Input>) {
+        // Groups live in MLS storage; tell the UI which we are already in.
+        for id in self.protocol.list_groups().unwrap_or_default() {
+            self.announce_group(&id);
+        }
         loop {
             match inputs.recv_timeout(TICK) {
                 Ok(input) => self.handle(input),
@@ -286,6 +343,7 @@ impl Engine {
     fn handle(&mut self, input: Input) {
         match input {
             Input::Net(NetEvent::Seen { address, nick }) => {
+                self.nicks.insert(address.clone(), nick.clone());
                 self.update(Update::PeerSeen { address, nick });
             }
             Input::Net(NetEvent::Up { address, stream }) => {
@@ -325,6 +383,92 @@ impl Engine {
                     let _ = self.protocol.send_read_receipt(&to, ids.to_vec());
                 }
             }
+            Input::Ui(Command::CreateGroup { name }) => match self.protocol.create_group(&name) {
+                Ok(info) => self.announce_group(info.group_id.as_str()),
+                Err(e) => self.error(format!("group not created: {e}")),
+            },
+            Input::Ui(Command::Invite { group, member }) => {
+                match self.protocol.invite_to_group(&group, &member) {
+                    Ok(()) => self.announce_group(&group),
+                    Err(ProtocolError::NoKeyPackage(_)) => {
+                        // Ask for a fresh one; the invite can be retried
+                        // once it arrives.
+                        if self.streams.contains_key(&member) {
+                            self.protocol.on_neighbor_discovered(&member);
+                        }
+                        self.error(
+                            "invite failed: no key package from them yet, try again in a moment"
+                                .into(),
+                        );
+                    }
+                    Err(e) => self.error(format!("invite failed: {e}")),
+                }
+            }
+            Input::Ui(Command::Leave { group }) => match self.protocol.leave_group(&group) {
+                Ok(()) => self.update(Update::GroupLeft { id: group }),
+                Err(e) => self.error(format!("leave failed: {e}")),
+            },
+            Input::Ui(Command::SendGroup {
+                group,
+                text,
+                reply,
+                from_home,
+            }) => self.send_group(group, text, reply, from_home),
+        }
+    }
+
+    fn announce_group(&self, id: &str) {
+        let Ok(Some(info)) = self.protocol.get_group_info(id) else {
+            return;
+        };
+        self.update(Update::Group {
+            id: id.to_string(),
+            name: info.name.unwrap_or_else(|| "group".into()),
+            members: info.members,
+        });
+    }
+
+    fn send_group(&mut self, group: String, text: String, reply: Option<Quote>, from_home: bool) {
+        let reply_to = reply.as_ref().map(|q| q.id.clone());
+        match self
+            .protocol
+            .send_group_message(&group, &text, None, reply_to.as_deref())
+        {
+            Ok(ids) => {
+                // One SDK message per member; the first names the whole send.
+                let id = ids
+                    .first()
+                    .map(|id| id.as_str())
+                    .unwrap_or_else(new_file_id);
+                self.update(Update::GroupQueued {
+                    group: group.clone(),
+                    id,
+                    text: text.clone(),
+                    reply,
+                });
+                if !from_home {
+                    self.to_home(&group, self.nick.clone(), &text);
+                }
+            }
+            Err(e) => self.error(format!("send failed: {e}")),
+        }
+    }
+
+    /// Hands a group message that mentions home to it.
+    fn to_home(&self, group: &str, from: String, text: &str) {
+        // Another member's home talking (its "mention @home" hint included)
+        // is not a request.
+        if text.starts_with(home::SIGNATURE) {
+            return;
+        }
+        if let Some(home) = &self.home
+            && let Some(text) = home::addressed(text)
+        {
+            let _ = home.send(home::Request::Ask {
+                group: group.to_string(),
+                from,
+                text,
+            });
         }
     }
 
@@ -496,6 +640,35 @@ impl Engine {
             Event::SecureSessionEstablished { ref peer_id, .. } => {
                 let address = peer_id.clone();
                 self.update(Update::SessionReady { address });
+            }
+            Event::GroupMessageReceived {
+                ref group_id,
+                ref sender,
+                ref content,
+                ref message_id,
+                ref reply_to_msg,
+                ..
+            } => {
+                let who = self.nicks.get(sender).cloned().unwrap_or_else(|| sender.clone());
+                self.to_home(group_id, who, content);
+                self.update(Update::GroupIncoming {
+                    group: group_id.clone(),
+                    from: sender.clone(),
+                    id: message_id.clone(),
+                    text: content.clone(),
+                    reply_to: reply_to_msg.clone(),
+                });
+            }
+            Event::GroupCreated { ref group_id, .. }
+            | Event::GroupMemberAdded { ref group_id, .. }
+            | Event::GroupMemberRemoved { ref group_id, .. }
+            | Event::GroupRenamed { ref group_id, .. } => {
+                let id = group_id.clone();
+                if self.protocol.list_groups().unwrap_or_default().contains(&id) {
+                    self.announce_group(&id);
+                } else {
+                    self.update(Update::GroupLeft { id });
+                }
             }
             Event::FileProgress {
                 ref file_id,

@@ -32,6 +32,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/file", "attach and send files (path, or no path for the picker)"),
     ("/downloads", "open the folder received files are saved in"),
     ("/info", "show who this peer is and how they are connected"),
+    ("/group", "start a group: /group NAME"),
+    ("/invite", "add someone nearby to this group: /invite NICK"),
+    ("/members", "list who is in this group"),
+    ("/leave", "leave this group"),
+    ("/home", "devices: /home on|off in a group, /home bulb IP, /home tv IP"),
     ("/me", "show and copy your own address"),
     ("/clear", "delete this conversation from this device"),
     ("/log", "show or hide the protocol event log"),
@@ -148,10 +153,12 @@ impl App {
             } else {
                 Style::new()
             };
-            let dot = match (convo.online, convo.secure) {
-                (true, true) => "●".fg(OK),
-                (true, false) => "◐".fg(WARN),
-                (false, _) => "○".fg(FAINT),
+            let dot = match (convo.data.group, convo.online, convo.secure) {
+                (true, true, _) => "#".fg(ACCENT).bold(),
+                (true, false, _) => "#".fg(FAINT),
+                (false, true, true) => "●".fg(OK),
+                (false, true, false) => "◐".fg(WARN),
+                (false, false, _) => "○".fg(FAINT),
             };
             let marker = if selected { "▌".fg(ACCENT) } else { " ".into() };
             let mut name = Span::raw(clip(&convo.data.nick, width.saturating_sub(10)));
@@ -184,7 +191,11 @@ impl App {
                     .rev()
                     .find(|e| !matches!(e.body, Body::Notice(_)))
                     .map(|e| {
-                        let who = if e.mine { "you: " } else { "" };
+                        let who = match &e.sender {
+                            _ if e.mine => "you: ".to_string(),
+                            Some(sender) => format!("{}: ", self.nick_of(sender)),
+                            None => String::new(),
+                        };
                         format!("{who}{}", entry_summary(e))
                     })
                     .unwrap_or_else(|| short(&convo.data.address));
@@ -226,6 +237,15 @@ impl App {
             return;
         };
         let state = match (convo.online, convo.secure) {
+            _ if convo.data.group => {
+                let n = convo.data.members.len();
+                let members = format!("{n} member{}", if n == 1 { "" } else { "s" });
+                if convo.online {
+                    vec!["# ".fg(ACCENT), members.fg(OK), "  🔒 MLS group".fg(MUTED)]
+                } else {
+                    vec!["# ".fg(FAINT), "you left this group".fg(MUTED)]
+                }
+            }
             (true, true) => vec!["● ".fg(OK), "online".fg(OK), "  🔒 end-to-end encrypted".fg(MUTED)],
             (true, false) => vec!["◐ ".fg(WARN), "securing the connection…".fg(WARN)],
             (false, _) => vec!["○ ".fg(FAINT), "offline · messages wait for them".fg(MUTED)],
@@ -282,7 +302,9 @@ impl App {
         }
         if convo.data.entries.is_empty() {
             rows.push((Line::from(""), None));
-            let hint = if convo.secure {
+            let hint = if convo.data.group {
+                "A new group. /invite NICK adds people; /home on lets them use your devices."
+            } else if convo.secure {
                 "Say hello — or drop a file here."
             } else {
                 "Messages you write now are delivered when they're reachable."
@@ -340,6 +362,7 @@ impl App {
         }
         let continues = prev.is_some_and(|p| {
             p.mine == entry.mine
+                && p.sender == entry.sender
                 && !matches!(p.body, Body::Notice(_))
                 && entry.at_ms - p.at_ms < GROUP_GAP_MS
                 && same_day(p.at_ms, entry.at_ms)
@@ -348,10 +371,10 @@ impl App {
             if prev.is_some() {
                 out.push(Line::from(""));
             }
-            let (name, color) = if entry.mine {
-                ("you".to_string(), ACCENT)
-            } else {
-                (convo.data.nick.clone(), THEIRS)
+            let (name, color) = match &entry.sender {
+                _ if entry.mine => ("you".to_string(), ACCENT),
+                Some(sender) => (self.nick_of(sender), THEIRS),
+                None => (convo.data.nick.clone(), THEIRS),
             };
             let mut header = vec![name.fg(color).bold(), "  ".into(), clock(entry.at_ms).fg(FAINT)];
             if !entry.mine && entry.hops > 1 {
@@ -361,7 +384,11 @@ impl App {
         }
 
         if let Some(q) = &entry.reply {
-            let who = if q.mine { "you".to_string() } else { convo.data.nick.clone() };
+            let who = match () {
+                _ if q.mine => "you".to_string(),
+                _ if convo.data.group => "reply".to_string(),
+                _ => convo.data.nick.clone(),
+            };
             let text = clip(&q.text.replace('\n', " "), width.saturating_sub(who.width() + 8));
             out.push(Line::from(vec![
                 INDENT.into(),
