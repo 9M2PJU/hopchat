@@ -6,6 +6,7 @@ mod editor;
 mod groups;
 mod picker;
 mod render;
+mod theme;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -123,6 +124,13 @@ pub struct App {
     pub peer_rows: Vec<(Rect, String)>,
     pub new_group_row: Rect,
     pub chat_area: Rect,
+    pub composer_area: Rect,
+    /// The footer's key buttons, and the key each one presses.
+    pub footer_hits: Vec<(Rect, KeyEvent)>,
+    /// Screen row → the message drawn on it.
+    pub message_rows: Vec<(u16, usize)>,
+    /// When the boot screen went up; it goes after a moment or a key.
+    pub boot: Option<Instant>,
     /// Message id or file id → the conversation it belongs to.
     owners: HashMap<String, String>,
     store: Option<history::Store>,
@@ -187,6 +195,10 @@ impl App {
             peer_rows: Vec::new(),
             new_group_row: Rect::default(),
             chat_area: Rect::default(),
+            composer_area: Rect::default(),
+            footer_hits: Vec::new(),
+            message_rows: Vec::new(),
+            boot: None,
             owners,
             store,
             last_save: Instant::now(),
@@ -218,6 +230,7 @@ impl App {
         let send = |c: Command| {
             let _ = commands.send(Input::Ui(c));
         };
+        self.boot = Some(Instant::now());
         while !self.quit {
             while let Ok(update) = updates.try_recv() {
                 self.apply(update, &send);
@@ -233,7 +246,7 @@ impl App {
                             self.on_key(key, &send)
                         }
                         TermEvent::Paste(text) => self.on_paste(&text, &send),
-                        TermEvent::Mouse(mouse) => self.on_mouse(mouse),
+                        TermEvent::Mouse(mouse) => self.on_mouse(mouse, &send),
                         TermEvent::FocusGained => self.focused = true,
                         TermEvent::FocusLost => self.focused = false,
                         _ => {}
@@ -277,6 +290,11 @@ impl App {
         if let Some(lobby) = self.convos.iter_mut().find(|c| c.data.address == LOBBY) {
             lobby.data.members = members;
         }
+    }
+
+    /// Whether the boot screen is still up.
+    pub fn booting(&self) -> bool {
+        self.boot.is_some_and(|at| at.elapsed() < render::BOOT_FOR)
     }
 
     pub fn in_lobby(&self) -> bool {
@@ -836,6 +854,13 @@ impl App {
     fn on_key(&mut self, key: KeyEvent, send: &impl Fn(Command)) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Any key gets past the boot screen, and does nothing else.
+        if self.booting() {
+            self.boot = None;
+            if !(ctrl && matches!(key.code, KeyCode::Char('c' | 'q'))) {
+                return;
+            }
+        }
         // Global keys, whatever is open.
         match key.code {
             KeyCode::Char('c' | 'q') if ctrl => {
@@ -918,6 +943,15 @@ impl App {
             KeyCode::Tab if self.editor.text().starts_with('/') => {
                 if let Some(cmd) = render::command_matches(self.editor.text()).first() {
                     self.editor.set(&format!("{} ", cmd.0));
+                }
+            }
+            KeyCode::Tab if self.mentioning() => {
+                if let Some((name, _)) = render::mention_matches(self.editor.text()).first() {
+                    let text = self.editor.text();
+                    let start = text.rfind([' ', '\n']).map_or(0, |i| i + 1);
+                    let done = format!("{}{name} ", &text[..start]);
+                    self.editor.set(&done);
+                    self.edited(send);
                 }
             }
             KeyCode::Tab => self.cycle(1, send),
@@ -1128,13 +1162,19 @@ impl App {
         }
     }
 
-    fn on_mouse(&mut self, mouse: MouseEvent) {
+    fn on_mouse(&mut self, mouse: MouseEvent, send: &impl Fn(Command)) {
         let inside = |r: Rect| {
             mouse.column >= r.x
                 && mouse.column < r.x + r.width
                 && mouse.row >= r.y
                 && mouse.row < r.y + r.height
         };
+        if self.booting() {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.boot = None;
+            }
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => match &mut self.mode {
                 Mode::Picker(p) => p.up(),
@@ -1146,16 +1186,39 @@ impl App {
                 _ if inside(self.chat_area) => self.scroll = self.scroll.saturating_sub(3),
                 _ => {}
             },
-            MouseEventKind::Down(MouseButton::Left) if matches!(self.mode, Mode::Normal) => {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // The keys along the bottom are buttons, whatever is open.
+                let key = self.footer_hits.iter().find(|(r, _)| inside(*r)).map(|(_, k)| *k);
+                if let Some(key) = key {
+                    return self.on_key(key, send);
+                }
+                if !matches!(self.mode, Mode::Normal | Mode::Select(_)) {
+                    return;
+                }
                 let hit = self
                     .peer_rows
                     .iter()
                     .find(|(r, _)| inside(*r))
                     .map(|(_, a)| a.clone());
                 if hit.is_some() {
-                    self.select(hit, &|_| {});
+                    self.select(hit, send);
+                    self.mode = Mode::Normal;
                 } else if inside(self.new_group_row) {
                     self.open_groups("");
+                } else if inside(self.composer_area) {
+                    self.mode = Mode::Normal;
+                } else if inside(self.chat_area) {
+                    // A click on a message picks it, for reply, open, copy…
+                    let at = self.message_rows.iter().find(|(y, _)| *y == mouse.row).map(|(_, i)| *i);
+                    let picked = at.and_then(|i| {
+                        let convo = self.current()?;
+                        selectable(convo, i, 0).filter(|&j| j == i)
+                    });
+                    self.mode = match (picked, &self.mode) {
+                        (Some(i), Mode::Select(j)) if i == *j => Mode::Normal,
+                        (Some(i), _) => Mode::Select(i),
+                        (None, _) => Mode::Normal,
+                    };
                 }
             }
             _ => {}
@@ -1471,6 +1534,11 @@ impl App {
 
     fn in_group(&self) -> bool {
         self.current().is_some_and(|c| c.data.group)
+    }
+
+    /// Whether an `@` name is being typed where `@home` and `@ai` answer.
+    fn mentioning(&self) -> bool {
+        self.in_group() && self.editor.at_end() && !render::mention_matches(self.editor.text()).is_empty()
     }
 
     /// A person by nick (case-insensitive) or by address.
@@ -1877,7 +1945,7 @@ mod render_tests {
         assert_eq!(app.selected.as_deref(), Some(LOBBY));
         let alone = screen(&mut app);
         println!("{alone}");
-        for needle in ["# Lobby", "everyone nearby", "just you so far", "0 nearby", "Looking for people", "@home", "@ai", "Only you can use them"] {
+        for needle in ["◈ Lobby", "everyone nearby", "just you so far", "0 nearby", "Looking for people", "@home", "@ai", "Only you can use them"] {
             assert!(alone.contains(needle), "missing {needle:?}");
         }
 
@@ -1922,6 +1990,82 @@ mod render_tests {
         }
         app.home_view.groups = vec![LOBBY.into()];
         assert!(screen(&mut app).contains("everyone nearby can use them"));
+    }
+
+    #[test]
+    fn boots_and_any_key_gets_past() {
+        let mut app = test_app();
+        let send = |_: Command| {};
+        app.boot = Some(Instant::now() - Duration::from_millis(2_000));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let boot: String = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>() + "\n")
+            .collect();
+        println!("{boot}");
+        for needle in ["██╗", "NO SERVER", "identity", "alice", "not needed"] {
+            assert!(boot.contains(needle), "missing {needle:?}");
+        }
+        // The key that dismisses it is not typed.
+        app.on_key(KeyEvent::from(KeyCode::Char('x')), &send);
+        assert!(!app.booting());
+        assert!(app.editor.is_empty());
+        assert!(screen(&mut app).contains("◈ Lobby"));
+    }
+
+    #[test]
+    fn completes_mentions_and_clicks_keys() {
+        let mut app = test_app();
+        let send = |_: Command| {};
+        app.editor.set("lights please @ho");
+        let shown = screen(&mut app);
+        assert!(shown.contains("@home") && shown.contains("ask the devices"), "{shown}");
+        app.on_key(KeyEvent::from(KeyCode::Tab), &send);
+        assert_eq!(app.editor.text(), "lights please @home ");
+        assert_eq!(app.selected.as_deref(), Some(LOBBY), "Tab completed instead of switching chats");
+
+        // The footer's keys are buttons.
+        let (rect, _) = app
+            .footer_hits
+            .iter()
+            .find(|(_, k)| *k == KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .copied()
+            .expect("a devices button");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(click, &send);
+        assert!(matches!(app.mode, Mode::Devices(_)));
+    }
+
+    #[test]
+    fn clicking_a_message_picks_it() {
+        let mut app = test_app();
+        let send = |_: Command| {};
+        let bob = "off1bob00000000000000";
+        let convo = app.convo_mut(bob);
+        convo.data.nick = "bob".into();
+        convo.push(text("m1", false, "first", Status::Sent));
+        convo.push(text("m2", false, "second", Status::Sent));
+        app.selected = Some(bob.into());
+        screen(&mut app);
+        let (row, _) = *app.message_rows.iter().find(|(_, i)| *i == 0).unwrap();
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.chat_area.x + 4,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let first = click(row);
+        app.on_mouse(first, &send);
+        assert!(matches!(app.mode, Mode::Select(0)));
+        assert!(screen(&mut app).contains(" reply "), "the footer offers what to do with it");
+        app.on_mouse(first, &send);
+        assert!(matches!(app.mode, Mode::Normal), "a second click lets go");
     }
 
     #[test]

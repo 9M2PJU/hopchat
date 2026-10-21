@@ -19,6 +19,10 @@ impl Editor {
         self.text.is_empty()
     }
 
+    pub fn at_end(&self) -> bool {
+        self.cursor == self.text.len()
+    }
+
     pub fn set(&mut self, text: &str) {
         self.text = text.to_string();
         self.cursor = self.text.len();

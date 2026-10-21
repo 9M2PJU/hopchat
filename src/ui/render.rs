@@ -1,36 +1,44 @@
 //! Drawing: everything here reads the app and paints; nothing changes
 //! state except the remembered hit areas and the scroll clamp.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Datelike, Local, TimeZone};
 use offline_protocol::Event;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::devices::{self, Devices, Primary};
 use super::groups::{Candidate, Focus, GroupPanel};
+use super::theme::{self, BG, CYAN, LIME, MAGENTA, ORANGE, PANEL, RAISED, TEXT, VIOLET, YELLOW};
 use crate::lobby::LOBBY;
 use super::picker::{self, Picker};
 use crate::home::{self, DeviceView, ModelState, State};
 use super::{App, Convo, Mode};
 use crate::history::{Body, Entry, Status, Transfer};
 
-pub const ACCENT: Color = Color::Rgb(255, 170, 60);
-pub const THEIRS: Color = Color::Rgb(110, 200, 230);
-pub const OK: Color = Color::Rgb(120, 210, 120);
-pub const WARN: Color = Color::Rgb(230, 200, 90);
-pub const ERR: Color = Color::Rgb(235, 100, 100);
-pub const MUTED: Color = Color::Rgb(120, 120, 130);
-pub const FAINT: Color = Color::Rgb(70, 70, 80);
-pub const READ: Color = Color::Rgb(100, 170, 255);
-const SELECTED_BG: Color = Color::Rgb(45, 45, 58);
+pub const ACCENT: Color = MAGENTA;
+pub const THEIRS: Color = CYAN;
+pub const OK: Color = LIME;
+pub const WARN: Color = ORANGE;
+pub const ERR: Color = theme::RED;
+pub const MUTED: Color = theme::MUTED;
+pub const FAINT: Color = theme::FAINT;
+pub const READ: Color = CYAN;
+/// Keys to press, wherever they are mentioned.
+const KEY: Color = YELLOW;
+const SELECTED_BG: Color = RAISED;
 const SIDEBAR: u16 = 30;
 /// A new header is drawn when the same sender pauses this long.
 const GROUP_GAP_MS: i64 = 5 * 60 * 1000;
 const INDENT: &str = "  ";
+/// How long the boot screen shows, unless a key skips it.
+pub const BOOT_FOR: Duration = Duration::from_millis(2_800);
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/file", "attach and send files (path, or no path for the picker)"),
@@ -50,6 +58,12 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/quit", "leave"),
 ];
 
+/// What can be called on by name in a group or the lobby.
+pub const MENTIONS: &[(&str, &str)] = &[
+    ("@home", "ask the devices: lights, the TV"),
+    ("@ai", "ask the model anything"),
+];
+
 /// Commands whose name starts with what is typed, while the name is still
 /// being typed.
 pub fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
@@ -63,10 +77,32 @@ pub fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// Mentions that start with the word being typed at the end of `input`.
+pub fn mention_matches(input: &str) -> Vec<(&'static str, &'static str)> {
+    let word = input.rsplit([' ', '\n']).next().unwrap_or_default();
+    if !word.starts_with('@') {
+        return Vec::new();
+    }
+    MENTIONS
+        .iter()
+        .copied()
+        .filter(|(name, _)| name.starts_with(word))
+        .collect()
+}
+
 impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
-        let [body, footer] =
-            Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(frame.area());
+        frame.render_widget(Block::new().style(Style::new().bg(BG).fg(TEXT)), frame.area());
+        if self.booting() {
+            self.draw_boot(frame);
+            return;
+        }
+        let [hud, body, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
         let narrow = body.width < 70;
         let side_width = if narrow { 0 } else { SIDEBAR };
         let log_width = if self.show_log && body.width > 110 { 46 } else { 0 };
@@ -77,6 +113,7 @@ impl App {
         ])
         .areas(body);
 
+        self.draw_hud(frame, hud);
         if side_width > 0 {
             self.draw_sidebar(frame, side);
         } else {
@@ -97,60 +134,188 @@ impl App {
         }
     }
 
+    /// The boot screen: the name in lights, and the radio coming up.
+    fn draw_boot(&self, frame: &mut Frame) {
+        let area = frame.area();
+        let t = self.boot.map_or(i64::MAX, |at| at.elapsed().as_millis() as i64);
+        let logo = theme::logo();
+        let logo_width = logo[0].width();
+        let mut lines: Vec<Line> = Vec::new();
+        if area.width as usize >= logo_width + 4 && area.height >= 20 {
+            // Drawn in left to right behind a bright scan edge, and torn
+            // sideways now and then while the signal settles.
+            let shown = ((t as f64 / 650.0).min(1.0) * logo_width as f64) as usize;
+            for (r, row) in logo.iter().enumerate() {
+                let tone = theme::along(&[MAGENTA, VIOLET, CYAN], r as f64 / 5.0);
+                let torn = t < 1_000 && theme::noise((t / 60) as u64 + r as u64).is_multiple_of(6);
+                let mut spans: Vec<Span> = vec![if torn { "  ".into() } else { "".into() }];
+                let visible: String = row.chars().take(shown).collect();
+                spans.extend(theme::gradient(&visible, &[tone, theme::mix(tone, CYAN, 0.6)]));
+                if shown < logo_width {
+                    spans.push("▌".fg(TEXT));
+                    spans.push(" ".repeat(logo_width - shown - 1).into());
+                }
+                if !torn {
+                    spans.push("  ".into());
+                }
+                lines.push(Line::from(spans).centered());
+            }
+        } else {
+            lines.push(
+                Line::from(theme::gradient(&theme::glitch("◢◤  H O P C H A T  ◢◤", t), &[MAGENTA, VIOLET, CYAN]))
+                    .centered(),
+            );
+        }
+        lines.push(Line::from(""));
+        if t > 450 {
+            lines.push(
+                Line::from(vec![
+                    "▓▒░ ".fg(MAGENTA),
+                    "NO SERVER · NO INTERNET · NO ONE IN THE MIDDLE".fg(YELLOW).bold(),
+                    " ░▒▓".fg(CYAN),
+                ])
+                .centered(),
+            );
+        } else {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(""));
+        let me = format!("{} @ {}", self.me_nick, short(&self.me_address));
+        let steps: [(&str, &str, String); 5] = [
+            (" OK ", "identity", me),
+            (" OK ", "crypto", "MLS · RFC 9420 · end-to-end".into()),
+            (" OK ", "radio", "multicast 239.255.42.99:47999".into()),
+            (" -- ", "internet", "not needed".into()),
+            (" >> ", "mesh", format!("listening for people nearby{}", dots())),
+        ];
+        for (i, (status, what, detail)) in steps.into_iter().enumerate() {
+            if t < 650 + i as i64 * 230 {
+                lines.push(Line::from(""));
+                continue;
+            }
+            let tone = match status {
+                " OK " => LIME,
+                " -- " => YELLOW,
+                _ => CYAN,
+            };
+            let text = format!(" {what:<9} {detail}");
+            let pad = 46usize.saturating_sub(text.width());
+            lines.push(
+                Line::from(vec![
+                    "[".fg(FAINT),
+                    status.fg(tone).bold(),
+                    "]".fg(FAINT),
+                    format!(" {what:<9}").fg(MUTED),
+                    format!(" {detail}").fg(TEXT),
+                    " ".repeat(pad).into(),
+                ])
+                .centered(),
+            );
+        }
+        lines.push(Line::from(""));
+        if t > 1_700 && theme::blink(900) {
+            lines.push(Line::from(vec!["▶ ".fg(MAGENTA), "press any key to jack in".fg(MUTED)]).centered());
+        }
+        let top = (area.height as usize).saturating_sub(lines.len()) / 2;
+        let at = Rect::new(area.x, area.y + top as u16, area.width, area.height - top as u16);
+        frame.render_widget(Paragraph::new(lines), at);
+
+        // A CRT scanline rolling down the screen.
+        let y = area.y + (t / 18).rem_euclid(area.height.max(1) as i64) as u16;
+        let buf = frame.buffer_mut();
+        for x in area.x..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(theme::mix(BG, VIOLET, 0.18));
+            }
+        }
+    }
+
+    /// The strip along the top: who you are, how much mesh there is, and
+    /// the time.
+    fn draw_hud(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Block::new().style(Style::new().bg(PANEL)), area);
+        let online = self.convos.iter().filter(|c| !c.data.group && c.online && c.secure).count();
+        let clock = Local::now().format("%H:%M:%S ").to_string();
+        let room = (area.width as usize).saturating_sub(clock.width() + 1);
+
+        let mut logo: Vec<Span> = vec![" ".into()];
+        logo.extend(
+            theme::gradient(&theme::glitch("◢◤ HOPCHAT", theme::now_ms()), &[MAGENTA, VIOLET, CYAN])
+                .into_iter()
+                .map(|s| s.bold()),
+        );
+        let mut mesh = vec!["   mesh ".fg(MUTED)];
+        mesh.extend(theme::signal(online));
+        mesh.push(format!(" {online} online").fg(if online > 0 { LIME } else { MUTED }));
+        let segments: Vec<Vec<Span>> = vec![
+            logo,
+            vec!["  ▸ ".fg(FAINT), self.me_nick.clone().fg(MAGENTA).bold()],
+            mesh,
+            vec!["   🔒 ".into(), "end-to-end".fg(MUTED)],
+            vec!["   ◆ ".fg(YELLOW), "OFFLINE · NO INTERNET NEEDED".fg(YELLOW)],
+        ];
+        let mut spans = Vec::new();
+        let mut used = 0;
+        for segment in segments {
+            let w: usize = segment.iter().map(Span::width).sum();
+            if used + w > room {
+                break;
+            }
+            used += w;
+            spans.extend(segment);
+        }
+        frame.render_widget(Line::from(spans), area);
+        frame.render_widget(Line::from(clock.fg(MUTED)).alignment(Alignment::Right), area);
+    }
+
     fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::new()
             .borders(Borders::RIGHT)
-            .border_style(Style::new().fg(FAINT));
+            .border_style(Style::new().fg(theme::dim(VIOLET)))
+            .style(Style::new().bg(PANEL));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let [head, list, me] = Layout::vertical([
+        let [new_group, list, me] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(2),
         ])
         .areas(inner);
 
+        // A button: the same panel as Ctrl-G.
+        let open = matches!(self.mode, Mode::Groups(_));
+        let row = Rect::new(new_group.x + 1, new_group.y + 1, new_group.width.saturating_sub(2), 1);
+        let (bg, fg) = if open { (MAGENTA, BG) } else { (RAISED, TEXT) };
+        frame.render_widget(Block::new().style(Style::new().bg(bg)), row);
         frame.render_widget(
-            Line::from(vec![
-                " ◆ ".fg(ACCENT).bold(),
-                "hopchat".bold(),
-                "  offline · e2e".fg(MUTED),
-            ]),
-            head,
+            Line::from(vec![" + ".fg(if open { BG } else { MAGENTA }).bold(), "New group".fg(fg).bold()]),
+            row,
         );
+        frame.render_widget(
+            Line::from("Ctrl-G ".fg(if open { BG } else { MUTED })).alignment(Alignment::Right),
+            row,
+        );
+        self.new_group_row = row;
 
         let online = self.convos.iter().filter(|c| c.online && !c.data.group).count();
         frame.render_widget(
             Paragraph::new(vec![
+                Line::from(vec![" ▸ ".fg(MAGENTA), self.me_nick.clone().fg(MAGENTA).bold(), " (you)".fg(FAINT)]),
                 Line::from(vec![
-                    " ".into(),
-                    self.me_nick.clone().fg(ACCENT).bold(),
-                    format!(" · {}", short(&self.me_address)).fg(MUTED),
+                    format!("   {}", short(&self.me_address)).fg(FAINT),
+                    format!(" · {online} nearby").fg(MUTED),
                 ]),
-                Line::from(format!(" {online} nearby").fg(MUTED)),
             ]),
             me,
         );
-
-        let [new_group, list] =
-            Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(list);
-        let hover = matches!(self.mode, Mode::Groups(_));
-        let row = Rect::new(new_group.x, new_group.y, new_group.width, 1);
-        let label = Line::from(vec![
-            if hover { "▌".fg(ACCENT) } else { " ".into() },
-            "+ ".fg(ACCENT).bold(),
-            "New group".into(),
-        ]);
-        frame.render_widget(label, row);
-        frame.render_widget(Line::from("Ctrl-G ".fg(FAINT)).alignment(Alignment::Right), row);
-        self.new_group_row = row;
 
         self.peer_rows.clear();
         let ordered: Vec<&Convo> = self.ordered();
         // The lobby is always listed; with no one else, say how to get people.
         let alone = ordered.iter().all(|c| c.data.address == LOBBY);
 
+        let list = Rect::new(list.x, list.y + 1, list.width, list.height.saturating_sub(1));
         let width = list.width as usize;
         let mut y = list.y;
         let mut rows = Vec::new();
@@ -164,15 +329,21 @@ impl App {
             } else {
                 Style::new()
             };
-            let dot = match (convo.data.group, convo.online, convo.secure) {
-                (true, true, _) => "#".fg(ACCENT).bold(),
-                (true, false, _) => "#".fg(FAINT),
-                (false, true, true) => "●".fg(OK),
-                (false, true, false) => "◐".fg(WARN),
-                (false, false, _) => "○".fg(FAINT),
+            let dot = match (convo.data.address == LOBBY, convo.data.group, convo.online, convo.secure) {
+                (true, ..) => "◈".fg(CYAN).bold(),
+                (_, true, true, _) => "#".fg(VIOLET).bold(),
+                (_, true, false, _) => "#".fg(FAINT),
+                (_, false, true, true) => "●".fg(LIME),
+                (_, false, true, false) => "◐".fg(ORANGE),
+                (_, false, false, _) => "○".fg(FAINT),
             };
-            let marker = if selected { "▌".fg(ACCENT) } else { " ".into() };
-            let mut name = Span::raw(clip(&convo.data.nick, width.saturating_sub(10)));
+            let tint = match () {
+                _ if convo.data.group => TEXT,
+                _ if convo.online => theme::person(&convo.data.address),
+                _ => MUTED,
+            };
+            let marker = if selected { "▌".fg(MAGENTA) } else { " ".into() };
+            let mut name = clip(&convo.data.nick, width.saturating_sub(10)).fg(tint);
             name = if selected || convo.unread > 0 {
                 name.bold()
             } else {
@@ -184,16 +355,16 @@ impl App {
                 String::new()
             };
             let used = 3 + UnicodeWidthStr::width(name.content.as_ref());
-            let pad = width.saturating_sub(used + badge.width());
+            let pad = width.saturating_sub(used + badge.width() + 1);
             let badge = if convo.unread > 0 {
-                Span::styled(badge, Style::new().fg(Color::Black).bg(ACCENT).bold())
+                Span::styled(badge, Style::new().fg(BG).bg(MAGENTA).bold())
             } else {
                 badge.fg(FAINT)
             };
             let top = Line::from(vec![marker, dot, " ".into(), name, " ".repeat(pad).into(), badge]);
 
             let preview = if convo.typing() {
-                "typing…".fg(ACCENT).italic()
+                format!("typing{}", dots()).fg(tint).italic()
             } else {
                 let text = convo
                     .data
@@ -224,8 +395,9 @@ impl App {
         }
         self.peer_rows = rows;
         if alone && y < list.y + list.height {
+            let ping = ["   ·   ", "  (·)  ", " ((·)) ", "(( · ))"][(theme::now_ms() / 300).rem_euclid(4) as usize];
             let lines = vec![
-                Line::from(" Looking for people…".fg(MUTED)),
+                Line::from(vec![format!(" {ping} ").fg(CYAN), "Looking for people…".fg(MUTED)]),
                 Line::from(""),
                 Line::from(" Run hopchat on another".fg(FAINT)),
                 Line::from(" device on this network.".fg(FAINT)),
@@ -244,6 +416,7 @@ impl App {
         ])
         .areas(area);
         self.chat_area = history;
+        self.composer_area = composer;
 
         self.draw_header(frame, header);
         self.draw_history(frame, history);
@@ -251,14 +424,18 @@ impl App {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::new()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::new().fg(FAINT));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let [top, line] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        frame.render_widget(theme::rule(line.width as usize), line);
         let Some(convo) = self.current() else {
-            frame.render_widget(Line::from("  no conversation yet".fg(MUTED)), inner);
+            frame.render_widget(Line::from("  no conversation yet".fg(MUTED)), top);
             return;
+        };
+        let (icon, tint) = match (convo.online, convo.secure) {
+            _ if convo.data.address == LOBBY => ("◈ ".fg(CYAN).bold(), CYAN),
+            _ if convo.data.group => ("# ".fg(if convo.online { VIOLET } else { FAINT }).bold(), TEXT),
+            (true, true) => ("● ".fg(LIME), theme::person(&convo.data.address)),
+            (true, false) => ("◐ ".fg(ORANGE), theme::person(&convo.data.address)),
+            (false, _) => ("○ ".fg(FAINT), MUTED),
         };
         let state = match (convo.online, convo.secure) {
             _ if convo.data.address == LOBBY => {
@@ -267,34 +444,35 @@ impl App {
                     0 => "just you so far".to_string(),
                     n => format!("you and {n} nearby"),
                 };
-                vec!["# ".fg(ACCENT), here.fg(OK), "  🔒 everyone on this network".fg(MUTED)]
+                vec![here.fg(if others > 0 { LIME } else { MUTED }), "  🔒 everyone on this network".fg(MUTED)]
             }
             _ if convo.data.group => {
                 let n = convo.data.members.len();
                 let members = format!("{n} member{}", if n == 1 { "" } else { "s" });
                 if convo.online {
-                    vec!["# ".fg(ACCENT), members.fg(OK), "  🔒 MLS group".fg(MUTED)]
+                    vec![members.fg(LIME), "  🔒 MLS group".fg(MUTED)]
                 } else {
-                    vec!["# ".fg(FAINT), "you left this group".fg(MUTED)]
+                    vec!["you left this group".fg(MUTED)]
                 }
             }
-            (true, true) => vec!["● ".fg(OK), "online".fg(OK), "  🔒 end-to-end encrypted".fg(MUTED)],
-            (true, false) => vec!["◐ ".fg(WARN), "securing the connection…".fg(WARN)],
-            (false, _) => vec!["○ ".fg(FAINT), "offline · messages wait for them".fg(MUTED)],
+            (true, true) => vec!["online".fg(LIME), "  🔒 end-to-end encrypted".fg(MUTED)],
+            (true, false) => vec![format!("securing the link{}", dots()).fg(ORANGE)],
+            (false, _) => vec!["offline · messages wait for them".fg(MUTED)],
         };
-        let mut spans = vec!["  ".into(), convo.data.nick.clone().bold(), "   ".into()];
+        let mut spans = vec![" ".into(), icon, convo.data.nick.clone().fg(tint).bold(), "   ".into()];
         spans.extend(state);
-        frame.render_widget(Line::from(spans), inner);
+        frame.render_widget(Line::from(spans), top);
         if convo.data.address != LOBBY {
             frame.render_widget(
                 Line::from(format!("{}  ", short(&convo.data.address)).fg(FAINT))
                     .alignment(Alignment::Right),
-                inner,
+                top,
             );
         }
     }
 
     fn draw_history(&mut self, frame: &mut Frame, area: Rect) {
+        self.message_rows.clear();
         let Some(convo) = self.current() else {
             let lines = vec![
                 Line::from(""),
@@ -328,18 +506,34 @@ impl App {
             }
         }
         if convo.typing() {
+            let tint = theme::person(&convo.data.address);
             rows.push((Line::from(""), None));
             rows.push((
-                Line::from(vec![INDENT.into(), format!("{} is typing…", convo.data.nick).fg(MUTED).italic()]),
+                Line::from(vec![
+                    "▎ ".fg(theme::dim(tint)),
+                    format!("{} is typing", convo.data.nick).fg(tint).italic(),
+                    dots().fg(tint),
+                ]),
                 None,
             ));
         }
         if convo.data.entries.is_empty() {
             rows.push((Line::from(""), None));
             if convo.data.address == LOBBY {
+                let others = convo.data.members.len() > 1;
+                if !others && area.height >= 16 {
+                    for line in theme::radar(29, 7) {
+                        rows.push((line.centered(), None));
+                    }
+                    rows.push((
+                        Line::from(format!("SCANNING THE MESH{}", dots()).fg(CYAN).bold()).centered(),
+                        None,
+                    ));
+                    rows.push((Line::from(""), None));
+                }
                 let view = &self.home_view;
                 let open = view.groups.iter().chain(&view.ai_groups).any(|g| g == LOBBY);
-                for line in lobby_hint(convo.data.members.len() > 1, open) {
+                for line in lobby_hint(others, open) {
                     rows.push((line, None));
                 }
             }
@@ -375,18 +569,23 @@ impl App {
         self.scroll = self.scroll.min(max_scroll);
         let end = total - self.scroll;
         let start = end.saturating_sub(height);
-        let visible: Vec<Line> = rows[start..end].iter().map(|(l, _)| l.clone()).collect();
         // Anchor to the bottom, like every chat.
-        let pad = height.saturating_sub(visible.len()) as u16;
+        let pad = height.saturating_sub(end - start) as u16;
         let inner = Rect::new(area.x + 1, area.y + pad, area.width.saturating_sub(2), area.height - pad);
+        let mut visible = Vec::with_capacity(end - start);
+        for (k, (line, entry)) in rows[start..end].iter().enumerate() {
+            if let Some(i) = entry {
+                self.message_rows.push((inner.y + k as u16, *i));
+            }
+            visible.push(line.clone());
+        }
         frame.render_widget(Paragraph::new(visible), inner);
 
         if self.scroll > 0 {
             let label = format!(" ↓ {} more · Esc to jump down ", self.scroll);
             let w = label.width() as u16;
             let at = Rect::new(area.x + area.width.saturating_sub(w + 1), area.y + area.height - 1, w, 1);
-            frame.render_widget(Clear, at);
-            frame.render_widget(Line::from(label.fg(Color::Black).bg(ACCENT)), at);
+            frame.render_widget(Line::from(label.fg(BG).bg(CYAN).bold()), at);
         }
     }
 
@@ -401,10 +600,18 @@ impl App {
         if let Body::Notice(text) = &entry.body {
             out.push(Line::from(""));
             for row in wrap(text, width.saturating_sub(8)) {
-                out.push(Line::from(format!("· {row} ·").fg(MUTED).italic()).centered());
+                out.push(
+                    Line::from(vec!["░ ".fg(FAINT), row.fg(MUTED).italic(), " ░".fg(FAINT)]).centered(),
+                );
             }
             return out;
         }
+        let tint = match &entry.sender {
+            _ if entry.mine => MAGENTA,
+            Some(sender) => theme::person(sender),
+            None => theme::person(&convo.data.address),
+        };
+        let gutter = || -> Span<'static> { "▎ ".fg(theme::dim(tint)) };
         let continues = prev.is_some_and(|p| {
             p.mine == entry.mine
                 && p.sender == entry.sender
@@ -416,14 +623,14 @@ impl App {
             if prev.is_some() {
                 out.push(Line::from(""));
             }
-            let (name, color) = match &entry.sender {
-                _ if entry.mine => ("you".to_string(), ACCENT),
-                Some(sender) => (self.nick_of(sender), THEIRS),
-                None => (convo.data.nick.clone(), THEIRS),
+            let name = match &entry.sender {
+                _ if entry.mine => "you".to_string(),
+                Some(sender) => self.nick_of(sender),
+                None => convo.data.nick.clone(),
             };
-            let mut header = vec![name.fg(color).bold(), "  ".into(), clock(entry.at_ms).fg(FAINT)];
+            let mut header = vec!["◢ ".fg(tint), name.fg(tint).bold(), "  ".into(), clock(entry.at_ms).fg(FAINT)];
             if !entry.mine && entry.hops > 1 {
-                header.push(format!("  via {} hops", entry.hops).fg(FAINT));
+                header.push(format!("  ⇄ via {} hops", entry.hops).fg(VIOLET));
             }
             out.push(Line::from(header));
         }
@@ -436,8 +643,8 @@ impl App {
             };
             let text = clip(&q.text.replace('\n', " "), width.saturating_sub(who.width() + 8));
             out.push(Line::from(vec![
-                INDENT.into(),
-                "╭ ".fg(FAINT),
+                gutter(),
+                "↳ ".fg(FAINT),
                 who.fg(MUTED).bold(),
                 format!(" {text}").fg(MUTED),
             ]));
@@ -450,7 +657,8 @@ impl App {
                 let rows = wrap(text, width.saturating_sub(INDENT.len()));
                 let n = rows.len();
                 for (i, row) in rows.into_iter().enumerate() {
-                    let mut spans = vec![INDENT.into(), Span::raw(row.clone())];
+                    let mut spans = vec![gutter()];
+                    spans.extend(rich(&row));
                     if i + 1 == n
                         && let Some(tick) = &tick
                     {
@@ -480,13 +688,14 @@ impl App {
                 let size_text = human_size(*size);
                 let name_room = width.saturating_sub(size_text.width() + 10);
                 out.push(Line::from(vec![
-                    INDENT.into(),
-                    "┃ ".fg(if entry.mine { ACCENT } else { THEIRS }),
-                    format!("{icon} ").into(),
-                    clip(name, name_room).bold(),
-                    format!("  {size_text}").fg(MUTED),
+                    gutter(),
+                    "▐".fg(tint),
+                    format!(" {icon} ").bg(RAISED),
+                    clip(name, name_room).fg(TEXT).bg(RAISED).bold(),
+                    format!("  {size_text} ").fg(MUTED).bg(RAISED),
+                    "▌".fg(RAISED),
                 ]));
-                let mut detail = vec![INDENT.into(), "┃ ".fg(if entry.mine { ACCENT } else { THEIRS })];
+                let mut detail = vec![gutter(), "  ".into()];
                 match transfer {
                     Transfer::Queued => {
                         let why = if convo.online && convo.secure {
@@ -500,7 +709,7 @@ impl App {
                         let fraction = if *total == 0 { 0.0 } else { *done as f64 / *total as f64 };
                         let bar_width = (width.saturating_sub(30)).clamp(10, 30);
                         detail.extend(progress_bar(fraction, bar_width));
-                        detail.push(format!(" {:>3}%", (fraction * 100.0) as u32).bold());
+                        detail.push(format!(" {:>3}%", (fraction * 100.0) as u32).fg(TEXT).bold());
                         if let Some(rate) = self.rate(&entry.id, *size, fraction) {
                             detail.push(format!("  {rate}").fg(MUTED));
                         }
@@ -516,17 +725,17 @@ impl App {
                         let saved = clip(&picker::tilde(path), width.saturating_sub(24));
                         detail.push("saved to ".fg(MUTED));
                         detail.push(saved.fg(MUTED).underlined());
-                        detail.push("  ↑ o to open".fg(FAINT));
+                        detail.push("  click, then o to open".fg(FAINT));
                     }
                     Transfer::Failed(reason) => {
                         detail.push(format!("✗ {reason}").fg(ERR));
                         if entry.mine {
-                            detail.push("  ↑ R to retry".fg(FAINT));
+                            detail.push("  click, then R to retry".fg(FAINT));
                         }
                     }
                     Transfer::Interrupted => {
                         detail.push("interrupted when hopchat closed".fg(WARN));
-                        detail.push("  ↑ R to retry".fg(FAINT));
+                        detail.push("  click, then R to retry".fg(FAINT));
                     }
                 }
                 out.push(Line::from(detail));
@@ -555,9 +764,23 @@ impl App {
 
     fn draw_composer(&self, frame: &mut Frame, area: Rect) {
         let focused = matches!(self.mode, Mode::Normal);
+        // The box breathes while it has the keyboard.
+        let glow = if focused { theme::mix(MAGENTA, VIOLET, theme::pulse(2_600)) } else { FAINT };
+        let to = match self.current() {
+            Some(c) if c.data.address == LOBBY => vec!["everyone nearby".fg(CYAN).bold()],
+            Some(c) if c.data.group => vec![format!("#{}", c.data.nick).fg(VIOLET).bold()],
+            Some(c) => vec![c.data.nick.clone().fg(theme::person(&c.data.address)).bold()],
+            None => vec!["nobody yet".fg(MUTED)],
+        };
+        let mut title = vec![" ▶ to ".fg(MUTED)];
+        title.extend(to);
+        title.push(" ".into());
         let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(if focused { MUTED } else { FAINT }));
+            .border_type(BorderType::Thick)
+            .border_style(Style::new().fg(glow))
+            .style(Style::new().bg(PANEL))
+            .title(Line::from(title))
+            .title(Line::from(vec![" Enter ".fg(KEY).bold(), "sends ".fg(MUTED)]).alignment(Alignment::Right));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -571,7 +794,7 @@ impl App {
             let text = clip(&entry_summary(target).replace('\n', " "), (inner.width as usize).saturating_sub(who.width() + 28));
             lines.push(Line::from(vec![
                 "↪ replying to ".fg(MUTED),
-                who.fg(ACCENT),
+                who.fg(MAGENTA),
                 format!("  {text}").fg(MUTED),
                 "  Esc cancels".fg(FAINT),
             ]));
@@ -583,8 +806,8 @@ impl App {
                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                 spans.push(
                     format!(" {} {} · {} ", file_icon(&name), clip(&name, 24), human_size(size))
-                        .fg(Color::Black)
-                        .bg(ACCENT),
+                        .fg(BG)
+                        .bg(CYAN),
                 );
                 spans.push(" ".into());
             }
@@ -596,23 +819,30 @@ impl App {
         let (rows, (cx, cy)) = self.editor.layout(text_width);
         let first_row = cy.saturating_sub(7);
         let top = lines.len() as u16;
+        let prompt = || "❯ ".fg(MAGENTA).bold();
         if self.editor.is_empty() {
-            let who = self.current().map(|c| c.data.nick.clone());
-            let hint = match (&who, self.attachments.is_empty()) {
-                (Some(_), false) => "add a message, or just press Enter to send".to_string(),
-                (Some(nick), true) => format!("Message {nick}   ·   Ctrl-O attach · ↑ select · / commands"),
-                (None, _) => "Waiting for someone to talk to   ·   F1 help".to_string(),
+            let hint = match self.current() {
+                _ if !self.attachments.is_empty() => "add a message, or just press Enter to send".to_string(),
+                Some(c) if c.data.address == LOBBY => {
+                    "say something to everyone nearby  ·  @ai asks the model  ·  / commands".to_string()
+                }
+                Some(c) if c.data.group => {
+                    format!("message #{}  ·  @home @ai  ·  / commands", c.data.nick)
+                }
+                Some(c) => format!("message {}  ·  Ctrl-O attach a file  ·  / commands", c.data.nick),
+                None => "waiting for someone to talk to  ·  F1 help".to_string(),
             };
-            lines.push(Line::from(vec!["› ".fg(ACCENT).bold(), hint.fg(FAINT)]));
+            lines.push(Line::from(vec![prompt(), clip(&hint, text_width).fg(FAINT)]));
         } else {
             for (i, row) in rows.iter().enumerate().skip(first_row).take(8) {
-                let prompt = if i == 0 { "› ".fg(ACCENT).bold() } else { "  ".into() };
-                let styled = if self.editor.text().starts_with('/') && i == 0 {
-                    Span::raw(row.clone()).fg(ACCENT)
+                let lead = if i == 0 { prompt() } else { "  ".into() };
+                let mut spans = vec![lead];
+                if self.editor.text().starts_with('/') && i == 0 {
+                    spans.push(Span::raw(row.clone()).fg(MAGENTA));
                 } else {
-                    Span::raw(row.clone())
-                };
-                lines.push(Line::from(vec![prompt, styled]));
+                    spans.extend(rich(row));
+                }
+                lines.push(Line::from(spans));
             }
         }
         frame.render_widget(Paragraph::new(lines), inner);
@@ -623,41 +853,40 @@ impl App {
             ));
         }
 
-        // Command suggestions float above the composer.
-        if focused && self.editor.text().starts_with('/') {
-            let matches = command_matches(self.editor.text());
-            if !matches.is_empty() {
-                let h = matches.len() as u16 + 2;
-                let w = area.width.min(64);
-                let popup = Rect::new(area.x, area.y.saturating_sub(h), w, h);
-                let lines: Vec<Line> = matches
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (name, help))| {
-                        let name = format!(" {name:<11}");
-                        let name = if i == 0 { name.fg(ACCENT).bold() } else { name.fg(ACCENT) };
-                        Line::from(vec![name, help.fg(MUTED)])
-                    })
-                    .collect();
-                frame.render_widget(Clear, popup);
-                frame.render_widget(
-                    Paragraph::new(lines).block(
-                        Block::bordered()
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::new().fg(FAINT))
-                            .title(" Tab completes ".fg(FAINT)),
-                    ),
-                    popup,
-                );
-            }
+        // Suggestions float above the composer: commands, or who to call on.
+        if !focused {
+            return;
+        }
+        let (matches, title) = if self.editor.text().starts_with('/') {
+            (command_matches(self.editor.text()), " Tab completes ")
+        } else if self.in_group() && self.editor.at_end() {
+            (mention_matches(self.editor.text()), " Tab completes · the host's model and devices answer ")
+        } else {
+            (Vec::new(), "")
+        };
+        if !matches.is_empty() {
+            let h = matches.len() as u16 + 2;
+            let w = area.width.min(72);
+            let popup = Rect::new(area.x, area.y.saturating_sub(h), w, h);
+            let lines: Vec<Line> = matches
+                .iter()
+                .enumerate()
+                .map(|(i, (name, help))| {
+                    let line = Line::from(vec![format!(" {name:<11}").fg(MAGENTA).bold(), help.fg(MUTED)]);
+                    if i == 0 { line.style(Style::new().bg(RAISED)) } else { line }
+                })
+                .collect();
+            let inner = float(frame, popup, neon_block("").title(title.fg(MUTED)));
+            frame.render_widget(Paragraph::new(lines), inner);
         }
     }
 
     fn draw_log(&self, frame: &mut Frame, area: Rect) {
         let block = Block::new()
             .borders(Borders::LEFT)
-            .border_style(Style::new().fg(FAINT))
-            .title(" protocol ".fg(MUTED));
+            .border_style(Style::new().fg(theme::dim(VIOLET)))
+            .style(Style::new().bg(PANEL))
+            .title(Line::from(vec![" ▸ ".fg(MAGENTA), "protocol ".fg(CYAN).bold()]));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let height = inner.height as usize;
@@ -666,91 +895,182 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let keys: &[(&str, &str)] = match self.mode {
-            Mode::Select(_) => &[
-                ("↑↓", "move"),
-                ("r", "reply"),
-                ("o", "open"),
-                ("f", "show in folder"),
-                ("y", "copy"),
-                ("R", "retry"),
-                ("Esc", "back"),
+    /// The keys that work right now, as buttons: each can be clicked too.
+    fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Block::new().style(Style::new().bg(PANEL)), area);
+        let ctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        let press = |code: KeyCode| Some(KeyEvent::from(code));
+        let keys: Vec<(&str, &str, Option<KeyEvent>)> = match self.mode {
+            Mode::Select(_) => vec![
+                ("↑↓", "move", None),
+                ("r", "reply", press(KeyCode::Char('r'))),
+                ("o", "open", press(KeyCode::Char('o'))),
+                ("f", "show in folder", press(KeyCode::Char('f'))),
+                ("y", "copy", press(KeyCode::Char('y'))),
+                ("R", "retry", press(KeyCode::Char('R'))),
+                ("Esc", "back", press(KeyCode::Esc)),
             ],
-            Mode::Picker(_) => &[
-                ("↑↓", "move"),
-                ("Enter", "open/choose"),
-                ("Space", "mark"),
-                ("←", "up a folder"),
-                ("~", "home"),
-                ("type", "filter"),
-                ("Esc", "cancel"),
+            Mode::Picker(_) => vec![
+                ("↑↓", "move", None),
+                ("Enter", "open/choose", press(KeyCode::Enter)),
+                ("Space", "mark", press(KeyCode::Char(' '))),
+                ("←", "up a folder", press(KeyCode::Left)),
+                ("~", "home", press(KeyCode::Char('~'))),
+                ("type", "filter", None),
+                ("Esc", "cancel", press(KeyCode::Esc)),
             ],
-            Mode::Help => &[("any key", "close")],
-            Mode::Devices(ref panel) if panel.renaming.is_some() => {
-                &[("type", "a name"), ("Enter", "save"), ("Esc", "cancel")]
-            }
-            Mode::Groups(ref panel) if panel.focus == Focus::Name => &[
-                ("type", "a name"),
-                ("↓", "pick people"),
-                ("Enter", "create"),
-                ("Esc", "cancel"),
+            Mode::Help => vec![("any key", "close", press(KeyCode::Esc))],
+            Mode::Devices(ref panel) if panel.renaming.is_some() => vec![
+                ("type", "a name", None),
+                ("Enter", "save", press(KeyCode::Enter)),
+                ("Esc", "cancel", press(KeyCode::Esc)),
             ],
-            Mode::Groups(ref panel) => &[
-                ("↑↓", "move"),
-                ("Space", "pick"),
-                ("Enter", if panel.target.is_some() { "add them" } else { "create" }),
-                ("Esc", "cancel"),
+            Mode::Groups(ref panel) if panel.focus == Focus::Name => vec![
+                ("type", "a name", None),
+                ("↓", "pick people", press(KeyCode::Down)),
+                ("Enter", "create", press(KeyCode::Enter)),
+                ("Esc", "cancel", press(KeyCode::Esc)),
             ],
-            Mode::Devices(_) => &[
-                ("↑↓", "move"),
-                ("Enter", "add/pair/test"),
-                ("n", "rename"),
-                ("x", "forget"),
-                ("r", "rescan"),
-                ("g", "access"),
-                ("i", "@ai"),
-                ("Esc", "close"),
+            Mode::Groups(ref panel) => vec![
+                ("↑↓", "move", None),
+                ("Space", "pick", press(KeyCode::Char(' '))),
+                ("Enter", if panel.target.is_some() { "add them" } else { "create" }, press(KeyCode::Enter)),
+                ("Esc", "cancel", press(KeyCode::Esc)),
             ],
-            Mode::Normal => &[
-                ("Enter", "send"),
-                ("Ctrl-O", "attach"),
-                ("Ctrl-G", "new group"),
-                ("Ctrl-D", "devices"),
-                ("Tab", "next chat"),
-                ("↑", "select"),
-                ("F1", "help"),
+            Mode::Devices(_) => vec![
+                ("↑↓", "move", None),
+                ("Esc", "close", press(KeyCode::Esc)),
+                ("Enter", "add/pair/test", press(KeyCode::Enter)),
+                ("n", "rename", press(KeyCode::Char('n'))),
+                ("x", "forget", press(KeyCode::Char('x'))),
+                ("r", "rescan", press(KeyCode::Char('r'))),
+                ("g", "access", press(KeyCode::Char('g'))),
+                ("i", "@ai", press(KeyCode::Char('i'))),
+            ],
+            Mode::Normal => vec![
+                ("Enter", "send", press(KeyCode::Enter)),
+                ("Ctrl-O", "attach", ctrl('o')),
+                ("Ctrl-G", "new group", ctrl('g')),
+                ("Ctrl-D", "devices", ctrl('d')),
+                ("Tab", "next chat", press(KeyCode::Tab)),
+                ("↑", "select", press(KeyCode::Up)),
+                ("F1", "help", press(KeyCode::F(1))),
             ],
         };
-        let mut spans = vec![" ".into()];
-        for (key, what) in keys {
-            spans.push(key.to_string().fg(ACCENT).bold());
-            spans.push(format!(" {what}  ").fg(MUTED));
-        }
-        frame.render_widget(Line::from(spans), area);
-
-        // Right side: what's happening.
+        // Right side: what's happening. It wins the room over the keys.
         let mut right: Vec<Span> = Vec::new();
         if let Some((text, error)) = self.flash_text() {
-            right.push(clip(text, 60).fg(if error { ERR } else { OK }));
+            let (mark, tone) = if error { ("✗ ", ERR) } else { ("▸ ", LIME) };
+            right.push(mark.fg(tone).bold());
+            right.push(clip(text, 60).fg(tone));
             right.push("  ".into());
         }
         for incoming in self.incoming.values().take(2) {
             let pct = (incoming.done * 100).checked_div(incoming.total).unwrap_or(0);
             right.push(
                 format!("⇣ {} {}% of {}  ", clip(&incoming.name, 18), pct, human_size(incoming.size))
-                    .fg(THEIRS),
+                    .fg(CYAN),
             );
         }
-        if !self.show_log {
+        if !self.show_log && right.is_empty() && matches!(self.mode, Mode::Normal) {
             right.push("Ctrl-E log ".fg(FAINT));
         }
-        let line = Line::from(right).alignment(Alignment::Right);
-        let width = line.width() as u16;
-        let at = Rect::new(area.x + area.width.saturating_sub(width), area.y, width.min(area.width), 1);
-        frame.render_widget(Clear, at);
-        frame.render_widget(line, at);
+        let right = Line::from(right).alignment(Alignment::Right);
+        let right_width = (right.width() as u16).min(area.width);
+
+        self.footer_hits.clear();
+        let mut spans: Vec<Span> = vec![" ".into()];
+        let mut x = area.x + 1;
+        let room = area.right().saturating_sub(right_width + 1);
+        for (key, what, event) in keys {
+            let cap = format!(" {key} ");
+            let label = format!(" {what}  ");
+            let w = (cap.width() + label.width()) as u16;
+            if x + w > room {
+                break;
+            }
+            if let Some(event) = event {
+                self.footer_hits.push((Rect::new(x, area.y, w - 2, 1), event));
+            }
+            spans.push(cap.fg(KEY).bg(RAISED).bold());
+            spans.push(label.fg(MUTED));
+            x += w;
+        }
+        frame.render_widget(Line::from(spans), area);
+        let at = Rect::new(area.right() - right_width, area.y, right_width, 1);
+        frame.render_widget(right, at);
     }
+}
+
+/// A row of message text, with @mentions and links lit up.
+fn rich(row: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for word in row.split_inclusive(' ') {
+        let bare = word.trim_end();
+        let gap = &word[bare.len()..];
+        let styled = if bare.len() > 1 && bare.starts_with('@') {
+            bare.to_string().fg(YELLOW).bold()
+        } else if bare.starts_with("http://") || bare.starts_with("https://") {
+            bare.to_string().fg(CYAN).underlined()
+        } else {
+            Span::raw(bare.to_string())
+        };
+        spans.push(styled);
+        if !gap.is_empty() {
+            spans.push(Span::raw(gap.to_string()));
+        }
+    }
+    spans
+}
+
+/// Three dots that fill up, for anything still going.
+fn dots() -> &'static str {
+    ["   ", ".  ", ".. ", "..."][(theme::now_ms() / 350).rem_euclid(4) as usize]
+}
+
+/// The look of every floating panel: a thick neon frame.
+fn neon_block(title: &str) -> Block<'static> {
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(Style::new().fg(MAGENTA))
+        .style(Style::new().bg(PANEL).fg(TEXT));
+    if title.is_empty() {
+        return block;
+    }
+    block.title(Line::from(vec![
+        " ◢ ".fg(CYAN),
+        title.to_string().fg(MAGENTA).bold(),
+        " ◣ ".fg(CYAN),
+    ]))
+}
+
+/// Draws `block` floating over whatever is under `area`, with a shadow,
+/// and gives back the space inside it.
+fn float(frame: &mut Frame, area: Rect, block: Block) -> Rect {
+    let screen = frame.area();
+    let buf = frame.buffer_mut();
+    let right = area.right();
+    let bottom = area.bottom();
+    let mut shade = |x: u16, y: u16| {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_bg(theme::SHADOW);
+            cell.set_fg(theme::mix(FAINT, theme::SHADOW, 0.6));
+        }
+    };
+    if right < screen.right() {
+        for y in area.y + 1..=bottom.min(screen.bottom().saturating_sub(1)) {
+            shade(right, y);
+        }
+    }
+    if bottom < screen.bottom() {
+        for x in area.x + 1..=right.min(screen.right().saturating_sub(1)) {
+            shade(x, bottom);
+        }
+    }
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -764,19 +1084,13 @@ impl App {
     fn draw_devices(&self, frame: &mut Frame, panel: &Devices) {
         let view = &self.home_view;
         let area = centered(frame.area(), 78, 82);
-        frame.render_widget(Clear, area);
         let status = if view.scanning {
-            format!(" {} scanning ", spinner()).fg(ACCENT)
+            format!(" {} scanning ", spinner()).fg(CYAN)
         } else {
             " r rescans ".fg(MUTED)
         };
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(ACCENT))
-            .title(" Devices ".fg(ACCENT).bold())
-            .title(Line::from(status).alignment(Alignment::Right));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let block = neon_block("Devices").title(Line::from(status).alignment(Alignment::Right));
+        let inner = float(frame, area, block);
         let [list, help, footer] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(3),
@@ -791,13 +1105,13 @@ impl App {
         let added = view.devices.iter().filter(|d| d.added).count();
         for (i, d) in view.devices.iter().enumerate() {
             if i == 0 && d.added {
-                lines.push(Line::from(" Your devices".fg(MUTED).bold()));
+                lines.push(Line::from(" Your devices".fg(CYAN).bold()));
             }
             if i == added {
                 if added > 0 {
                     lines.push(Line::from(""));
                 }
-                lines.push(Line::from(" Found on this network".fg(MUTED).bold()));
+                lines.push(Line::from(" Found on this network".fg(CYAN).bold()));
             }
             if i == selected {
                 selected_row = lines.len();
@@ -823,7 +1137,7 @@ impl App {
             lines.push(Line::from(vec![
                 "  📺 No TV? ".fg(MUTED),
                 "A TV only shows up while it's switched on. Turn it on, then ".fg(FAINT),
-                "r".fg(ACCENT).bold(),
+                "r".fg(KEY).bold(),
                 ".".fg(FAINT),
             ]));
         }
@@ -947,24 +1261,18 @@ impl App {
     fn draw_groups(&self, frame: &mut Frame, panel: &GroupPanel) {
         let people = self.candidates(panel);
         let area = centered(frame.area(), 60, 70);
-        frame.render_widget(Clear, area);
         let title = match &panel.target {
-            Some((_, name)) => format!(" Add people to #{name} "),
-            None => " New group ".to_string(),
+            Some((_, name)) => format!("Add people to #{name}"),
+            None => "New group".to_string(),
         };
         let picked = people.iter().filter(|p| panel.is_picked(&p.address)).count();
         let count = if picked == 0 {
             " Space picks people ".fg(MUTED)
         } else {
-            format!(" {picked} picked ").fg(ACCENT)
+            format!(" {picked} picked ").fg(BG).bg(LIME).bold()
         };
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(ACCENT))
-            .title(title.fg(ACCENT).bold())
-            .title(Line::from(count).alignment(Alignment::Right));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let block = neon_block(&title).title(Line::from(count).alignment(Alignment::Right));
+        let inner = float(frame, area, block);
         let name_height = if panel.target.is_some() { 0 } else { 2 };
         let [name, list, help] = Layout::vertical([
             Constraint::Length(name_height),
@@ -991,7 +1299,7 @@ impl App {
         }
 
         let width = list.width as usize;
-        let mut lines = vec![Line::from(" People".fg(MUTED).bold())];
+        let mut lines = vec![Line::from(" People".fg(CYAN).bold())];
         let in_list = panel.focus == Focus::People;
         for (i, person) in people.iter().enumerate() {
             lines.push(candidate_line(person, panel, in_list && i == panel.cursor, width));
@@ -1006,7 +1314,7 @@ impl App {
         let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
         frame.render_widget(Paragraph::new(lines), list);
 
-        let key = |k: &str| k.to_string().fg(ACCENT).bold();
+        let key = |k: &str| k.to_string().fg(KEY).bold();
         let say = |t: &str| t.to_string().fg(MUTED);
         let names: Vec<String> = people
             .iter()
@@ -1076,7 +1384,7 @@ fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) ->
         home::Kind::Tv => "📺",
     };
     let (dot, state) = match &d.state {
-        State::Ready => ("●".fg(OK), d.detail.clone().fg(Color::Reset)),
+        State::Ready => ("●".fg(OK), d.detail.clone().fg(TEXT)),
         State::Offline => ("○".fg(FAINT), d.detail.clone().fg(MUTED)),
         State::Checking => (spinner().fg(MUTED), "checking…".fg(MUTED)),
         State::New => ("✦".fg(ACCENT), d.detail.clone().fg(MUTED)),
@@ -1113,7 +1421,7 @@ fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) ->
 
 /// Two lines under the list saying what the selected device needs.
 fn device_help(d: Option<&DeviceView>, panel: &Devices) -> Vec<Line<'static>> {
-    let key = |k: &str| k.to_string().fg(ACCENT).bold();
+    let key = |k: &str| k.to_string().fg(KEY).bold();
     let say = |t: &str| t.to_string().fg(MUTED);
     let Some(d) = d else { return Vec::new() };
     if panel.renaming.is_some() {
@@ -1165,21 +1473,15 @@ fn device_help(d: Option<&DeviceView>, panel: &Devices) -> Vec<Line<'static>> {
 
 fn draw_picker(frame: &mut Frame, picker: &Picker) {
     let area = centered(frame.area(), 76, 80);
-    frame.render_widget(Clear, area);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
-        .title(" Attach files ".fg(ACCENT).bold())
-        .title_bottom(
-            Line::from(if picker.marked.is_empty() {
-                " Space marks several ".to_string()
-            } else {
-                format!(" {} marked · Enter sends them ", picker.marked.len())
-            })
-            .fg(MUTED),
-        );
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let block = neon_block("Attach files").title_bottom(
+        Line::from(if picker.marked.is_empty() {
+            " Space marks several ".to_string()
+        } else {
+            format!(" {} marked · Enter sends them ", picker.marked.len())
+        })
+        .fg(MUTED),
+    );
+    let inner = float(frame, area, block);
     let [path, filter, list] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(2),
@@ -1194,7 +1496,7 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
     let filter_line = if picker.filter.is_empty() {
         Line::from(vec![" 🔍 ".into(), "type to filter · . shows hidden files".fg(FAINT)])
     } else {
-        Line::from(vec![" 🔍 ".into(), picker.filter.clone().fg(ACCENT)])
+        Line::from(vec![" 🔍 ".into(), picker.filter.clone().fg(YELLOW)])
     };
     frame.render_widget(filter_line, filter);
 
@@ -1216,7 +1518,7 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
         .skip(start)
         .take(height)
         .map(|(i, entry)| {
-            let mark = if picker.is_marked(entry) { "◆ ".fg(ACCENT) } else { "  ".into() };
+            let mark = if picker.is_marked(entry) { "◆ ".fg(LIME) } else { "  ".into() };
             let (icon, name, size) = if entry.dir {
                 ("📁".to_string(), format!("{}/", entry.name), String::new())
             } else {
@@ -1227,11 +1529,13 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
             let line = Line::from(vec![
                 mark,
                 format!("{icon} ").into(),
-                if entry.dir { name.bold() } else { name.into() },
+                if entry.dir { name.fg(CYAN).bold() } else { name.into() },
                 " ".repeat(pad).into(),
                 size.fg(MUTED),
             ]);
             if i == picker.selected {
+                let mut line = line;
+                line.spans[0] = if picker.is_marked(entry) { "◆ ".fg(LIME) } else { "▌ ".fg(MAGENTA) };
                 line.style(Style::new().bg(SELECTED_BG))
             } else {
                 line
@@ -1242,13 +1546,23 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
 }
 
 fn draw_help(frame: &mut Frame) {
-    let area = centered(frame.area(), 70, 86);
-    frame.render_widget(Clear, area);
+    let screen = frame.area();
+    let wide = screen.width >= 130;
+    let area = centered(screen, if wide { 90 } else { 70 }, 88);
     let key = |k: &str, what: &str| {
-        Line::from(vec![format!("  {k:<16}").fg(ACCENT).bold(), what.to_string().fg(Color::Reset)])
+        Line::from(vec![format!("  {k:<16}").fg(KEY).bold(), what.to_string().fg(TEXT)])
     };
-    let head = |t: &str| Line::from(format!(" {t}").fg(MUTED).bold());
+    let head = |t: &str| Line::from(vec![" ▸ ".fg(MAGENTA), t.to_string().fg(CYAN).bold()]);
     let mut lines = vec![
+        Line::from(vec![
+            "  Everything is clickable too: ".fg(MUTED),
+            "chats".fg(TEXT).bold(),
+            " on the left, ".fg(MUTED),
+            "messages".fg(TEXT).bold(),
+            ", and the ".fg(MUTED),
+            "keys".fg(KEY).bold(),
+            " along the bottom.".fg(MUTED),
+        ]),
         Line::from(""),
         head("Chatting"),
         key("Enter", "send (with any attached files)"),
@@ -1263,7 +1577,7 @@ fn draw_help(frame: &mut Frame) {
         key("drag & drop", "drop files on the window to attach them"),
         key("/file PATH", "send a file by path"),
         Line::from(""),
-        head("Messages  (↑ on an empty line)"),
+        head("Messages  (click one, or ↑ on an empty line)"),
         key("r · Enter", "reply"),
         key("o · f", "open a file · show it in its folder"),
         key("y", "copy text to the clipboard"),
@@ -1280,22 +1594,35 @@ fn draw_help(frame: &mut Frame) {
         key("Ctrl-D", "devices: find, pair and test them"),
         key("Ctrl-E", "protocol event log"),
         key("Ctrl-C · Ctrl-Q", "quit"),
-        Line::from(""),
-        Line::from(" Commands".fg(MUTED).bold()),
     ];
+    let mut commands = vec![head("Commands  (type / to see them)")];
     for (name, what) in COMMANDS {
-        lines.push(key(name, what));
+        commands.push(key(name, what));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(
+    commands.push(Line::from(""));
+    commands.push(Line::from(
         "  To select text with the mouse, hold Shift (Option in iTerm/Terminal).".fg(FAINT),
     ));
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
-        .title(" hopchat · help ".fg(ACCENT).bold())
-        .title_bottom(" ✓ on the wire · ✓✓ delivered · ✓✓ blue: read ".fg(MUTED));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let block = neon_block("hopchat · help").title_bottom(Line::from(vec![
+        " ✓ on the wire · ".fg(MUTED),
+        "✓✓".fg(LIME),
+        " delivered · ".fg(MUTED),
+        "✓✓".fg(READ),
+        " read ".fg(MUTED),
+    ]));
+    let inner = float(frame, area, block);
+    if wide {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(inner);
+        frame.render_widget(Paragraph::new(lines), left);
+        let mut right_lines = vec![Line::from(""), Line::from("")];
+        right_lines.extend(commands);
+        frame.render_widget(Paragraph::new(right_lines), right);
+    } else {
+        lines.push(Line::from(""));
+        lines.extend(commands);
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
 }
 
 /// What an empty lobby says: who's here, and what you can say to it.
@@ -1309,10 +1636,10 @@ fn lobby_hint(others: bool, open: bool) -> Vec<Line<'static>> {
         Line::from(who.fg(MUTED)).centered(),
         Line::from(""),
         Line::from(vec![
-            "@home".fg(ACCENT).bold(),
-            " turn the lights down  ·  ".fg(FAINT),
-            "@ai".fg(ACCENT).bold(),
-            " ask your model anything".fg(FAINT),
+            "@home".fg(YELLOW).bold(),
+            " turn the lights down  ·  ".fg(MUTED),
+            "@ai".fg(YELLOW).bold(),
+            " ask your model anything".fg(MUTED),
         ])
         .centered(),
         Line::from(
@@ -1335,10 +1662,11 @@ fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
 
 fn progress_bar(fraction: f64, width: usize) -> Vec<Span<'static>> {
     let filled = ((fraction.clamp(0.0, 1.0)) * width as f64).round() as usize;
-    vec![
-        "━".repeat(filled).fg(ACCENT),
-        "━".repeat(width - filled).fg(FAINT),
-    ]
+    let mut bar: Vec<Span<'static>> = (0..filled)
+        .map(|i| "█".fg(theme::along(&[MAGENTA, VIOLET, CYAN], i as f64 / width.max(2) as f64)))
+        .collect();
+    bar.push("░".repeat(width - filled).fg(FAINT));
+    bar
 }
 
 fn highlight_line(line: Line<'static>, width: usize) -> Line<'static> {
@@ -1434,7 +1762,7 @@ fn day_separator(ms: i64, width: usize) -> Line<'static> {
     let side = width.saturating_sub(label_width) / 2;
     Line::from(vec![
         "─".repeat(side).fg(FAINT),
-        label.fg(MUTED),
+        label.fg(VIOLET).bold(),
         "─".repeat(width.saturating_sub(side + label_width)).fg(FAINT),
     ])
 }
