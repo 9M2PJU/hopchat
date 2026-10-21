@@ -10,17 +10,16 @@
 //! A record is only a hint: the stream it leads to must prove `addr` in its
 //! preamble before anything is announced.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use sha2::{Digest, Sha256};
 
-use crate::net::{self, Announced, LocalIdentity, NetEvent};
+use crate::net::{self, Announced, Dialing, LocalIdentity, NetEvent};
 
 const SERVICE_TYPE: &str = "_offlineprotocol._tcp.local.";
 const TXT_VERSION: &str = "1";
@@ -35,6 +34,7 @@ pub fn start(
     tcp_port: u16,
     events: Sender<NetEvent>,
     announced: Announced,
+    dialing: Dialing,
 ) -> Result<(), mdns_sd::Error> {
     let daemon = ServiceDaemon::new()?;
     // The listener is IPv4 only, so a record must not offer IPv6 to dial.
@@ -57,7 +57,6 @@ pub fn start(
     thread::spawn(move || {
         // Owned here so the responder lives as long as the browser.
         let _daemon = daemon;
-        let dialing: Arc<Mutex<HashSet<String>>> = Arc::default();
         // Instance full name to the address it claims and where it listens.
         let mut records: HashMap<String, (String, Vec<SocketAddr>)> = HashMap::new();
         loop {
@@ -89,7 +88,7 @@ pub fn start(
             for (address, peers) in records.values() {
                 if me.address.as_str() >= address.as_str()
                     || announced.lock().unwrap().contains(address)
-                    || !dialing.lock().unwrap().insert(address.clone())
+                    || dialing.lock().unwrap().contains(address)
                 {
                     continue;
                 }
@@ -100,10 +99,7 @@ pub fn start(
                     announced.clone(),
                     dialing.clone(),
                 );
-                thread::spawn(move || {
-                    net::dial(&peers, address.clone(), me, events, announced);
-                    dialing.lock().unwrap().remove(&address);
-                });
+                thread::spawn(move || net::dial(&peers, address, me, events, announced, dialing));
             }
         }
     });

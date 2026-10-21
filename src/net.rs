@@ -60,10 +60,17 @@ pub struct LocalIdentity {
 /// same peer can be refused instead of announced twice.
 pub type Announced = Arc<Mutex<HashSet<String>>>;
 
+/// Addresses with a dial in flight or a dialed stream still open. Shared by
+/// the beacon and DNS-SD so one peer is never dialed twice at once: two
+/// streams racing their preambles can each be kept by a different side,
+/// and then both get closed.
+pub type Dialing = Arc<Mutex<HashSet<String>>>;
+
 pub fn start(me: LocalIdentity, events: Sender<NetEvent>) -> std::io::Result<u16> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     let tcp_port = listener.local_addr()?.port();
     let announced: Announced = Arc::default();
+    let dialing: Dialing = Arc::default();
 
     {
         let (me, events, announced) = (me.clone(), events.clone(), announced.clone());
@@ -75,7 +82,13 @@ pub fn start(me: LocalIdentity, events: Sender<NetEvent>) -> std::io::Result<u16
     }
 
     // Optional: without an mDNS responder the beacon still finds hopchats.
-    let _ = dnssd::start(me.clone(), tcp_port, events.clone(), announced.clone());
+    let _ = dnssd::start(
+        me.clone(),
+        tcp_port,
+        events.clone(),
+        announced.clone(),
+        dialing.clone(),
+    );
 
     let socket = discovery_socket()?;
     {
@@ -108,10 +121,18 @@ pub fn start(me: LocalIdentity, events: Sender<NetEvent>) -> std::io::Result<u16
             });
             // One side dials so a pair never races into two streams: the
             // lower address. The other side just waits to be called.
-            if me.address < address && !announced.lock().unwrap().contains(&address) {
+            if me.address < address
+                && !announced.lock().unwrap().contains(&address)
+                && !dialing.lock().unwrap().contains(&address)
+            {
                 let peer = SocketAddr::new(from.ip(), port);
-                let (me, events, announced) = (me.clone(), events.clone(), announced.clone());
-                thread::spawn(move || dial(&[peer], address, me, events, announced));
+                let (me, events, announced, dialing) = (
+                    me.clone(),
+                    events.clone(),
+                    announced.clone(),
+                    dialing.clone(),
+                );
+                thread::spawn(move || dial(&[peer], address, me, events, announced, dialing));
             }
         }
     });
@@ -142,99 +163,113 @@ fn parse_beacon(bytes: &[u8]) -> Option<(String, u16, String)> {
     Some((address, port, nick))
 }
 
-/// Connects to the first of `peers` that answers and runs the stream,
-/// expecting it to prove `address`.
+/// Connects to the first of `peers` that answers and runs the stream until
+/// it closes, expecting it to prove `address`. Does nothing if `address` is
+/// already being dialed.
 pub fn dial(
     peers: &[SocketAddr],
     address: String,
     me: LocalIdentity,
     events: Sender<NetEvent>,
     announced: Announced,
+    dialing: Dialing,
 ) {
+    if !dialing.lock().unwrap().insert(address.clone()) {
+        return;
+    }
     for peer in peers {
         if let Ok(stream) = TcpStream::connect_timeout(peer, Duration::from_secs(3)) {
-            spawn_stream(stream, Some(address), me, events, announced);
-            return;
+            run_stream(stream, Some(address.clone()), me, events, announced);
+            break;
         }
     }
+    dialing.lock().unwrap().remove(&address);
+}
+
+fn spawn_stream(
+    stream: TcpStream,
+    expecting: Option<String>,
+    me: LocalIdentity,
+    events: Sender<NetEvent>,
+    announced: Announced,
+) {
+    thread::spawn(move || run_stream(stream, expecting, me, events, announced));
 }
 
 /// Runs one stream: sends our preamble, then reads until it closes.
 ///
 /// `expecting` is the address a beacon or DNS-SD record claimed, for a stream
 /// we dialed; the reader refuses a preamble that proves anything else.
-fn spawn_stream(
+fn run_stream(
     mut stream: TcpStream,
     expecting: Option<String>,
     me: LocalIdentity,
     events: Sender<NetEvent>,
     announced: Announced,
 ) {
-    thread::spawn(move || {
-        let _ = stream.set_nodelay(true);
-        let keepalive = TcpKeepalive::new()
-            .with_time(KEEPALIVE_IDLE)
-            .with_interval(KEEPALIVE_INTERVAL)
-            .with_retries(KEEPALIVE_RETRIES);
-        let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
-        let _ = stream.set_read_timeout(Some(PREAMBLE_WAIT));
-        let _ = stream.set_write_timeout(Some(WRITE_WAIT));
-        let Ok(preamble) = frame(&me.preamble) else {
-            return;
+    let _ = stream.set_nodelay(true);
+    let keepalive = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+    let _ = stream.set_read_timeout(Some(PREAMBLE_WAIT));
+    let _ = stream.set_write_timeout(Some(WRITE_WAIT));
+    let Ok(preamble) = frame(&me.preamble) else {
+        return;
+    };
+    if stream.write_all(&preamble).is_err() {
+        return;
+    }
+
+    let verify = Box::new(|b: &[u8]| verify_identity_assertion(b).ok().map(|a| a.to_string()));
+    let mut reader = PeerStreamReader::new(verify);
+    if let Some(address) = expecting {
+        reader = reader.expecting(address);
+    }
+
+    let mut peer: Option<String> = None;
+    let mut buf = vec![0u8; 64 * 1024];
+    'read: loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
         };
-        if stream.write_all(&preamble).is_err() {
-            return;
-        }
-
-        let verify = Box::new(|b: &[u8]| verify_identity_assertion(b).ok().map(|a| a.to_string()));
-        let mut reader = PeerStreamReader::new(verify);
-        if let Some(address) = expecting {
-            reader = reader.expecting(address);
-        }
-
-        let mut peer: Option<String> = None;
-        let mut buf = vec![0u8; 64 * 1024];
-        'read: loop {
-            let n = match stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            for event in reader.feed(&buf[..n]) {
-                match event {
-                    StreamEvent::Announced(address) => {
-                        let Ok(writer) = stream.try_clone() else {
-                            break 'read;
-                        };
-                        let fresh = address != me.address
-                            && announced.lock().unwrap().insert(address.clone());
-                        if !fresh {
-                            break 'read;
-                        }
-                        // Proven: from here keepalive notices a dead peer.
-                        let _ = stream.set_read_timeout(None);
-                        peer = Some(address.clone());
-                        let _ = events.send(NetEvent::Up {
-                            address,
-                            stream: writer,
-                        });
+        for event in reader.feed(&buf[..n]) {
+            match event {
+                StreamEvent::Announced(address) => {
+                    let Ok(writer) = stream.try_clone() else {
+                        break 'read;
+                    };
+                    let fresh = address != me.address
+                        && announced.lock().unwrap().insert(address.clone());
+                    if !fresh {
+                        break 'read;
                     }
-                    StreamEvent::Message { from, body } => {
-                        let _ = events.send(NetEvent::Frame {
-                            address: from,
-                            body,
-                        });
-                    }
-                    StreamEvent::Closed(_) => break 'read,
+                    // Proven: from here keepalive notices a dead peer.
+                    let _ = stream.set_read_timeout(None);
+                    peer = Some(address.clone());
+                    let _ = events.send(NetEvent::Up {
+                        address,
+                        stream: writer,
+                    });
                 }
+                StreamEvent::Message { from, body } => {
+                    let _ = events.send(NetEvent::Frame {
+                        address: from,
+                        body,
+                    });
+                }
+                StreamEvent::Closed(_) => break 'read,
             }
         }
+    }
 
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-        if let Some(address) = peer {
-            announced.lock().unwrap().remove(&address);
-            let _ = events.send(NetEvent::Down { address });
-        }
-    });
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    if let Some(address) = peer {
+        announced.lock().unwrap().remove(&address);
+        let _ = events.send(NetEvent::Down { address });
+    }
 }
 
 /// Writes one body to a peer's stream as one frame.

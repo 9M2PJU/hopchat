@@ -951,6 +951,9 @@ impl Engine {
         let mut broken = Vec::new();
         loop {
             match lan.get_next_message() {
+                // A peer whose write already failed would stall each later
+                // frame for the full write timeout, so its frames are dropped.
+                Ok(Some((peer, _))) if broken.contains(&peer) => {}
                 Ok(Some((peer, body))) => match self.streams.get_mut(&peer) {
                     Some(stream) => {
                         if net::write_frame(stream, &body).is_err() {
