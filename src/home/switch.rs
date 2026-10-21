@@ -12,7 +12,9 @@ use super::driver::backend_of;
 use super::{Device, Home};
 
 pub trait SwitchDriver: Sync {
-    fn set(&self, d: &Device, on: bool) -> Result<(), String>;
+    /// Switches it, and says whether it is on when the answer to the
+    /// change said so; `None` to ask with [`status`](Self::status).
+    fn set(&self, d: &Device, on: bool) -> Result<Option<String>, String>;
     /// Whether it is on, in a word or two.
     fn status(&self, d: &Device) -> Result<String, String>;
 }
@@ -50,8 +52,9 @@ impl Home {
         Some(match name {
             "switch_set" => match flag(args, "on") {
                 Some(on) => self.pick_switch(args).and_then(|(s, d)| {
-                    s.set(&d, on)?;
-                    let state = s.status(&d).unwrap_or_else(|_| if on { "on" } else { "off" }.into());
+                    let told = s.set(&d, on)?;
+                    let asked = || s.status(&d).unwrap_or_else(|_| if on { "on" } else { "off" }.into());
+                    let state = told.unwrap_or_else(asked);
                     Ok(format!("{} is now {state}", d.name))
                 }),
                 None => Err("say whether to switch it on or off".into()),

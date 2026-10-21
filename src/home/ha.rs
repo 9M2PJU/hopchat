@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -111,17 +112,21 @@ impl Hub {
         data["token"] = json!(self.token);
     }
 
-    fn agent() -> ureq::Agent {
-        ureq::Agent::config_builder()
-            .timeout_global(Some(WAIT))
-            // An HTTP error from HA says why in its body; keep it.
-            .http_status_as_error(false)
-            .build()
-            .new_agent()
+    /// One client for every call, so its connections to HA are kept and
+    /// reused rather than opened per request.
+    fn agent() -> &'static ureq::Agent {
+        static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+        AGENT.get_or_init(|| {
+            ureq::Agent::config_builder()
+                .timeout_global(Some(WAIT))
+                // An HTTP error from HA says why in its body; keep it.
+                .http_status_as_error(false)
+                .build()
+                .new_agent()
+        })
     }
 
-    /// The JSON HA answered, or why not: its own message when it gives one,
-    /// as in "Entity … does not support action media_player.volume_set".
+    /// The JSON HA answered, or why not.
     fn answer(&self, sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value, String> {
         let mut response = sent.map_err(|e| match e {
             ureq::Error::Timeout(_) => "Home Assistant took too long to answer".to_string(),
@@ -129,14 +134,7 @@ impl Hub {
         })?;
         let code = response.status().as_u16();
         let body: Value = response.body_mut().read_json().unwrap_or_default();
-        match code {
-            200..=299 => Ok(body),
-            401 => Err("Home Assistant refused the token; make a new one under your HA profile, Security".into()),
-            _ => Err(match body.get("message").and_then(Value::as_str) {
-                Some(message) => format!("Home Assistant: {message}"),
-                None => format!("Home Assistant answered HTTP {code}"),
-            }),
-        }
+        outcome(code, body)
     }
 
     fn get(&self, path: &str) -> Result<Value, String> {
@@ -147,15 +145,18 @@ impl Hub {
         self.answer(sent)
     }
 
-    /// Calls a service, such as `light.turn_on`, on one entity.
-    fn call(&self, service: &str, entity: &str, mut body: Value) -> Result<(), String> {
+    /// Calls a service, such as `light.turn_on`, on one entity, and returns
+    /// the entity's new state if HA's answer has it. HA answers with every
+    /// state the call changed; one that changes later, as a polled or
+    /// cloud device may, isn't in it.
+    fn call(&self, service: &str, entity: &str, mut body: Value) -> Result<Option<Value>, String> {
         let (domain, service) = service.split_once('.').unwrap_or((service, ""));
         body["entity_id"] = json!(entity);
         let sent = Self::agent()
             .post(format!("{}/api/services/{domain}/{service}", self.url))
             .header("Authorization", format!("Bearer {}", self.token))
             .send_json(&body);
-        self.answer(sent).map(drop)
+        Ok(changed(&self.answer(sent)?, entity))
     }
 
     /// One entity's state and attributes.
@@ -242,6 +243,29 @@ impl Hub {
             .filter_map(|e| Some((e.get("entity_id")?.as_str()?.to_string(), e.clone())))
             .collect())
     }
+}
+
+/// What HA's answer means: its JSON, or why not, in its own words when it
+/// gives them, as in "Entity … does not support action media_player.volume_set".
+fn outcome(code: u16, body: Value) -> Result<Value, String> {
+    match code {
+        200..=299 => Ok(body),
+        401 => Err("Home Assistant refused the token; make a new one under your HA profile, Security".into()),
+        _ => Err(match body.get("message").and_then(Value::as_str) {
+            Some(message) => format!("Home Assistant: {message}"),
+            None => format!("Home Assistant answered HTTP {code}"),
+        }),
+    }
+}
+
+/// `entity`'s state among those a service call changed.
+fn changed(states: &Value, entity: &str) -> Option<Value> {
+    states.as_array()?.iter().find(|s| s.get("entity_id").and_then(Value::as_str) == Some(entity)).cloned()
+}
+
+/// Whether a device is one of Home Assistant's, and so keeps its URL and token.
+pub fn drives(d: &Device) -> bool {
+    [HaLight.id(), HaTv.id(), HaSwitch.id()].contains(&d.backend.as_str())
 }
 
 /// The next JSON message on a WebSocket.
@@ -405,44 +429,53 @@ impl LightDriver for HaLight {
         effects.into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
     }
 
-    fn set(&self, d: &Device, pilot: &Pilot) -> Result<(), String> {
-        let hub = Hub::of(d)?;
-        let entity = entity(d)?;
-        let changes = pilot.brightness.is_some() || pilot.kelvin.is_some() || pilot.rgb.is_some() || pilot.scene.is_some();
-        if pilot.on == Some(false) && !changes {
-            return hub.call("light.turn_off", entity, json!({}));
-        }
-        if pilot.on.is_none() && !changes {
-            return Ok(());
-        }
-        let mut body = json!({});
-        if let Some(b) = pilot.brightness {
-            body["brightness_pct"] = json!(b.clamp(1, 100));
-        }
-        if let Some(k) = pilot.kelvin {
-            body["color_temp_kelvin"] = json!(k);
-        }
-        if let Some((r, g, b)) = pilot.rgb {
-            body["rgb_color"] = json!([r, g, b]);
-        }
-        if let Some(scene) = &pilot.scene {
-            let wanted = scene_key(scene);
-            // HA wants the effect as the light spells it.
-            let Some(effect) = self.scenes(d).into_iter().find(|e| scene_key(e) == wanted) else {
-                return Err(format!("{} has no scene called {scene}", d.name));
-            };
-            body["effect"] = json!(effect);
-        } else if (pilot.kelvin.is_some() || pilot.rgb.is_some()) && flag(d, "stops") {
-            // Or the colour asked for hides behind whatever effect is running.
-            body["effect"] = json!("off");
-        }
-        hub.call("light.turn_on", entity, body)
+    fn set(&self, d: &Device, pilot: &Pilot) -> Result<Option<String>, String> {
+        let Some((service, body)) = light_call(pilot, &self.scenes(d), flag(d, "stops"))
+            .map_err(|scene| format!("{} has no scene called {scene}", d.name))?
+        else {
+            return Ok(None);
+        };
+        let now = Hub::of(d)?.call(service, entity(d)?, body)?;
+        Ok(now.as_ref().map(describe_light))
     }
 
     fn status(&self, d: &Device) -> Result<String, String> {
         let hub = Hub::of(d)?;
         Ok(describe_light(&hub.state(entity(d)?)?))
     }
+}
+
+/// The service call that makes a light do what `pilot` asks, given the
+/// effects it has and whether "off" stops one; `None` when it asks for
+/// nothing, and the scene asked for when the light has no such effect.
+fn light_call(pilot: &Pilot, effects: &[String], stops: bool) -> Result<Option<(&'static str, Value)>, String> {
+    let changes = pilot.brightness.is_some() || pilot.kelvin.is_some() || pilot.rgb.is_some() || pilot.scene.is_some();
+    if pilot.on == Some(false) && !changes {
+        return Ok(Some(("light.turn_off", json!({}))));
+    }
+    if pilot.on.is_none() && !changes {
+        return Ok(None);
+    }
+    let mut body = json!({});
+    if let Some(b) = pilot.brightness {
+        body["brightness_pct"] = json!(b.clamp(1, 100));
+    }
+    if let Some(k) = pilot.kelvin {
+        body["color_temp_kelvin"] = json!(k);
+    }
+    if let Some((r, g, b)) = pilot.rgb {
+        body["rgb_color"] = json!([r, g, b]);
+    }
+    if let Some(scene) = &pilot.scene {
+        let wanted = scene_key(scene);
+        // HA wants the effect as the light spells it.
+        let effect = effects.iter().find(|e| scene_key(e) == wanted).ok_or_else(|| scene.clone())?;
+        body["effect"] = json!(effect);
+    } else if (pilot.kelvin.is_some() || pilot.rgb.is_some()) && stops {
+        // Or the colour asked for hides behind whatever effect is running.
+        body["effect"] = json!("off");
+    }
+    Ok(Some(("light.turn_on", body)))
 }
 
 /// A light's state as "on · 40% · 2700K".
@@ -697,9 +730,10 @@ impl Backend for HaSwitch {
 }
 
 impl SwitchDriver for HaSwitch {
-    fn set(&self, d: &Device, on: bool) -> Result<(), String> {
+    fn set(&self, d: &Device, on: bool) -> Result<Option<String>, String> {
         let service = if on { "switch.turn_on" } else { "switch.turn_off" };
-        Hub::of(d)?.call(service, entity(d)?, json!({}))
+        let now = Hub::of(d)?.call(service, entity(d)?, json!({}))?;
+        Ok(now.as_ref().map(describe_switch))
     }
 
     fn status(&self, d: &Device) -> Result<String, String> {
@@ -772,6 +806,55 @@ mod tests {
         assert!(describe("media_player.kitchen", &speaker).is_none());
         let plug = json!({"attributes": {"friendly_name": "Kettle"}});
         assert_eq!(describe("switch.kettle", &plug), Some(("ha_switch", json!({"name": "Kettle"}))));
+    }
+
+    #[test]
+    fn answers_say_why_not() {
+        assert_eq!(outcome(200, json!([])), Ok(json!([])));
+        assert!(outcome(401, Value::Null).unwrap_err().contains("refused the token"));
+        let refused = json!({"message": "Entity media_player.tv does not support action media_player.volume_set"});
+        assert_eq!(outcome(400, refused).unwrap_err(), "Home Assistant: Entity media_player.tv does not support action media_player.volume_set");
+        assert_eq!(outcome(500, Value::Null).unwrap_err(), "Home Assistant answered HTTP 500");
+    }
+
+    #[test]
+    fn a_call_reports_the_state_it_changed() {
+        let states = json!([{"entity_id": "light.other", "state": "off"}, {"entity_id": "switch.kettle", "state": "on"}]);
+        assert_eq!(changed(&states, "switch.kettle").map(|s| describe_switch(&s)), Some("on".into()));
+        assert_eq!(changed(&states, "switch.fridge"), None, "not changed yet: ask instead");
+        assert_eq!(changed(&Value::Null, "switch.kettle"), None);
+    }
+
+    #[test]
+    fn light_calls() {
+        let effects = vec!["Rainbow".to_string(), "Night-Light".to_string()];
+        let call = |pilot: Pilot, stops: bool| light_call(&pilot, &effects, stops);
+        assert_eq!(call(Pilot::default(), false), Ok(None), "nothing asked, nothing sent");
+        assert_eq!(call(Pilot { on: Some(false), ..Default::default() }, false), Ok(Some(("light.turn_off", json!({})))));
+        assert_eq!(call(Pilot { on: Some(true), ..Default::default() }, false), Ok(Some(("light.turn_on", json!({})))));
+        assert_eq!(
+            call(Pilot { scene: Some("night light".into()), ..Default::default() }, true),
+            Ok(Some(("light.turn_on", json!({"effect": "Night-Light"})))),
+            "the effect as the light spells it",
+        );
+        assert_eq!(call(Pilot { scene: Some("fire".into()), ..Default::default() }, true), Err("fire".into()));
+        assert_eq!(
+            call(Pilot { rgb: Some((255, 0, 0)), brightness: Some(0), ..Default::default() }, true),
+            Ok(Some(("light.turn_on", json!({"rgb_color": [255, 0, 0], "brightness_pct": 1, "effect": "off"})))),
+            "a colour stops a running effect",
+        );
+        assert_eq!(
+            call(Pilot { kelvin: Some(2700), ..Default::default() }, false),
+            Ok(Some(("light.turn_on", json!({"color_temp_kelvin": 2700})))),
+            "no \"off\" to send when the light has none",
+        );
+    }
+
+    #[test]
+    fn which_devices_are_home_assistants() {
+        let d = |backend: &str| Device::new(backend, "x".into(), Ipv4Addr::UNSPECIFIED, None, Value::Null);
+        assert!(drives(&d("ha_light")) && drives(&d("ha_tv")) && drives(&d("ha_switch")));
+        assert!(!drives(&d("wiz")) && !drives(&d("webos")) && !drives(&d("ha_something_newer")));
     }
 
     #[test]

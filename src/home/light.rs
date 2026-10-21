@@ -43,7 +43,9 @@ pub trait LightDriver: Sync {
     fn scenes(&self, _d: &Device) -> Vec<String> {
         Vec::new()
     }
-    fn set(&self, d: &Device, pilot: &Pilot) -> Result<(), String>;
+    /// Changes it, and says what it is doing now when the answer to the
+    /// change said so; `None` to ask with [`status`](Self::status).
+    fn set(&self, d: &Device, pilot: &Pilot) -> Result<Option<String>, String>;
     /// A one-line description of what it is doing now.
     fn status(&self, d: &Device) -> Result<String, String>;
 }
@@ -157,7 +159,8 @@ impl Home {
                 if pilot.kelvin.is_some() && !caps.white {
                     return format!("{} only dims; it has no white temperature", d.name);
                 }
-                match l.set(d, &pilot).and_then(|()| l.status(d)) {
+                let now = l.set(d, &pilot).and_then(|told| told.map_or_else(|| l.status(d), Ok));
+                match now {
                     Ok(state) => format!("{} is now {state}", d.name),
                     Err(e) => format!("{}: {e}", d.name),
                 }

@@ -90,8 +90,8 @@ impl LightDriver for Wiz {
         SCENE_NAMES.iter().map(|s| s.to_string()).collect()
     }
 
-    fn set(&self, d: &Device, pilot: &Pilot) -> Result<(), String> {
-        (Bulb { ip: d.ip }).set(pilot)
+    fn set(&self, d: &Device, pilot: &Pilot) -> Result<Option<String>, String> {
+        (Bulb { ip: d.ip }).set(pilot).map(|()| None)
     }
 
     fn status(&self, d: &Device) -> Result<String, String> {

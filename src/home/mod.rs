@@ -97,11 +97,15 @@ impl Device {
         Self { backend: backend.into(), name, ip, mac, unit: None, data, model: None, key: None, cert: None }
     }
 
+    /// A hub's entity is named by its unit, not by an address the hub's
+    /// name happens to resolve to, so it keeps its id when the hub moves
+    /// or doesn't resolve.
     pub fn id(&self) -> String {
-        let at = self.mac.clone().unwrap_or_else(|| self.ip.to_string());
-        match &self.unit {
-            Some(unit) => format!("{at}/{unit}"),
-            None => at,
+        match (&self.unit, &self.mac) {
+            (Some(unit), Some(mac)) => format!("{mac}/{unit}"),
+            (Some(unit), None) => unit.clone(),
+            (None, Some(mac)) => mac.clone(),
+            (None, None) => self.ip.to_string(),
         }
     }
 
@@ -329,6 +333,25 @@ pub enum Request {
     /// A group member wants this machine's model to think.
     Lend { to: String, who: String, id: String, messages: Vec<serde_json::Value>, tools: serde_json::Value },
     Answered { question: ai::Question, asked: serde_json::Value, answer: Result<String, String> },
+}
+
+/// The address and token typed after `/home ha`, in either order. Taken
+/// the wrong way round, the token would be shown back as the address that
+/// couldn't be reached.
+fn ha_args(first: &str, second: Option<&str>) -> (Option<String>, String) {
+    match second {
+        Some(second) if looks_like_address(second) && !looks_like_address(first) => {
+            (Some(second.to_string()), first.to_string())
+        }
+        Some(second) => (Some(first.to_string()), second.to_string()),
+        None => (None, first.to_string()),
+    }
+}
+
+/// Whether a word typed after `/home ha` is an address: `http://…` or
+/// `host:port` or an IPv4 address. HA's tokens are JWTs, with none of these.
+fn looks_like_address(word: &str) -> bool {
+    word.contains("://") || word.contains(':') || word.parse::<Ipv4Addr>().is_ok()
 }
 
 /// A device name as it may be kept: one line, not too long.
@@ -618,8 +641,13 @@ impl Home {
         if let Some(d) = self.config.devices.iter_mut().find(|d| d.same(&f)) {
             let mut changed = false;
             let mut moved = None;
-            if d.ip != f.ip {
-                moved = Some(format!("{} moved to {}", d.name, f.ip));
+            // An unresolved hub says 0.0.0.0; that isn't a move.
+            if d.ip != f.ip && !f.ip.is_unspecified() {
+                // Every entity of a hub moves with it; one note per entity
+                // would only be noise.
+                if d.unit.is_none() {
+                    moved = Some(format!("{} moved to {}", d.name, f.ip));
+                }
                 d.ip = f.ip;
                 changed = true;
             }
@@ -633,13 +661,17 @@ impl Home {
                 }
                 changed = true;
             }
-            // Anything the backend learned that it didn't have yet.
+            // Anything the backend learned that it didn't have yet. What a
+            // hub lists is what the hub says now, so that replaces what an
+            // entity had: its effects and colour modes can change.
+            let current = f.unit.is_some();
             if let Value::Object(learned) = &f.data {
                 if !d.data.is_object() {
                     d.data = json!({});
                 }
                 for (key, value) in learned {
-                    if d.data.get(key).is_none_or(Value::is_null) {
+                    let stale = d.data.get(key).is_none_or(Value::is_null) || (current && d.data[key] != *value);
+                    if stale {
                         d.data[key] = value.clone();
                         changed = true;
                     }
@@ -815,10 +847,7 @@ impl Home {
                     .into(),
             },
             ("ha", Some(first)) => {
-                let (typed, token) = match words.next() {
-                    Some(token) => (Some(first.to_string()), token.to_string()),
-                    None => (None, first.to_string()),
-                };
+                let (typed, token) = ha_args(first, words.next());
                 self.connect_ha(typed, token);
                 "connecting to Home Assistant…".into()
             }
@@ -870,9 +899,10 @@ impl Home {
             Ok(connected) => connected,
             Err(e) => return self.note(format!("home: {e}")),
         };
-        // A new token or address reaches every device added from it.
-        for d in &mut self.config.devices {
-            if d.backend.starts_with("ha_") {
+        // A new token or address reaches every device from it, added or
+        // still waiting in /devices to be added.
+        for d in self.config.devices.iter_mut().chain(&mut self.found) {
+            if ha::drives(d) {
                 hub.stamp(&mut d.data);
             }
         }
@@ -1339,7 +1369,7 @@ mod tests {
         };
         home.ha_connected(Ok((hub("old"), "Home".into(), vec![strip(&hub("old"))])));
         assert_eq!(home.found[0].name, "Kitchen strip");
-        assert_eq!(home.found[0].id(), "10.0.0.4/light.strip");
+        assert_eq!(home.found[0].id(), "light.strip", "an entity is named by itself, not the hub's address");
         let id = home.found[0].id();
         home.add(&id);
         assert!(home.tools().to_string().contains("\"color\""));
@@ -1381,6 +1411,59 @@ mod tests {
         assert_eq!(run(&mut home, "tv_open_app", json!({"app": "youtube"})), "Lounge room switched to youtube");
         assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": true})), "AC is now on");
         assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": false})), "AC is now off");
+    }
+
+    #[test]
+    fn a_new_token_reaches_devices_not_yet_added() {
+        let mut home = home_with(Vec::new());
+        let hub = |token: &str| ha::Hub { url: "http://10.0.0.4:8123".into(), token: token.into() };
+        let plug = |hub: &ha::Hub| {
+            let mut data = json!({"name": "Kettle"});
+            hub.stamp(&mut data);
+            driver::Found { backend: "ha_switch", ip: [10, 0, 0, 4].into(), mac: None, unit: Some("switch.kettle".into()), data }
+        };
+        home.ha_connected(Ok((hub("old"), "Home".into(), vec![plug(&hub("old"))])));
+        home.ha_connected(Ok((hub("new"), "Home".into(), vec![plug(&hub("new"))])));
+        assert_eq!(home.found.len(), 1);
+        home.add("switch.kettle");
+        assert_eq!(home.config.devices[0].data["token"], "new");
+    }
+
+    #[test]
+    fn a_hub_entity_stays_put_and_keeps_up_with_the_hub() {
+        let strip = |ip: [u8; 4], effects: Value| driver::Found {
+            backend: "ha_light",
+            ip: ip.into(),
+            mac: None,
+            unit: Some("light.strip".into()),
+            data: json!({"name": "Strip", "colour": true, "white": false, "effects": effects}),
+        };
+        let mut home = home_with(Vec::new());
+        home.on_found(strip([10, 0, 0, 4], json!(["Rainbow"])));
+        home.add("light.strip");
+        // The hub's name didn't resolve this time: not a move.
+        home.on_found(strip([0, 0, 0, 0], json!(["Rainbow"])));
+        assert_eq!(home.config.devices[0].ip, Ipv4Addr::new(10, 0, 0, 4));
+        // A real move keeps the id, so its state isn't lost.
+        home.on_found(strip([10, 0, 0, 7], json!(["Rainbow"])));
+        assert_eq!(home.config.devices[0].ip, Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(home.config.devices[0].id(), "light.strip");
+        assert!(home.live.contains_key("light.strip"));
+        // What the hub says now replaces what it said before.
+        home.on_found(strip([10, 0, 0, 7], json!(["Fire", "Rainbow"])));
+        assert_eq!(home.config.devices[0].data["effects"], json!(["Fire", "Rainbow"]));
+        assert!(home.system_prompt().contains("Fire"));
+    }
+
+    #[test]
+    fn home_assistant_address_and_token_in_either_order() {
+        let both = |a: &str, b: Option<&str>| ha_args(a, b);
+        let (url, token) = ("http://10.0.0.4:8123", "eyJhbGciOi.eyJpc3Mi.sig");
+        assert_eq!(both(url, Some(token)), (Some(url.into()), token.into()));
+        assert_eq!(both(token, Some(url)), (Some(url.into()), token.into()));
+        assert_eq!(both(token, Some("10.0.0.4")), (Some("10.0.0.4".into()), token.into()));
+        assert_eq!(both("homeassistant.local", Some(token)), (Some("homeassistant.local".into()), token.into()));
+        assert_eq!(both(token, None), (None, token.into()));
     }
 
     #[test]
