@@ -1466,7 +1466,15 @@ impl App {
                 let paths = dropped_paths(arg)
                     .unwrap_or_else(|| vec![expand_tilde(arg)]);
                 self.attach(paths);
-                if let Some(to) = self.selected.clone() {
+                // Groups have no stream to carry a file, so it would wait forever.
+                if self.in_group() {
+                    self.attachments.clear();
+                    if self.in_me() {
+                        self.flash_error("files can't be kept in Me yet; send them to one person");
+                    } else {
+                        self.flash_error("files can't go to a group yet; send them to one person");
+                    }
+                } else if let Some(to) = self.selected.clone() {
                     for path in std::mem::take(&mut self.attachments) {
                         self.send_file(to.clone(), path, send);
                     }
@@ -1488,6 +1496,8 @@ impl App {
                     if let Some(store) = &self.store {
                         store.forget(&address);
                     }
+                    self.reply = None;
+                    self.scroll = 0;
                     self.flash("conversation cleared on this device");
                 }
             }

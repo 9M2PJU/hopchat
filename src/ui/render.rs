@@ -129,6 +129,7 @@ impl App {
             self.draw_sidebar(frame, side);
         } else {
             self.peer_rows.clear();
+            self.new_group_row = Rect::default();
         }
         self.draw_main(frame, main);
         if log_width > 0 {
