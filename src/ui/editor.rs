@@ -169,10 +169,10 @@ impl Editor {
         let mut col = 0;
         let mut cursor = (0, 0);
         for (i, c) in self.text.char_indices() {
-            if i == self.cursor {
-                cursor = (col, rows.len() - 1);
-            }
             if c == '\n' {
+                if i == self.cursor {
+                    cursor = (col.min(width - 1), rows.len() - 1);
+                }
                 rows.push(String::new());
                 col = 0;
                 continue;
@@ -181,6 +181,10 @@ impl Editor {
             if col + w > width {
                 rows.push(String::new());
                 col = 0;
+            }
+            // After wrapping, so the cursor sits where the character is drawn.
+            if i == self.cursor {
+                cursor = (col, rows.len() - 1);
             }
             rows.last_mut().unwrap().push(c);
             col += w;
@@ -236,6 +240,14 @@ mod tests {
         assert_eq!(rows, ["abcd", "ef"]);
         assert_eq!(cursor, (2, 1));
         e.set("abcd");
+        assert_eq!(e.layout(4).1, (0, 1));
+        // On the first character of a wrapped row, not past the last.
+        e.set("abcdef");
+        e.left();
+        e.left();
+        assert_eq!(e.layout(4).1, (0, 1));
+        e.set("abc中");
+        e.left();
         assert_eq!(e.layout(4).1, (0, 1));
     }
 }

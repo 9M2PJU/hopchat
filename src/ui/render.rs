@@ -1868,8 +1868,9 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
                 row = String::new();
                 row_width = 0;
             }
-            if w > width {
-                for c in word.chars() {
+            let bare = word.trim_end_matches(' ');
+            if bare.width() > width {
+                for c in bare.chars() {
                     let cw = c.width().unwrap_or(0);
                     if row_width + cw > width {
                         rows.push(std::mem::take(&mut row));
@@ -1877,6 +1878,11 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
                     }
                     row.push(c);
                     row_width += cw;
+                }
+                // The space after it never starts a row.
+                if bare.len() < word.len() && row_width < width {
+                    row.push(' ');
+                    row_width += 1;
                 }
             } else {
                 row.push_str(word);
@@ -1936,7 +1942,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>
                 continue;
             }
             if bare > width {
-                for c in word.chars() {
+                for c in word.trim_end().chars() {
                     let cw = c.width().unwrap_or(0);
                     if used + cw > width {
                         rows.push(Vec::new());
@@ -2093,6 +2099,8 @@ mod tests {
         assert_eq!(wrap("hello there world", 11), ["hello there", "world"]);
         assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
         assert_eq!(wrap("a\n\nb", 10), ["a", "", "b"]);
+        assert_eq!(wrap("abcd efg", 4), ["abcd", "efg"]);
+        assert_eq!(wrap("abcdefgh ij", 4), ["abcd", "efgh", "ij"]);
     }
 
     #[test]
