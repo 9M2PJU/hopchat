@@ -97,6 +97,8 @@ hopchat --name alice --group house --home --to bob --say "@home is the light on?
                                                   # starts a group, invites bob, lets it use the devices
 hopchat --name alice --group quiz --ai --to bob --say "@ai what is 2+2?"
                                                   # the same, and lets the group ask the model
+hopchat --name alice --lobby --to bob --say "hi all"
+                                                  # says it in the lobby once bob is there
 ```
 
 Without `--to`, `--say` and `--file` go to the first peer whose secure session comes up.

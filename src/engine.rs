@@ -19,6 +19,7 @@ use offline_protocol_transport::{
 };
 
 use crate::home;
+use crate::lobby::{self, LOBBY};
 use crate::net::{self, LocalIdentity, NetEvent};
 
 pub const APP_ID: &str = "dev.hopchat";
@@ -504,6 +505,9 @@ impl Engine {
     }
 
     fn send_group(&mut self, group: String, text: String, reply: Option<Quote>, from_home: bool) {
+        if group == LOBBY {
+            return self.send_lobby(text, reply, from_home);
+        }
         let reply_to = reply.as_ref().map(|q| q.id.clone());
         match self
             .protocol
@@ -527,6 +531,54 @@ impl Engine {
             }
             Err(e) => self.error(format!("send failed: {e}")),
         }
+    }
+
+    /// Sends to everyone in the lobby right now (see [`lobby`]).
+    fn send_lobby(&mut self, text: String, reply: Option<Quote>, from_home: bool) {
+        let wire = lobby::Wire {
+            id: lobby::new_id(),
+            text: text.clone(),
+            reply_to: reply.as_ref().map(|q| q.id.clone()),
+        };
+        let body = wire.encode();
+        for peer in self.lobby_members() {
+            if let Err(e) = self.protocol.send_message_with(&peer, &body, SendMessageOptions::default()) {
+                self.error(format!("lobby message to {}: {e}", self.nick_or_address(&peer)));
+            }
+        }
+        self.update(Update::GroupQueued {
+            group: LOBBY.into(),
+            id: wire.id.clone(),
+            text: text.clone(),
+            reply,
+        });
+        if !from_home {
+            self.to_home(LOBBY, &self.address, &wire.id, &text);
+        }
+    }
+
+    /// Everyone else in the lobby: each peer connected with a secure
+    /// session.
+    fn lobby_members(&self) -> Vec<String> {
+        let mut peers: Vec<String> = self
+            .streams
+            .keys()
+            .filter(|p| self.session_ready(p))
+            .cloned()
+            .collect();
+        peers.sort();
+        peers
+    }
+
+    /// Whether `peer` is in `group` with us.
+    fn shares(&self, group: &str, peer: &str) -> bool {
+        if group == LOBBY {
+            return self.streams.contains_key(peer) && self.session_ready(peer);
+        }
+        matches!(
+            self.protocol.get_group_info(group),
+            Ok(Some(info)) if info.members.iter().any(|m| m == peer)
+        )
     }
 
     /// Hands a group message that mentions home, or the model, to home.
@@ -604,15 +656,11 @@ impl Engine {
         skip: Vec<String>,
         reply: Sender<home::lend::Borrowed>,
     ) {
-        let members = match self.protocol.get_group_info(&group) {
-            Ok(Some(info)) => info.members,
-            _ => Vec::new(),
-        };
         let mut candidates: Vec<(&String, &String)> = self
             .lenders
             .iter()
             .filter(|(address, _)| {
-                members.contains(address)
+                self.shares(&group, address)
                     && **address != self.address
                     && !skip.contains(address)
                     && self.streams.contains_key(*address)
@@ -653,11 +701,8 @@ impl Engine {
                 }
             }
             Wire::Ask { id, group, messages, tools } => {
-                // Only for someone in a group we are both in.
-                let shared = matches!(
-                    self.protocol.get_group_info(&group),
-                    Ok(Some(info)) if info.members.contains(&from)
-                );
+                // Only for someone in a group, or the lobby, we are both in.
+                let shared = self.shares(&group, &from);
                 match &self.home {
                     Some(home) if shared => {
                         let who = self.nick_or_address(&from);
@@ -681,6 +726,17 @@ impl Engine {
                 }
             }
         }
+    }
+
+    fn on_lobby(&mut self, from: String, wire: lobby::Wire) {
+        self.to_home(LOBBY, &from, &wire.id, &wire.text);
+        self.update(Update::GroupIncoming {
+            group: LOBBY.into(),
+            from,
+            id: wire.id,
+            text: wire.text,
+            reply_to: wire.reply_to,
+        });
     }
 
     fn session_ready(&self, address: &str) -> bool {
@@ -818,6 +874,12 @@ impl Engine {
             if let Some(wire) = home::lend::Wire::decode(&message.content) {
                 if let Some(wire) = wire {
                     self.on_wire(message.sender.as_str().to_string(), wire);
+                }
+                continue;
+            }
+            if let Some(wire) = lobby::Wire::decode(&message.content) {
+                if let Some(wire) = wire {
+                    self.on_lobby(message.sender.as_str().to_string(), wire);
                 }
                 continue;
             }

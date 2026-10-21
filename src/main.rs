@@ -6,6 +6,7 @@
 mod engine;
 mod history;
 mod home;
+mod lobby;
 mod net;
 mod ui;
 
@@ -14,7 +15,8 @@ use std::sync::mpsc;
 use std::thread;
 
 const USAGE: &str = "usage: hopchat [--name NICK] [--dir PATH] [--downloads PATH]
-               [--echo | --say TEXT | --file PATH] [--to NICK] [--group NAME [--home] [--ai]]
+               [--echo | --say TEXT | --file PATH] [--to NICK]
+               [--lobby | --group NAME [--home] [--ai]]
 
   --name NICK       what peers see you as (default: $USER)
   --dir PATH        where your identity and history live (default: ~/.hopchat/NICK)
@@ -23,6 +25,8 @@ const USAGE: &str = "usage: hopchat [--name NICK] [--dir PATH] [--downloads PATH
   --say TEXT        no UI: send TEXT to the first peer that connects
   --file PATH       no UI: send the file at PATH to the first peer that connects
   --to NICK         with --say/--file: only send to a peer with this nick
+  --lobby           with --say: say it in the lobby, everyone nearby's room,
+                    once the first peer (or --to NICK) has a session
   --group NAME      no UI: create group NAME, invite peers as they connect
                     (only --to NICK, if given), and --say into the group
   --home            with --group: let the group use this machine's devices
@@ -39,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut file: Option<PathBuf> = None;
     let mut to: Option<String> = None;
     let mut group: Option<String> = None;
+    let mut lobby = false;
     let mut home_on = false;
     let mut ai_on = false;
     let mut args = std::env::args().skip(1);
@@ -52,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--file" => file = Some(args.next().ok_or(USAGE)?.into()),
             "--to" => to = Some(args.next().ok_or(USAGE)?),
             "--group" => group = Some(args.next().ok_or(USAGE)?),
+            "--lobby" => lobby = true,
             "--home" => home_on = true,
             "--ai" => ai_on = true,
             "--help" | "-h" => {
@@ -111,6 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     thread::spawn(move || engine.run(input_rx));
 
+    if lobby && group.is_some() {
+        return Err(USAGE.into());
+    }
     if echo || say.is_some() || file.is_some() || group.is_some() {
         let script = Script {
             echo,
@@ -118,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             file,
             to,
             group,
+            lobby,
             home_on,
             ai_on,
         };
@@ -180,6 +190,7 @@ struct Script {
     file: Option<PathBuf>,
     to: Option<String>,
     group: Option<String>,
+    lobby: bool,
     home_on: bool,
     ai_on: bool,
 }
@@ -188,7 +199,8 @@ struct Script {
 /// `--say TEXT` and `--file PATH` send to the first peer whose secure
 /// session is up (and, with `--to NICK`, whose beacon carries that nick).
 /// With `--group NAME`, that peer is invited to a new group instead and
-/// `--say` goes to the group once they have joined.
+/// `--say` goes to the group once they have joined. With `--lobby` it
+/// goes to the lobby instead, once that peer is there.
 fn headless(
     me: &net::LocalIdentity,
     updates: mpsc::Receiver<engine::Update>,
@@ -202,6 +214,7 @@ fn headless(
         mut file,
         to,
         group,
+        lobby,
         home_on,
         ai_on,
     } = script;
@@ -239,6 +252,14 @@ fn headless(
         if group.is_some() {
             invite.push(address.to_string());
             return;
+        }
+        if lobby && let Some(text) = say.take() {
+            send(Command::SendGroup {
+                group: crate::lobby::LOBBY.into(),
+                text,
+                reply: None,
+                from_home: false,
+            });
         }
         if let Some(text) = say.take() {
             send(Command::Send {
