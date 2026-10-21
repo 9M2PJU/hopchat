@@ -6,6 +6,7 @@ mod editor;
 mod groups;
 mod picker;
 mod render;
+mod tasks;
 mod theme;
 
 use std::collections::{HashMap, VecDeque};
@@ -33,6 +34,7 @@ use devices::Devices;
 use editor::Editor;
 use groups::{Candidate, GroupPanel};
 use picker::{Outcome, Picker};
+use tasks::TaskPanel;
 
 const LOG_LINES: usize = 300;
 /// The longest nick or group name kept from the network; a new group's
@@ -111,6 +113,8 @@ pub enum Mode {
     Picker(Picker),
     Devices(Devices),
     Groups(GroupPanel),
+    /// Todos and reminders.
+    Tasks(TaskPanel),
     /// Keys and commands, scrolled down this many rows.
     Help(usize),
 }
@@ -156,6 +160,8 @@ pub struct App {
     home: Sender<home::Request>,
     /// What home last reported, for the Devices panel.
     pub home_view: home::View,
+    /// Todos and reminders, kept beside the history.
+    pub tasks: crate::tasks::Tasks,
 }
 
 pub fn now_ms() -> i64 {
@@ -172,6 +178,8 @@ impl App {
     ) -> Self {
         let mut convos = Vec::new();
         let mut owners = HashMap::new();
+        let mut tasks = store.as_ref().map(|s| s.load_tasks()).unwrap_or_default();
+        tasks.prune(now_ms());
         if let Some(store) = &store {
             for data in store.load() {
                 for e in data.entries.iter().filter(|e| e.mine && !e.status.settled()) {
@@ -222,6 +230,7 @@ impl App {
             quit: false,
             home,
             home_view: home::View::default(),
+            tasks,
         };
         // The lobby is always there, and it is where hopchat opens.
         let lobby = app.convo_mut(LOBBY);
@@ -792,8 +801,11 @@ impl App {
         }
     }
 
-    /// Per-frame chores: read receipts, typing timeouts, saving, the title.
+    /// Per-frame chores: reminders, read receipts, typing timeouts, saving,
+    /// the title.
     fn housekeeping(&mut self, send: &impl Fn(Command)) {
+        self.ring(chrono::Local::now());
+
         let picking = matches!(self.mode, Mode::Picker(_));
         if self.focused && !picking
             && let Some(convo) = self.current_mut()
@@ -842,6 +854,12 @@ impl App {
         self.last_save = Instant::now();
         let Some(store) = &self.store else { return };
         let mut failed = None;
+        if self.tasks.dirty {
+            match store.save_tasks(&self.tasks) {
+                Ok(()) => self.tasks.dirty = false,
+                Err(e) => failed = Some(e),
+            }
+        }
         for convo in self.convos.iter_mut().filter(|c| c.data.dirty) {
             match store.save(&convo.data) {
                 Ok(()) => convo.data.dirty = false,
@@ -968,7 +986,14 @@ impl App {
                     }
                 }
             }
+            Mode::Tasks(mut panel) => {
+                let action = panel.key(key, &self.tasks);
+                if let Some(panel) = self.task_action(panel, action, send) {
+                    self.mode = Mode::Tasks(panel);
+                }
+            }
             Mode::Select(at) => self.select_key(at, key, send),
+            Mode::Normal if ctrl && key.code == KeyCode::Char('t') => self.open_tasks(),
             Mode::Normal if ctrl && key.code == KeyCode::Char('d') => self.open_devices(),
             Mode::Normal if ctrl && key.code == KeyCode::Char('g') => self.open_groups(""),
             Mode::Normal => self.normal_key(key, ctrl, alt, send),
@@ -1107,6 +1132,31 @@ impl App {
                     next = Mode::Select(i);
                 }
             }
+            // A reminder that went off: check it off, put it off, or go
+            // back to where it was set.
+            KeyCode::Char('x' | ' ') if matches!(entry.body, Body::Reminder { .. }) => {
+                if let Body::Reminder { task, .. } = &entry.body {
+                    self.toggle_task(task);
+                }
+            }
+            KeyCode::Char('s') if matches!(entry.body, Body::Reminder { .. }) => {
+                if let Body::Reminder { task, .. } = &entry.body {
+                    self.snooze_task(task);
+                }
+            }
+            KeyCode::Char('o') | KeyCode::Enter if matches!(entry.body, Body::Reminder { .. }) => {
+                let origin = match &entry.body {
+                    Body::Reminder { task, .. } => self.tasks.get(task).and_then(|t| t.origin.clone()),
+                    _ => None,
+                };
+                match origin.filter(|o| self.convos.iter().any(|c| c.data.address == o.address)) {
+                    Some(origin) => {
+                        self.select(Some(origin.address), send);
+                        next = Mode::Normal;
+                    }
+                    None => self.flash_error("that reminder wasn't set in a chat"),
+                }
+            }
             KeyCode::Char('r') => {
                 self.reply = Some(entry.id.clone());
                 next = Mode::Normal;
@@ -1122,6 +1172,26 @@ impl App {
                     next = Mode::Normal;
                 }
             },
+            // Anything said becomes something to do.
+            KeyCode::Char('t') => {
+                match &entry.body {
+                    Body::Reminder { task, .. } => {
+                        let mut panel = TaskPanel::new(self.origin_here(), "");
+                        if self.tasks.get(task).is_some() {
+                            panel.follow(&self.tasks, task);
+                            panel.focus = tasks::Focus::List;
+                        }
+                        next = Mode::Tasks(panel);
+                    }
+                    body => {
+                        let text = match body {
+                            Body::File { name, .. } => format!("look at {name}"),
+                            _ => render::entry_summary(&entry),
+                        };
+                        next = Mode::Tasks(TaskPanel::new(self.origin_here(), &text));
+                    }
+                }
+            }
             KeyCode::Char('f') => {
                 if let Body::File { path, .. } = &entry.body {
                     reveal_path(path);
@@ -1130,6 +1200,7 @@ impl App {
             KeyCode::Char('y') => {
                 let text = match &entry.body {
                     Body::Text(t) | Body::Notice(t) => t.clone(),
+                    Body::Reminder { text, .. } => text.clone(),
                     Body::File { path, .. } => path.display().to_string(),
                 };
                 copy_to_clipboard(&text);
@@ -1194,6 +1265,7 @@ impl App {
                 return;
             }
             Mode::Groups(panel) => return panel.type_str(text),
+            Mode::Tasks(panel) => return panel.type_str(text),
             Mode::Normal => {}
             _ => self.mode = Mode::Normal,
         }
@@ -1222,12 +1294,14 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp => match &mut self.mode {
                 Mode::Picker(p) => p.up(),
+                Mode::Tasks(p) => p.cursor = p.cursor.saturating_sub(1),
                 Mode::Help(at) => *at = at.saturating_sub(3),
                 _ if inside(self.chat_area) => self.scroll += 3,
                 _ => {}
             },
             MouseEventKind::ScrollDown => match &mut self.mode {
                 Mode::Picker(p) => p.down(),
+                Mode::Tasks(p) => p.cursor = (p.cursor + 1).min(self.tasks.items.len().saturating_sub(1)),
                 Mode::Help(at) => *at += 3,
                 _ if inside(self.chat_area) => self.scroll = self.scroll.saturating_sub(3),
                 _ => {}
@@ -1492,6 +1566,16 @@ impl App {
                     args: format!("ai {arg}"),
                 });
             }
+            "todo" | "todos" | "tasks" | "task" | "remind" | "reminders" | "reminder" if arg.is_empty() => {
+                self.open_tasks()
+            }
+            "todo" | "task" | "remind" | "reminder" => {
+                let draft = crate::tasks::Draft::read(arg, chrono::Local::now());
+                if name.starts_with("remind") && draft.due.is_none() {
+                    return self.flash_error("when? e.g. /remind 20m stretch · /remind call mom at 5pm");
+                }
+                self.add_task(draft, self.origin_here());
+            }
             "log" => self.show_log = !self.show_log,
             "help" | "?" => self.mode = Mode::Help(0),
             "quit" | "exit" | "q" => self.quit = true,
@@ -1501,6 +1585,151 @@ impl App {
 }
 
 impl App {
+    /// The open conversation, as somewhere a task can come from; Me is
+    /// where they all land anyway.
+    fn origin_here(&self) -> Option<crate::tasks::Origin> {
+        let convo = self.current().filter(|c| c.data.address != ME)?;
+        let name = match () {
+            _ if convo.data.address == LOBBY => lobby::NAME.to_string(),
+            _ if convo.data.group => format!("#{}", convo.data.nick),
+            _ => convo.data.nick.clone(),
+        };
+        Some(crate::tasks::Origin { address: convo.data.address.clone(), name })
+    }
+
+    /// The list on its own: what's typed there belongs to no chat.
+    fn open_tasks(&mut self) {
+        self.mode = Mode::Tasks(TaskPanel::new(None, ""));
+    }
+
+    /// Adds what was typed, and says what it became.
+    fn add_task(&mut self, draft: crate::tasks::Draft, origin: Option<crate::tasks::Origin>) -> Option<String> {
+        if draft.text.is_empty() {
+            self.flash_error("nothing to do there");
+            return None;
+        }
+        let now = chrono::Local::now();
+        if draft.due.is_some_and(|d| d <= now) {
+            self.flash_error("that time has already passed");
+            return None;
+        }
+        let task = self.tasks.add(draft, origin, now_ms()).clone();
+        let what = render::clip(&task.text, 40);
+        match task.due_ms {
+            Some(due) => self.flash(format!(
+                "⏰ {what} · {} ({})",
+                crate::tasks::when_label(due, now),
+                crate::tasks::until(due, now_ms())
+            )),
+            None => self.flash(format!("added {what} to your todos · Ctrl-T")),
+        }
+        Some(task.id)
+    }
+
+    fn toggle_task(&mut self, id: &str) {
+        let text = self.tasks.get(id).map(|t| render::clip(&t.text, 40)).unwrap_or_default();
+        match self.tasks.toggle(id, now_ms()) {
+            Some(true) => self.flash(format!("checked off {text}")),
+            Some(false) => self.flash(format!("{text} is back on your list")),
+            None => self.flash_error("that one has been deleted"),
+        }
+    }
+
+    fn snooze_task(&mut self, id: &str) {
+        match self.tasks.snooze(id, now_ms()) {
+            Some(at) => self.flash(format!("snoozed until {}", render::clock(at))),
+            None => self.flash_error("that one has been deleted"),
+        }
+    }
+
+    /// Does what a key in the tasks panel asked; the panel comes back
+    /// unless it was closed.
+    fn task_action(
+        &mut self,
+        mut panel: TaskPanel,
+        action: tasks::Action,
+        send: &impl Fn(Command),
+    ) -> Option<TaskPanel> {
+        use tasks::Action;
+        match action {
+            Action::Stay => {}
+            Action::Close => return None,
+            Action::Add(draft) => {
+                if let Some(id) = self.add_task(draft, panel.origin.clone()) {
+                    panel.follow(&self.tasks, &id);
+                }
+            }
+            Action::Save(id, draft) => {
+                self.tasks.edit(&id, draft);
+                panel.follow(&self.tasks, &id);
+                self.flash("saved");
+            }
+            Action::Toggle(id) => {
+                self.toggle_task(&id);
+                panel.follow(&self.tasks, &id);
+            }
+            Action::Snooze(id) => {
+                self.snooze_task(&id);
+                panel.follow(&self.tasks, &id);
+            }
+            Action::Delete(id) => {
+                if let Some(task) = self.tasks.remove(&id) {
+                    self.flash(format!("deleted {} · u brings it back", render::clip(&task.text, 30)));
+                    panel.undo = Some(task);
+                }
+            }
+            Action::Undo(task) => {
+                let id = task.id.clone();
+                self.tasks.restore(task);
+                panel.follow(&self.tasks, &id);
+                self.flash("it's back");
+            }
+            Action::Go(address) => {
+                if self.convos.iter().any(|c| c.data.address == address) {
+                    self.select(Some(address), send);
+                    return None;
+                }
+                self.flash_error("that chat is gone from this device");
+            }
+            Action::ClearDone => {
+                let n = self.tasks.clear_done();
+                self.flash(format!("cleared {n} done"));
+                panel.cursor = 0;
+            }
+        }
+        Some(panel)
+    }
+
+    /// Says each reminder whose time has come in Me, and gets attention
+    /// for it.
+    fn ring(&mut self, now: chrono::DateTime<chrono::Local>) {
+        for fired in self.tasks.fire(now) {
+            let visible = self.focused && self.in_me();
+            let entry = Entry {
+                id: format!("rm_{}_{}", fired.id, fired.due_ms),
+                mine: false,
+                at_ms: now_ms(),
+                body: Body::Reminder {
+                    task: fired.id.clone(),
+                    text: fired.text.clone(),
+                    from: fired.origin.map(|o| o.name),
+                },
+                status: Status::Sent,
+                hops: 0,
+                reply: None,
+                read: true,
+                sender: None,
+            };
+            self.receive(ME, entry, &fired.text);
+            self.flash(format!("⏰ {} · in Me", first_line(&fired.text)));
+            self.note(render::ACCENT, format!("reminder   {}", first_line(&fired.text)));
+            if visible {
+                let _ = std::io::stdout().write_all(b"\x07");
+            }
+            notify("hopchat reminder", &fired.text);
+        }
+    }
+
     fn open_groups(&mut self, name: &str) {
         self.mode = Mode::Groups(GroupPanel::new_group(name));
     }
@@ -1798,6 +2027,19 @@ fn reveal_path(path: &Path) {
     }
 }
 
+/// OSC 9: a desktop notification, from the terminals known to show one.
+/// Others could print it, so they get only the bell.
+fn notify(title: &str, body: &str) {
+    let term = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    if !matches!(term.as_str(), "iTerm.app" | "WezTerm" | "ghostty") || std::env::var_os("TMUX").is_some() {
+        return;
+    }
+    let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control() && *c != ';').take(200).collect() };
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]9;{}: {}\x07", clean(title), clean(body));
+    let _ = out.flush();
+}
+
 /// OSC 52: the terminal puts it on the system clipboard, even over SSH.
 fn copy_to_clipboard(text: &str) {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
@@ -1833,6 +2075,7 @@ mod tests {
 #[cfg(test)]
 mod render_tests {
     use super::*;
+    use chrono::TimeZone;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -2259,6 +2502,119 @@ mod render_tests {
             assert!(shown.contains(".pdf"), "the extension survives at {w}");
             assert!(shown.contains(&clock_now()), "the time beside the name survives at {w}");
             assert!(shown.contains("is typing"), "at {w}");
+        }
+    }
+
+    #[test]
+    fn todos_and_reminders_from_anywhere() {
+        let mut app = test_app();
+        let commands = std::cell::RefCell::new(Vec::new());
+        let send = |c: Command| commands.borrow_mut().push(c);
+        let bob = "off1bob00000000000000";
+        app.apply(Update::PeerSeen { address: bob.into(), nick: "bob".into() }, &send);
+        let convo = app.convo_mut(bob);
+        convo.online = true;
+        convo.secure = true;
+        convo.push(text("m1", false, "can you send the lease by friday?", Status::Sent));
+        app.selected = Some(bob.into());
+
+        // A message becomes a todo with t, prefilled and ready for a time.
+        screen(&mut app);
+        app.mode = Mode::Select(0);
+        app.on_key(KeyEvent::from(KeyCode::Char('t')), &send);
+        let Mode::Tasks(panel) = &app.mode else { panic!("t should open the list") };
+        assert_eq!(panel.input.text(), "can you send the lease by friday?");
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), &send);
+        for c in "send bob the lease in 20m".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)), &send);
+        }
+        let shown = screen(&mut app);
+        println!("{shown}");
+        for needle in ["Todos & reminders", "Add  ›", "send bob the lease in 20m", "◷ reminder", "in 20m"] {
+            assert!(shown.contains(needle), "missing {needle:?}");
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter), &send);
+        for c in "buy milk".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)), &send);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter), &send);
+        app.run_command("remind", &send);
+        app.run_command("todo water the plants", &send);
+        app.run_command("remind water the plants", &send);
+        assert!(app.flash_text().is_some_and(|(t, error)| error && t.contains("when?")), "a reminder needs a time");
+        assert_eq!(app.tasks.items.len(), 3);
+        let lease = app.tasks.items.iter().find(|t| t.text == "send bob the lease").unwrap().clone();
+        assert_eq!(lease.origin.as_ref().map(|o| o.name.as_str()), Some("bob"));
+
+        app.mode = Mode::Tasks(TaskPanel::new(None, ""));
+        let shown = screen(&mut app);
+        println!("{shown}");
+        for needle in ["Reminders", "send bob the lease", "Todo", "[ ] buy milk", "water the plants", "3 open"] {
+            assert!(shown.contains(needle), "missing {needle:?}");
+        }
+        assert!(commands.borrow().is_empty(), "nothing about tasks goes on the network");
+
+        // Its time comes while you're in bob's chat: it rings in Me.
+        app.mode = Mode::Normal;
+        let due = chrono::Local.timestamp_millis_opt(lease.due_ms.unwrap()).unwrap();
+        app.ring(due);
+        app.ring(due);
+        let me = app.convos.iter().find(|c| c.data.address == ME).unwrap();
+        assert_eq!(me.unread, 1, "once, and Me says so");
+        assert!(matches!(&me.data.entries.last().unwrap().body, Body::Reminder { text, .. } if text == "send bob the lease"));
+        assert!(app.flash_text().is_some_and(|(t, _)| t.contains("send bob the lease")));
+        let top = screen(&mut app);
+        assert!(top.contains("1 due Ctrl-T"), "the strip at the top says so: {top}");
+
+        app.selected = Some(ME.into());
+        let shown = screen(&mut app);
+        println!("{shown}");
+        for needle in ["reminder", "send bob the lease", "due", "set in bob", "x done · s snooze"] {
+            assert!(shown.contains(needle), "missing {needle:?}");
+        }
+        // Checked off from the message itself.
+        let at = app.current().unwrap().data.entries.len() - 1;
+        app.mode = Mode::Select(at);
+        assert!(screen(&mut app).contains("snooze 10m"), "the footer offers what a reminder can do");
+        app.on_key(KeyEvent::from(KeyCode::Char('x')), &send);
+        assert!(app.tasks.get(&lease.id).unwrap().done());
+        assert!(screen(&mut app).contains("✓ done"));
+        app.on_key(KeyEvent::from(KeyCode::Char('o')), &send);
+        assert_eq!(app.selected.as_deref(), Some(bob), "o goes back to where it was set");
+    }
+
+    #[test]
+    fn the_list_checks_off_snoozes_and_undoes() {
+        let mut app = test_app();
+        let send = |_: Command| {};
+        app.run_command("todo buy milk", &send);
+        app.run_command("todo call mom tomorrow at 5pm", &send);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL), &send);
+        assert!(matches!(app.mode, Mode::Tasks(_)));
+        let key = |app: &mut App, code| app.on_key(KeyEvent::from(code), &send);
+        key(&mut app, KeyCode::Down);
+        // The reminder sorts first.
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char(' '));
+        let milk = app.tasks.items.iter().find(|t| t.text == "buy milk").unwrap().clone();
+        assert!(app.tasks.get(&milk.id).unwrap().done());
+        let shown = screen(&mut app);
+        println!("{shown}");
+        assert!(shown.contains("Done · 1") && shown.contains("[✓] buy milk"), "{shown}");
+        key(&mut app, KeyCode::Char('d'));
+        assert!(app.tasks.get(&milk.id).is_none());
+        key(&mut app, KeyCode::Char('u'));
+        assert!(app.tasks.get(&milk.id).is_some(), "u brings it back");
+        key(&mut app, KeyCode::Home);
+        key(&mut app, KeyCode::Char('s'));
+        let mom = app.tasks.items.iter().find(|t| t.text == "call mom").unwrap();
+        assert!(mom.due_ms.unwrap() - now_ms() <= crate::tasks::SNOOZE_MS, "snoozing moves it to soon");
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        for (w, h) in [(72, 20), (150, 40)] {
+            app.mode = Mode::Tasks(TaskPanel::new(None, "a really long thing to do that goes on and on and on past the edge of the panel at 5pm"));
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
         }
     }
 

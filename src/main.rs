@@ -10,6 +10,7 @@ mod home;
 mod lobby;
 mod me;
 mod net;
+mod tasks;
 mod ui;
 
 use std::path::PathBuf;

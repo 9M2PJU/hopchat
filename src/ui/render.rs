@@ -15,6 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::devices::{self, Devices, Primary};
 use super::groups::{Candidate, Focus, GroupPanel};
+use super::tasks::{self as task_panel, TaskPanel};
+use crate::tasks::{self, Section, Task};
 use super::theme::{self, BG, FOAM, SAGE, IRIS, PEACH, PANEL, RAISED, TEXT, ROSE, GOLD};
 use crate::lobby::LOBBY;
 use crate::me::ME;
@@ -55,6 +57,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/invite", "add people to this group · /invite NICK"),
     ("/members", "list who is in this group"),
     ("/leave", "leave this group"),
+    ("/todo", "your todos and reminders (also Ctrl-T) · /todo buy milk · /todo call mom at 5pm"),
+    ("/remind", "set a reminder · /remind 20m stretch · /remind standup every weekday at 9:30"),
     ("/devices", "find, pair and test your smart devices (also Ctrl-D)"),
     ("/home", "/home on|off lets everyone here use your devices (you always can) · /home add IP"),
     ("/ai", "/ai on|off lets everyone here ask your model (you always can) · /ai share on|off lends it"),
@@ -136,6 +140,7 @@ impl App {
             Mode::Picker(picker) => draw_picker(frame, picker),
             Mode::Devices(panel) => self.draw_devices(frame, panel),
             Mode::Groups(panel) => self.draw_groups(frame, panel),
+            Mode::Tasks(panel) => self.draw_tasks(frame, panel),
             &Mode::Help(at) => {
                 let max = draw_help(frame, at);
                 self.mode = Mode::Help(at.min(max));
@@ -183,12 +188,30 @@ impl App {
             1 => "1 person nearby".fg(MUTED),
             n => format!("{n} people nearby").fg(MUTED),
         };
-        let segments: Vec<Vec<Span>> = vec![
+        // What's waiting for you: due first, else the next reminder, else
+        // how many todos.
+        let due = self.tasks.due_count();
+        let waiting = if due > 0 {
+            vec!["   ".into(), format!("⏰ {due} due").fg(GOLD).bold(), " Ctrl-T".fg(FAINT)]
+        } else if let Some(next) = self.tasks.next() {
+            let at = next.due_ms.unwrap_or_default();
+            let when = if at - theme::now_ms() < 60 * 60 * 1000 { tasks::until(at, theme::now_ms()) } else { self::clock(at) };
+            vec!["   ".into(), "◷ ".fg(FOAM), when.fg(MUTED), " ".into(), clip(&next.text, 24).fg(FAINT)]
+        } else {
+            match self.tasks.open_count() {
+                0 => Vec::new(),
+                n => vec!["   ".into(), format!("☐ {n} todo{}", if n == 1 { "" } else { "s" }).fg(MUTED)],
+            }
+        };
+        let mut segments: Vec<Vec<Span>> = vec![
             vec!["  hopchat".fg(IRIS).bold()],
             vec!["   ".into(), clip(&self.me_nick, NAME_ROOM).fg(TEXT)],
             vec!["   ".into(), "●".fg(if online > 0 { SAGE } else { FAINT }), " ".into(), nearby],
-            vec!["   end-to-end · offline".fg(FAINT)],
         ];
+        if !waiting.is_empty() {
+            segments.push(waiting);
+        }
+        segments.push(vec!["   end-to-end · offline".fg(FAINT)]);
         frame.render_widget(Line::from(fitting(segments, room)), area);
         frame.render_widget(Line::from(clock.fg(FAINT)).alignment(Alignment::Right), area);
     }
@@ -573,16 +596,18 @@ impl App {
             }
             return out;
         }
+        let reminder = matches!(entry.body, Body::Reminder { .. });
         let tint = match &entry.sender {
+            _ if reminder => GOLD,
             _ if entry.mine => IRIS,
             Some(sender) => theme::person(sender),
             None => theme::person(&convo.data.address),
         };
         let gutter = || -> Span<'static> { "▎ ".fg(theme::dim(tint)) };
-        let continues = prev.is_some_and(|p| {
+        let continues = !reminder && prev.is_some_and(|p| {
             p.mine == entry.mine
                 && p.sender == entry.sender
-                && !matches!(p.body, Body::Notice(_))
+                && !matches!(p.body, Body::Notice(_) | Body::Reminder { .. })
                 && entry.at_ms - p.at_ms < GROUP_GAP_MS
                 && same_day(p.at_ms, entry.at_ms)
         });
@@ -591,6 +616,7 @@ impl App {
                 out.push(Line::from(""));
             }
             let name = match &entry.sender {
+                _ if reminder => "⏰ reminder".to_string(),
                 _ if entry.mine => "you".to_string(),
                 Some(sender) => self.nick_of(sender),
                 None => convo.data.nick.clone(),
@@ -712,6 +738,37 @@ impl App {
                 let used: usize = detail.iter().map(Span::width).sum();
                 if let Some(hint) = hint.filter(|h| used + h.width() <= width) {
                     detail.push(hint);
+                }
+                out.push(Line::from(detail));
+            }
+            Body::Reminder { task, text, from } => {
+                for row in wrap(text, width.saturating_sub(6)) {
+                    out.push(Line::from(vec![gutter(), format!(" {row} ").fg(TEXT).bg(RAISED).bold()]));
+                }
+                // What has happened to it since, from the list itself.
+                let now = theme::now_ms();
+                let state = match self.tasks.get(task) {
+                    None => "deleted".fg(FAINT),
+                    Some(t) if t.done() => "✓ done".fg(OK),
+                    Some(t) if t.due() => "due".fg(GOLD).bold(),
+                    Some(t) => match (t.repeat, t.due_ms) {
+                        (Some(r), Some(at)) => format!("↻ {} · next {}", r.describe(), tasks::when_label(at, Local::now())).fg(MUTED),
+                        (None, Some(at)) => format!("snoozed until {}", clock(at)).fg(MUTED),
+                        _ => "on your todo list".fg(MUTED),
+                    },
+                };
+                let mut detail = vec![gutter(), " ".into(), state];
+                if let Some(from) = from {
+                    detail.push(format!("  ·  set in {}", clip(from, NAME_ROOM)).fg(FAINT));
+                }
+                let hint = match self.tasks.get(task) {
+                    Some(t) if t.due() => "  ·  click, then x done · s snooze",
+                    Some(t) if !t.done() && t.due_ms.is_some_and(|at| at > now) => "  ·  Ctrl-T to change it",
+                    _ => "",
+                };
+                let used: usize = detail.iter().map(Span::width).sum();
+                if used + hint.width() <= width {
+                    detail.push(hint.fg(FAINT));
                 }
                 out.push(Line::from(detail));
             }
@@ -918,13 +975,30 @@ impl App {
         frame.render_widget(Block::new().style(Style::new().bg(PANEL)), area);
         let ctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         let press = |code: KeyCode| Some(KeyEvent::from(code));
+        let on_reminder = match self.mode {
+            Mode::Select(i) => self
+                .current()
+                .and_then(|c| c.data.entries.get(i))
+                .is_some_and(|e| matches!(e.body, Body::Reminder { .. })),
+            _ => false,
+        };
         let keys: Vec<(&str, &str, Option<KeyEvent>)> = match self.mode {
+            Mode::Select(_) if on_reminder => vec![
+                ("↑↓", "move", None),
+                ("x", "done", press(KeyCode::Char('x'))),
+                ("s", "snooze 10m", press(KeyCode::Char('s'))),
+                ("o", "go to chat", press(KeyCode::Char('o'))),
+                ("t", "in the list", press(KeyCode::Char('t'))),
+                ("y", "copy", press(KeyCode::Char('y'))),
+                ("Esc", "back", press(KeyCode::Esc)),
+            ],
             Mode::Select(_) => vec![
                 ("↑↓", "move", None),
                 ("r", "reply", press(KeyCode::Char('r'))),
                 ("o", "open", press(KeyCode::Char('o'))),
                 ("f", "show in folder", press(KeyCode::Char('f'))),
                 ("y", "copy", press(KeyCode::Char('y'))),
+                ("t", "todo", press(KeyCode::Char('t'))),
                 ("R", "retry", press(KeyCode::Char('R'))),
                 ("Esc", "back", press(KeyCode::Esc)),
             ],
@@ -955,6 +1029,21 @@ impl App {
                 ("Enter", if panel.target.is_some() { "add them" } else { "create" }, press(KeyCode::Enter)),
                 ("Esc", "cancel", press(KeyCode::Esc)),
             ],
+            Mode::Tasks(ref panel) if panel.focus == task_panel::Focus::Input => vec![
+                ("type", "a todo, or when", None),
+                ("Enter", if panel.editing.is_some() { "save" } else { "add" }, press(KeyCode::Enter)),
+                ("↓", "the list", press(KeyCode::Down)),
+                ("Esc", if panel.editing.is_some() { "stop editing" } else { "close" }, press(KeyCode::Esc)),
+            ],
+            Mode::Tasks(_) => vec![
+                ("↑↓", "move", None),
+                ("Space", "done", press(KeyCode::Char(' '))),
+                ("s", "snooze", press(KeyCode::Char('s'))),
+                ("Enter", "edit", press(KeyCode::Enter)),
+                ("d", "delete", press(KeyCode::Char('d'))),
+                ("o", "go to chat", press(KeyCode::Char('o'))),
+                ("Esc", "close", press(KeyCode::Esc)),
+            ],
             Mode::Devices(_) => vec![
                 ("↑↓", "move", None),
                 ("Esc", "close", press(KeyCode::Esc)),
@@ -969,6 +1058,7 @@ impl App {
                 ("Enter", "send", press(KeyCode::Enter)),
                 ("Ctrl-O", "attach", ctrl('o')),
                 ("Ctrl-G", "new group", ctrl('g')),
+                ("Ctrl-T", "todos", ctrl('t')),
                 ("Ctrl-D", "devices", ctrl('d')),
                 ("Tab", "next chat", press(KeyCode::Tab)),
                 ("↑", "select", press(KeyCode::Up)),
@@ -1373,6 +1463,217 @@ impl App {
     }
 }
 
+impl App {
+    fn draw_tasks(&self, frame: &mut Frame, panel: &TaskPanel) {
+        let list = self.tasks.ordered();
+        let sections = {
+            let mut seen: Vec<Section> = list.iter().map(|t| Section::of(t)).collect();
+            seen.dedup();
+            seen.len()
+        };
+        // The line, what it reads as, a gap, the list with its headings,
+        // and the help.
+        let rows = 2 + 1 + (list.len() + sections).max(4) as u16 + 3 + 2;
+        let area = fit(frame.area(), 80, rows);
+        let due = self.tasks.due_count();
+        let open = self.tasks.open_count();
+        let count = match (due, open) {
+            (0, 0) => " nothing to do ".fg(MUTED),
+            (0, n) => format!(" {n} open ").fg(MUTED),
+            (d, _) => format!(" {d} due ").fg(BG).bg(GOLD).bold(),
+        };
+        let block = panel_block("Todos & reminders").title(Line::from(count).alignment(Alignment::Right));
+        let inner = float(frame, area, block);
+        let [line, gap, body, help] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .areas(inner);
+        let _ = gap;
+        let [field, reads] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(line);
+
+        // The line to type into.
+        let typing = panel.focus == task_panel::Focus::Input;
+        let label = if panel.editing.is_some() { " Edit › " } else { " Add  › " };
+        let label = if typing { label.fg(ACCENT).bold() } else { label.fg(MUTED) };
+        let lead = label.width();
+        let room = (field.width as usize).saturating_sub(lead + 1).max(1);
+        let text = panel.input.text();
+        let (_, (col, _)) = panel.input.layout(usize::MAX / 2);
+        // Scrolled so the cursor stays in view.
+        let skip = col.saturating_sub(room.saturating_sub(1));
+        let shown: String = {
+            let mut used = 0;
+            let mut out = String::new();
+            let mut at = 0;
+            for c in text.chars() {
+                let w = UnicodeWidthChar::width(c).unwrap_or(0);
+                if at < skip {
+                    at += w;
+                    continue;
+                }
+                if used + w > room {
+                    break;
+                }
+                out.push(c);
+                used += w;
+            }
+            out
+        };
+        let value = if text.is_empty() {
+            if typing { "buy milk · call mom at 5pm · stretch in 20m".fg(FAINT) } else { "".into() }
+        } else {
+            Span::raw(shown)
+        };
+        frame.render_widget(Line::from(vec![label, value]), field);
+        if typing {
+            let x = field.x + (lead + col - skip) as u16;
+            frame.set_cursor_position(Position::new(x.min(field.right().saturating_sub(1)), field.y));
+        }
+
+        // What it will be, before Enter.
+        let pad = " ".repeat(lead);
+        let width = reads.width as usize;
+        let reading = match panel.warning {
+            Some(warning) => Line::from(vec![pad.into(), warning.fg(WARN)]),
+            None if text.trim().is_empty() => Line::from(vec![
+                pad.into(),
+                clip("a time makes it a reminder: tomorrow 9am, every weekday at 9:30", width.saturating_sub(lead)).fg(FAINT),
+            ]),
+            None => {
+                let draft = panel.draft();
+                let now = Local::now();
+                let mut spans: Vec<Span> = vec![pad.into()];
+                match draft.due {
+                    Some(due) if due <= now => spans.push("that time has already passed".fg(WARN)),
+                    Some(due) => {
+                        let ms = due.timestamp_millis();
+                        spans.push("◷ reminder ".fg(FOAM).bold());
+                        spans.push(tasks::when_label(ms, now).fg(TEXT));
+                        spans.push(format!(" · {}", tasks::until(ms, now.timestamp_millis())).fg(MUTED));
+                        if let Some(r) = draft.repeat {
+                            spans.push(format!(" · ↻ {}", r.describe()).fg(MUTED));
+                        }
+                    }
+                    None => {
+                        spans.push("☐ todo".fg(SAGE).bold());
+                        spans.push("  add a time to be reminded".fg(FAINT));
+                    }
+                }
+                Line::from(fitting(spans.into_iter().map(|s| vec![s]).collect(), width))
+            }
+        };
+        frame.render_widget(reading, reads);
+
+        // The list, under its headings.
+        let width = body.width as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        let mut cursor_row = 0;
+        let mut last: Option<Section> = None;
+        let in_list = panel.focus == task_panel::Focus::List;
+        let cursor = panel.cursor.min(list.len().saturating_sub(1));
+        for (i, task) in list.iter().enumerate() {
+            let section = Section::of(task);
+            if last != Some(section) {
+                let n = list.iter().filter(|t| Section::of(t) == section).count();
+                let tone = if section == Section::Due { GOLD } else { MUTED };
+                let mut heading = vec![format!(" {}", section.title()).fg(tone).bold()];
+                if section == Section::Done {
+                    heading.push(format!(" · {n}").fg(FAINT));
+                }
+                lines.push(Line::from(heading));
+                last = Some(section);
+            }
+            if i == cursor {
+                cursor_row = lines.len();
+            }
+            lines.push(task_line(task, in_list && i == cursor, width));
+        }
+        if list.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("  Nothing yet. Type above, then Enter.".fg(MUTED)));
+            lines.push(Line::from("  Or press t on any message to keep it here.".fg(FAINT)));
+        }
+        let height = body.height as usize;
+        let skip = (cursor_row + 2).saturating_sub(height);
+        let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
+        frame.render_widget(Paragraph::new(lines), body);
+
+        let key = |k: &str| k.to_string().fg(KEY).bold();
+        let say = |t: &str| t.to_string().fg(MUTED);
+        let current = panel.current(&self.tasks);
+        let first = match (typing, current) {
+            (true, _) if panel.editing.is_some() => Line::from(vec!["  ".into(), key("Enter"), say(" saves · "), key("Esc"), say(" stops editing")]),
+            (true, _) => Line::from(vec!["  ".into(), key("Enter"), say(" adds it · "), key("↓"), say(" goes to the list")]),
+            (false, Some(t)) if t.due() => Line::from(vec!["  ".into(), key("Space"), say(" done · "), key("s"), say(" snooze 10m · "), key("Enter"), say(" edit")]),
+            (false, _) => Line::from(vec!["  ".into(), key("Space"), say(" done · "), key("Enter"), say(" edit · "), key("d"), say(" delete · "), key("u"), say(" undo")]),
+        };
+        let second = match current.and_then(|t| t.origin.as_ref()) {
+            Some(origin) if !typing => Line::from(vec![
+                "  ".into(),
+                clip(&format!("set in {}", origin.name), width.saturating_sub(20)).fg(FAINT),
+                "  ".into(),
+                key("o"),
+                say(" goes there"),
+            ]),
+            _ if !typing && self.tasks.items.iter().any(Task::done) => Line::from(vec!["  ".into(), key("c"), say(" clears what's done")]),
+            _ => Line::from(vec!["  ".into(), "Reminders ring in Me, even from another chat.".fg(FAINT)]),
+        };
+        frame.render_widget(Paragraph::new(vec![Line::from(""), first, second]), help);
+    }
+}
+
+fn task_line(task: &Task, selected: bool, width: usize) -> Line<'static> {
+    let marker = if selected { "▎".fg(ACCENT) } else { " ".into() };
+    let now = Local::now();
+    let now_ms = now.timestamp_millis();
+    let check = match Section::of(task) {
+        Section::Done => "[✓]".fg(OK),
+        Section::Due => "[!]".fg(GOLD).bold(),
+        _ => "[ ]".fg(MUTED),
+    };
+    // On the right: when, and how it repeats; where it came from if room.
+    let mut meta: Vec<Span<'static>> = Vec::new();
+    match (Section::of(task), task.due_ms) {
+        (Section::Due, Some(at)) => meta.push(format!("due {}", tasks::until(at, now_ms)).fg(GOLD)),
+        (Section::Upcoming, Some(at)) => {
+            if let Some(r) = task.repeat {
+                meta.push(format!("↻ {} · ", r.describe()).fg(FAINT));
+            }
+            meta.push(tasks::when_label(at, now).fg(FOAM));
+            meta.push(format!(" · {}", tasks::until(at, now_ms)).fg(MUTED));
+        }
+        (Section::Done, _) => {}
+        _ => {}
+    }
+    let meta_width: usize = meta.iter().map(Span::width).sum();
+    let origin = task
+        .origin
+        .as_ref()
+        .map(|o| format!("{}  ", clip(&o.name, 14)))
+        .unwrap_or_default();
+    // Marker, space, check, space before; a margin after.
+    let fixed = 6 + meta_width + 2;
+    let show_origin = !origin.is_empty() && width >= fixed + 16 + origin.width();
+    let room = width.saturating_sub(fixed + if show_origin { origin.width() } else { 0 });
+    let text = clip(&task.text, room);
+    let pad = room.saturating_sub(text.width());
+    let text = match () {
+        _ if task.done() => text.fg(FAINT).crossed_out(),
+        _ if selected => text.fg(TEXT).bold(),
+        _ => text.fg(TEXT),
+    };
+    let mut spans = vec![marker, " ".into(), check, " ".into(), text, " ".repeat(pad + 1).into()];
+    if show_origin {
+        spans.push(origin.fg(FAINT));
+    }
+    spans.extend(meta);
+    let line = Line::from(spans);
+    if selected { line.style(Style::new().bg(SELECTED_BG)) } else { line }
+}
+
 fn candidate_line(person: &Candidate, panel: &GroupPanel, selected: bool, width: usize) -> Line<'static> {
     let marker = if selected { "▎".fg(ACCENT) } else { " ".into() };
     let pickable = person.pickable();
@@ -1636,6 +1937,7 @@ fn draw_help(frame: &mut Frame, at: usize) -> usize {
         ("o · f", "open a file · show it in its folder"),
         ("y", "copy text to the clipboard"),
         ("R", "retry a failed send"),
+        ("t", "make it a todo, or a reminder"),
     ];
     let editing: &[(&str, &str)] = &[
         ("Ctrl-A · Ctrl-E", "start / end of line"),
@@ -1645,6 +1947,7 @@ fn draw_help(frame: &mut Frame, at: usize) -> usize {
     let elsewhere: &[(&str, &str)] = &[
         ("Lobby", "everyone nearby, always at the top · @home your devices · @ai your model"),
         ("Me", "just you: notes, and @home and @ai that never leave this machine"),
+        ("Ctrl-T", "todos & reminders: type \"buy milk\" or \"call mom at 5pm\", Enter · reminders ring in Me"),
         ("Ctrl-G", "new group: name it, pick people, Enter"),
         ("Ctrl-D", "devices: find, pair and test them"),
         ("Ctrl-E", "protocol event log"),
@@ -1780,6 +2083,7 @@ fn me_hint(view: &home::View) -> Vec<Line<'static>> {
     };
     lines.push(Line::from(vec!["@home".fg(GOLD), example.fg(MUTED)]).centered());
     lines.push(Line::from(vec!["@ai".fg(GOLD), " what should I cook tonight?".fg(MUTED)]).centered());
+    lines.push(Line::from(vec!["/remind".fg(GOLD), " stretch in 20m".fg(MUTED), "  ·  reminders ring here".fg(FAINT)]).centered());
     lines.push(Line::from(""));
     lines.push(
         if names.is_empty() {
@@ -1839,6 +2143,7 @@ pub fn entry_summary(entry: &Entry) -> String {
         Body::Text(text) => text.clone(),
         Body::File { name, .. } => format!("{} {name}", file_icon(name)),
         Body::Notice(text) => text.clone(),
+        Body::Reminder { text, .. } => format!("⏰ {text}"),
     }
 }
 
@@ -1878,7 +2183,7 @@ fn local(ms: i64) -> DateTime<Local> {
     Local.timestamp_millis_opt(ms).single().unwrap_or_else(Local::now)
 }
 
-fn clock(ms: i64) -> String {
+pub fn clock(ms: i64) -> String {
     local(ms).format("%H:%M").to_string()
 }
 

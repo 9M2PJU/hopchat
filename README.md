@@ -24,6 +24,7 @@ It's also a remote control for the room you're in. Mention `@home` to dim the li
 - [Usage](#usage)
   - [The lobby](#the-lobby)
   - [Me](#me)
+  - [Todos and reminders](#todos-and-reminders)
   - [Direct messages and files](#direct-messages-and-files)
   - [Groups](#groups)
   - [Smart home with `@home`](#smart-home-with-home)
@@ -44,6 +45,7 @@ It's also a remote control for the room you're in. Mention `@home` to dim the li
 - **End-to-end encrypted.** Direct messages, groups and the lobby all travel inside MLS (RFC 9420). History on disk is sealed with XChaCha20-Poly1305.
 - **Lobby.** A room everyone nearby is in by default, pinned at the top of the sidebar.
 - **Me.** A private space for notes and for talking to your own devices and model. Nothing in it goes on the network.
+- **Todos and reminders.** Type "call mom at 5pm" or "standup every weekday at 9:30" and hopchat reminds you in Me. Any message becomes a todo with one key.
 - **Groups.** MLS groups created from a panel in a few keystrokes.
 - **File transfer.** Up to 100 MB per file, chunked and encrypted, with live progress, rate and time left. Pick files from a browser, drag them onto the window, or type a path.
 - **Delivery and read receipts.** `◷` queued, `✓` sent, `✓✓` delivered, highlighted `✓✓ read`, and `✗` failed (press `R` to retry).
@@ -132,6 +134,29 @@ remember to call the landlord
 ```
 
 Nothing written in Me goes on the network. It's kept in local history, and nobody else can ever reach your devices or model through it.
+
+### Todos and reminders
+
+Press **Ctrl-T** (or type `/todo`) for your list. Type what to do and press Enter. If it says when, it becomes a reminder, and the line under it shows how it was read before you commit:
+
+```
+buy milk                              ☐ todo
+call mom at 5pm                       ◷ reminder today 17:00 · in 3h
+stretch in 20m                        ◷ reminder today 14:20 · in 20m
+dentist tomorrow at 9                 ◷ reminder tomorrow 09:00
+pay rent on nov 1                     ◷ reminder 1 Nov 09:00
+standup every weekday at 9:30         ◷ reminder · ↻ weekdays
+drink water every 2 hours             ◷ reminder · ↻ every 2h
+```
+
+The time can come before or after the task. Text that doesn't read as a time stays part of the task, so "meet at the cafe" is a todo. A bare "at 5" means 5 pm.
+
+- **From anywhere.** `/todo TEXT` and `/remind TEXT` add one without opening the list. Select any message (click it, or ↑) and press `t` to turn it into a todo, with its text filled in so you can add a time.
+- **When it's time**, the reminder appears in Me with a bell, an unread badge and a note in the footer, whichever chat you're in. The strip at the top shows what's due, or what's next. iTerm2, WezTerm and Ghostty also show a desktop notification.
+- **On the reminder in Me:** `x` checks it off, `s` snoozes it 10 minutes, and `o` goes back to the chat it was set in.
+- **In the list:** Space checks off, `s` snoozes, Enter edits, `d` deletes (`u` undoes), `o` goes to the chat it came from, and `c` clears what's done.
+
+A one-off reminder waits under **Due** until you check it off or snooze it. A repeating one moves on to its next time. Reminders missed while hopchat was closed go off when it next starts. The list stays on this machine, sealed like your history, and is never sent to anyone.
 
 ### Direct messages and files
 
@@ -230,8 +255,9 @@ Without `--to`, `--say` and `--file` go to the first peer whose secure session c
 | Tab / Shift-Tab, Ctrl-N / Ctrl-P, Alt-1…9 | switch conversation |
 | Tab after `/` or `@` | complete a command or mention |
 | Ctrl-O | attach files |
-| ↑ on an empty line, or click | select a message: `r` reply, `o` open, `f` show in folder, `y` copy, `R` retry, `g`/`G` first/last, Esc back |
+| ↑ on an empty line, or click | select a message: `r` reply, `o` open, `f` show in folder, `y` copy, `t` todo, `R` retry, `g`/`G` first/last, Esc back |
 | PgUp / PgDn, mouse wheel | scroll |
+| Ctrl-T | todos and reminders |
 | Ctrl-G | new group |
 | Ctrl-D | devices panel |
 | Ctrl-E | protocol event log |
@@ -250,6 +276,8 @@ Without `--to`, `--say` and `--file` go to the first peer whose secure session c
 | `/downloads` | open the folder received files are saved in |
 | `/info` | who this peer is and how they're connected |
 | `/me` | show and copy your own address |
+| `/todo [TEXT]` | add a todo, or a reminder if it says when (no text opens the list) |
+| `/remind TEXT` | set a reminder: `/remind 20m stretch`, `/remind call mom at 5pm` |
 | `/group [NAME]` | start a group |
 | `/invite [NICK]` | add people to this group |
 | `/members` | list who is in this group |
@@ -294,7 +322,7 @@ hopchat [--name NICK] [--dir PATH] [--downloads PATH]
 | Path | Contents |
 | --- | --- |
 | `store.key` | the key that seals everything else |
-| `history/` | each conversation, sealed with XChaCha20-Poly1305 |
+| `history/` | each conversation, and your todos and reminders (`tasks.box`), sealed with XChaCha20-Poly1305 |
 | `home.json` | devices, the model, where home and `@ai` are on, and each TV's client key and pinned certificate |
 | everything else | the SDK's identity and protocol stores |
 
@@ -313,6 +341,7 @@ The SDK does no I/O itself, so hopchat supplies the platform bridge for its peer
 | Lobby | `src/lobby.rs` | Not an MLS group. Each message is a hidden one-to-one message to every peer with a session, sharing one id so replies line up. |
 | Me | `src/me.rs` | A local-only conversation. Messages go straight back to the UI and to home, never onto the wire. |
 | History | `src/history.rs` | Encrypted per-conversation history. |
+| Tasks | `src/tasks.rs` | Todos and reminders: reading times from plain English, repeats, and what is due. They fire from the UI loop into Me. |
 | Home | `src/home/` | Device discovery and drivers (`wiz.rs`, `webos.rs`), the Ollama client, the `@home` tool-calling loop (`assistant.rs`), `@ai` (`ai.rs`), and model lending (`lend.rs`). |
 | UI | `src/ui/` | ratatui rendering, the composer, the file browser, and the group and device panels. |
 

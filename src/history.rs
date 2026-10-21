@@ -12,10 +12,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::engine::write_private;
+use crate::tasks::Tasks;
 
 /// Older messages are dropped past this, per conversation.
 const KEEP: usize = 5_000;
 const NONCE: usize = 24;
+/// Not `.sealed`, so it is never read as a conversation.
+const TASKS: &str = "tasks.box";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Status {
@@ -77,6 +80,14 @@ pub enum Body {
     /// Something happened that belongs in the conversation but is no one's
     /// message: a lost file, a key change.
     Notice(String),
+    /// A reminder going off, said in Me (see [`crate::tasks`]).
+    Reminder {
+        task: String,
+        text: String,
+        /// The conversation it was set in.
+        #[serde(default)]
+        from: Option<String>,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -164,7 +175,7 @@ impl Store {
         out
     }
 
-    fn read(&self, path: &Path) -> Option<Conversation> {
+    fn read<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Option<T> {
         let bytes = std::fs::read(path).ok()?;
         if bytes.len() < NONCE {
             return None;
@@ -172,6 +183,32 @@ impl Store {
         let (nonce, sealed) = bytes.split_at(NONCE);
         let plain = self.cipher.decrypt(XNonce::from_slice(nonce), sealed).ok()?;
         serde_json::from_slice(&plain).ok()
+    }
+
+    /// Seals `value` into `path`, beside and then over the old copy.
+    fn write<T: Serialize>(&self, path: &Path, value: &T) -> std::io::Result<()> {
+        let plain = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+        let mut nonce = [0u8; NONCE];
+        getrandom::fill(&mut nonce).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let sealed = self
+            .cipher
+            .encrypt(XNonce::from_slice(&nonce), plain.as_slice())
+            .map_err(|_| std::io::Error::other("seal failed"))?;
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&sealed);
+        // Write beside, then rename: a crash mid-write keeps the old copy.
+        let tmp = path.with_extension("tmp");
+        write_private(&tmp, &out)?;
+        std::fs::rename(tmp, path)
+    }
+
+    /// Todos and reminders (see [`crate::tasks`]), sealed like history.
+    pub fn load_tasks(&self) -> Tasks {
+        self.read(&self.dir.join(TASKS)).unwrap_or_default()
+    }
+
+    pub fn save_tasks(&self, tasks: &Tasks) -> std::io::Result<()> {
+        self.write(&self.dir.join(TASKS), tasks)
     }
 
     pub fn save(&self, convo: &Conversation) -> std::io::Result<()> {
@@ -184,20 +221,7 @@ impl Store {
             members: convo.members.clone(),
             dirty: false,
         };
-        let plain = serde_json::to_vec(&trimmed).map_err(std::io::Error::other)?;
-        let mut nonce = [0u8; NONCE];
-        getrandom::fill(&mut nonce).map_err(|e| std::io::Error::other(e.to_string()))?;
-        let sealed = self
-            .cipher
-            .encrypt(XNonce::from_slice(&nonce), plain.as_slice())
-            .map_err(|_| std::io::Error::other("seal failed"))?;
-        let mut out = nonce.to_vec();
-        out.extend_from_slice(&sealed);
-        // Write beside, then rename: a crash mid-write keeps the old copy.
-        let path = self.path_for(&convo.address);
-        let tmp = path.with_extension("tmp");
-        write_private(&tmp, &out)?;
-        std::fs::rename(tmp, path)
+        self.write(&self.path_for(&convo.address), &trimmed)
     }
 
     pub fn forget(&self, address: &str) {
@@ -244,8 +268,16 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].nick, "bob");
 
+        let mut tasks = Tasks::default();
+        let now = chrono::Local::now();
+        tasks.add(crate::tasks::Draft::read("secret plan in 5m", now), None, 0);
+        store.save_tasks(&tasks).unwrap();
+        assert_eq!(store.load_tasks().items, tasks.items);
+        assert_eq!(store.load().len(), 1, "tasks aren't a conversation");
+
         let other = Store::open(&root, &[8u8; 32]).unwrap();
         assert!(other.load().is_empty());
+        assert!(other.load_tasks().items.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
