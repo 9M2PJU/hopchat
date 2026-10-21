@@ -38,6 +38,9 @@ const SIDEBAR: u16 = 30;
 /// A new header is drawn when the same sender pauses this long.
 const GROUP_GAP_MS: i64 = 5 * 60 * 1000;
 const INDENT: &str = "  ";
+/// Messages wrap at this many columns however wide the window, so a
+/// tick never sits a screen away from what it ticks.
+const READING_WIDTH: usize = 96;
 /// How long the boot screen shows, unless a key skips it.
 pub const BOOT_FOR: Duration = Duration::from_millis(1_800);
 
@@ -130,7 +133,10 @@ impl App {
             Mode::Picker(picker) => draw_picker(frame, picker),
             Mode::Devices(panel) => self.draw_devices(frame, panel),
             Mode::Groups(panel) => self.draw_groups(frame, panel),
-            Mode::Help => draw_help(frame),
+            &Mode::Help(at) => {
+                let max = draw_help(frame, at);
+                self.mode = Mode::Help(at.min(max));
+            }
             _ => {}
         }
     }
@@ -180,38 +186,33 @@ impl App {
             vec!["   ".into(), "●".fg(if online > 0 { SAGE } else { FAINT }), " ".into(), nearby],
             vec!["   end-to-end · offline".fg(FAINT)],
         ];
-        let mut spans = Vec::new();
-        let mut used = 0;
-        for segment in segments {
-            let w: usize = segment.iter().map(Span::width).sum();
-            if used + w > room {
-                break;
-            }
-            used += w;
-            spans.extend(segment);
-        }
-        frame.render_widget(Line::from(spans), area);
+        frame.render_widget(Line::from(fitting(segments, room)), area);
         frame.render_widget(Line::from(clock.fg(FAINT)).alignment(Alignment::Right), area);
     }
 
     fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::new()
             .borders(Borders::RIGHT)
-            .border_style(Style::new().fg(theme::mix(FAINT, BG, 0.4)))
+            .border_style(Style::new().fg(theme::line()))
             .style(Style::new().bg(PANEL));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let [new_group, list, me] = Layout::vertical([
-            Constraint::Length(2),
+        // The button and its rule sit level with the chat's header, so one
+        // line runs under both.
+        let [new_group, rule, list, me] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .areas(inner);
+        frame.render_widget(theme::rule(rule.width as usize), rule);
+        junction(frame, inner.right(), rule.y, "┼");
 
         // A button: the same panel as Ctrl-G.
         let open = matches!(self.mode, Mode::Groups(_));
-        let row = Rect::new(new_group.x + 1, new_group.y + 1, new_group.width.saturating_sub(2), 1);
+        let row = Rect::new(new_group.x + 1, new_group.y, new_group.width.saturating_sub(2), 1);
         if open {
             frame.render_widget(Block::new().style(Style::new().bg(RAISED)), row);
         }
@@ -222,14 +223,17 @@ impl App {
         frame.render_widget(Line::from("Ctrl-G ".fg(FAINT)).alignment(Alignment::Right), row);
         self.new_group_row = row;
 
-        let online = self.convos.iter().filter(|c| c.online && !c.data.group).count();
+        let width = me.width as usize;
+        junction(frame, inner.right(), me.y, "┤");
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(vec!["  ".into(), self.me_nick.clone().fg(IRIS).bold(), "  you".fg(FAINT)]),
+                theme::rule(width),
                 Line::from(vec![
-                    format!("  {}", short(&self.me_address)).fg(FAINT),
-                    format!(" · {online} nearby").fg(FAINT),
+                    "  ".into(),
+                    clip(&self.me_nick, width.saturating_sub(8)).fg(IRIS).bold(),
+                    "  you".fg(FAINT),
                 ]),
+                Line::from(format!("  {}", short(&self.me_address)).fg(FAINT)),
             ]),
             me,
         );
@@ -269,16 +273,18 @@ impl App {
                 _ => MUTED,
             };
             let marker = if selected { "▎".fg(IRIS) } else { " ".into() };
-            let mut name = clip(&convo.data.nick, width.saturating_sub(10)).fg(tint);
-            name = if selected || convo.unread > 0 {
-                name.bold()
-            } else {
-                name
-            };
             let badge = if convo.unread > 0 {
                 format!(" {} ", convo.unread.min(99))
             } else {
                 String::new()
+            };
+            // Marker, dot and a space before; the badge and a margin after.
+            let room = width.saturating_sub(3 + badge.width() + 2);
+            let mut name = clip(&convo.data.nick, room).fg(tint);
+            name = if selected || convo.unread > 0 {
+                name.bold()
+            } else {
+                name
             };
             let used = 3 + UnicodeWidthStr::width(name.content.as_ref());
             let pad = width.saturating_sub(used + badge.width() + 1);
@@ -388,15 +394,26 @@ impl App {
             (true, false) => vec![format!("securing the link{}", dots()).fg(PEACH)],
             (false, _) => vec!["away  ·  messages wait for them".fg(FAINT)],
         };
-        let mut spans = vec!["  ".into(), icon, convo.data.nick.clone().fg(tint).bold(), "   ".into()];
-        spans.extend(state);
+        let width = top.width as usize;
+        let name = clip(&convo.data.nick, width.saturating_sub(6)).fg(tint).bold();
+        let mut spans = vec!["  ".into(), icon, name];
+        let lead: usize = spans.iter().map(Span::width).sum();
+        // The state gives way a piece at a time; the address only shows
+        // when everything fits beside it.
+        let segments: Vec<Vec<Span>> = state
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| if i == 0 { vec!["   ".into(), s] } else { vec![s] })
+            .collect();
+        let full: usize = segments.iter().flatten().map(Span::width).sum();
+        let address = (convo.data.address != LOBBY && convo.data.address != ME)
+            .then(|| format!("{}  ", short(&convo.data.address)))
+            .filter(|a| lead + full + a.width() + 2 <= width);
+        let room = width.saturating_sub(lead + address.as_ref().map_or(0, |a| a.width()));
+        spans.extend(fitting(segments, room));
         frame.render_widget(Line::from(spans), top);
-        if convo.data.address != LOBBY && convo.data.address != ME {
-            frame.render_widget(
-                Line::from(format!("{}  ", short(&convo.data.address)).fg(FAINT))
-                    .alignment(Alignment::Right),
-                top,
-            );
+        if let Some(address) = address {
+            frame.render_widget(Line::from(address.fg(FAINT)).alignment(Alignment::Right), top);
         }
     }
 
@@ -414,7 +431,8 @@ impl App {
             return;
         };
 
-        let width = area.width.saturating_sub(2).max(10) as usize;
+        let full = area.width.saturating_sub(2).max(10) as usize;
+        let width = full.min(READING_WIDTH);
         let selected = match self.mode {
             Mode::Select(i) => Some(i),
             _ => None,
@@ -424,13 +442,13 @@ impl App {
         let mut prev: Option<&Entry> = None;
         for (i, entry) in convo.data.entries.iter().enumerate() {
             if prev.is_none_or(|p| !same_day(p.at_ms, entry.at_ms)) {
-                rows.push((day_separator(entry.at_ms, width), None));
+                rows.push((day_separator(entry.at_ms, full), None));
             }
             let lines = self.entry_lines(convo, entry, prev, width);
             prev = Some(entry);
             let highlight = selected == Some(i) || (reply_to == Some(entry.id.as_str()) && !entry.id.is_empty());
             for line in lines {
-                let line = if highlight { highlight_line(line, width) } else { line };
+                let line = if highlight { highlight_line(line, full) } else { line };
                 rows.push((line, Some(i)));
             }
         }
@@ -447,25 +465,21 @@ impl App {
             ));
         }
         if convo.data.entries.is_empty() {
-            rows.push((Line::from(""), None));
+            let mut hints: Vec<Line<'static>> = Vec::new();
             if convo.data.address == LOBBY {
                 let others = convo.data.members.len() > 1;
                 if !others && area.height >= 16 {
+                    rows.push((Line::from(""), None));
                     for line in theme::ripples(29, 7) {
                         rows.push((line.centered(), None));
                     }
-                    rows.push((Line::from(""), None));
                 }
                 let view = &self.home_view;
                 let open = view.groups.iter().chain(&view.ai_groups).any(|g| g == LOBBY);
-                for line in lobby_hint(others, open) {
-                    rows.push((line, None));
-                }
+                hints.extend(lobby_hint(others, open));
             }
             if convo.data.address == ME {
-                for line in me_hint(&self.home_view) {
-                    rows.push((line, None));
-                }
+                hints.extend(me_hint(&self.home_view));
             }
             let hint = if convo.data.address == LOBBY || convo.data.address == ME {
                 ""
@@ -477,7 +491,15 @@ impl App {
                 "Messages you write now are delivered when they're reachable."
             };
             if !hint.is_empty() {
-                rows.push((Line::from(hint.fg(MUTED)).centered(), None));
+                hints.push(Line::from(hint.fg(MUTED)).centered());
+            }
+            rows.push((Line::from(""), None));
+            for line in hints {
+                if line.width() == 0 {
+                    rows.push((line, None));
+                    continue;
+                }
+                rows.extend(wrap_line(line, full.saturating_sub(4)).into_iter().map(|l| (l, None)));
             }
         }
 
@@ -623,7 +645,10 @@ impl App {
                     clip(name, name_room).fg(TEXT).bg(RAISED),
                     format!("  {size_text} ").fg(MUTED).bg(RAISED),
                 ]));
-                let mut detail = vec![gutter(), "  ".into()];
+                // Lined up under the icon. The first piece always shows; the
+                // hints after it only when there's room.
+                let mut detail = vec![gutter(), " ".into()];
+                let mut hint: Option<Span<'static>> = None;
                 match transfer {
                     Transfer::Queued => {
                         let why = if convo.online && convo.secure {
@@ -650,21 +675,25 @@ impl App {
                         }
                     }
                     Transfer::Done => {
-                        let saved = clip(&picker::tilde(path), width.saturating_sub(24));
+                        let saved = clip(&picker::tilde(path), width.saturating_sub(12));
                         detail.push("saved to ".fg(MUTED));
                         detail.push(saved.fg(MUTED).underlined());
-                        detail.push("  click, then o to open".fg(FAINT));
+                        hint = Some("  click, then o to open".fg(FAINT));
                     }
                     Transfer::Failed(reason) => {
-                        detail.push(format!("✗ {reason}").fg(ERR));
+                        detail.push(format!("✗ {}", clip(reason, width.saturating_sub(6))).fg(ERR));
                         if entry.mine {
-                            detail.push("  click, then R to retry".fg(FAINT));
+                            hint = Some("  click, then R to retry".fg(FAINT));
                         }
                     }
                     Transfer::Interrupted => {
                         detail.push("interrupted when hopchat closed".fg(WARN));
-                        detail.push("  click, then R to retry".fg(FAINT));
+                        hint = Some("  click, then R to retry".fg(FAINT));
                     }
+                }
+                let used: usize = detail.iter().map(Span::width).sum();
+                if let Some(hint) = hint.filter(|h| used + h.width() <= width) {
+                    detail.push(hint);
                 }
                 out.push(Line::from(detail));
             }
@@ -763,7 +792,14 @@ impl App {
                 Some(c) => format!("message {}  ·  Ctrl-O attach a file  ·  / commands", c.data.nick),
                 None => "waiting for someone to talk to  ·  F1 help".to_string(),
             };
-            lines.push(Line::from(vec![prompt(), clip(&hint, text_width).fg(FAINT)]));
+            // Whole hints only: the tail ones drop off when it's narrow.
+            let mut parts = hint.split("  ·  ");
+            let first = clip(parts.next().unwrap_or_default(), text_width).fg(FAINT);
+            let rest: Vec<Vec<Span>> = parts.map(|p| vec![format!("  ·  {p}").fg(FAINT)]).collect();
+            let mut spans = vec![prompt(), first];
+            let used: usize = spans.iter().map(Span::width).sum();
+            spans.extend(fitting(rest, (inner.width as usize).saturating_sub(used)));
+            lines.push(Line::from(spans));
         } else {
             for (i, row) in rows.iter().enumerate().skip(first_row).take(8) {
                 let lead = if i == 0 { prompt() } else { "  ".into() };
@@ -800,11 +836,15 @@ impl App {
             let h = matches.len() as u16 + 2;
             let w = area.width.min(72);
             let popup = Rect::new(area.x, area.y.saturating_sub(h), w, h);
+            let help_width = (w as usize).saturating_sub(2 + 13 + 1);
             let lines: Vec<Line> = matches
                 .iter()
                 .enumerate()
                 .map(|(i, (name, help))| {
-                    let line = Line::from(vec![format!(" {name:<11}").fg(IRIS), help.fg(MUTED)]);
+                    let line = Line::from(vec![
+                        format!(" {name:<12}").fg(IRIS),
+                        clip(help, help_width).fg(MUTED),
+                    ]);
                     if i == 0 { line.style(Style::new().bg(RAISED)) } else { line }
                 })
                 .collect();
@@ -816,14 +856,20 @@ impl App {
     fn draw_log(&self, frame: &mut Frame, area: Rect) {
         let block = Block::new()
             .borders(Borders::LEFT)
-            .border_style(Style::new().fg(theme::mix(FAINT, BG, 0.4)))
-            .style(Style::new().bg(PANEL))
-            .title(Line::from(" protocol ".fg(MUTED)));
+            .border_style(Style::new().fg(theme::line()))
+            .style(Style::new().bg(PANEL));
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        // A header like the chat's, on the same line.
+        let [title, rule, inner] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+        frame.render_widget(Line::from(vec![" protocol".fg(MUTED), "  events as they happen".fg(FAINT)]), title);
+        frame.render_widget(theme::rule(rule.width as usize), rule);
+        junction(frame, area.x, rule.y, "┼");
         let height = inner.height as usize;
         let skip = self.log.len().saturating_sub(height);
         let lines: Vec<Line> = self.log.iter().skip(skip).cloned().collect();
+        let inner = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), inner.height);
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -851,7 +897,7 @@ impl App {
                 ("type", "filter", None),
                 ("Esc", "cancel", press(KeyCode::Esc)),
             ],
-            Mode::Help => vec![("any key", "close", press(KeyCode::Esc))],
+            Mode::Help(_) => vec![("↑↓", "scroll", None), ("any key", "close", press(KeyCode::Esc))],
             Mode::Devices(ref panel) if panel.renaming.is_some() => vec![
                 ("type", "a name", None),
                 ("Enter", "save", press(KeyCode::Enter)),
@@ -1001,6 +1047,13 @@ fn float(frame: &mut Frame, area: Rect, block: Block) -> Rect {
     inner
 }
 
+/// Where two dividers meet, at the cell `x`, `y`: `symbol` joins them.
+fn junction(frame: &mut Frame, x: u16, y: u16, symbol: &str) {
+    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+        cell.set_symbol(symbol).set_fg(theme::line());
+    }
+}
+
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn spinner() -> &'static str {
@@ -1011,22 +1064,8 @@ fn spinner() -> &'static str {
 impl App {
     fn draw_devices(&self, frame: &mut Frame, panel: &Devices) {
         let view = &self.home_view;
-        let area = centered(frame.area(), 78, 82);
-        let status = if view.scanning {
-            format!(" {} scanning ", spinner()).fg(FOAM)
-        } else {
-            " r rescans ".fg(MUTED)
-        };
-        let block = panel_block("Devices").title(Line::from(status).alignment(Alignment::Right));
-        let inner = float(frame, area, block);
-        let [list, help, footer] = Layout::vertical([
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(4),
-        ])
-        .areas(inner);
-
-        let width = list.width as usize;
+        let screen = frame.area();
+        let width = fit_width(screen, 96) as usize - 2;
         let selected = panel.selected.min(view.devices.len().saturating_sub(1));
         let mut lines: Vec<Line> = Vec::new();
         let mut selected_row = 0;
@@ -1069,6 +1108,21 @@ impl App {
                 ".".fg(FAINT),
             ]));
         }
+        // Tall enough for what's listed, up to most of the screen.
+        let area = fit(screen, 96, lines.len() as u16 + 3 + 4 + 2);
+        let status = if view.scanning {
+            format!(" {} scanning ", spinner()).fg(FOAM)
+        } else {
+            " r rescans ".fg(MUTED)
+        };
+        let block = panel_block("Devices").title(Line::from(status).alignment(Alignment::Right));
+        let inner = float(frame, area, block);
+        let [list, help, footer] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(4),
+        ])
+        .areas(inner);
         // Keep the selection in view.
         let height = list.height as usize;
         let skip = (selected_row + 2).saturating_sub(height);
@@ -1190,7 +1244,10 @@ impl App {
 impl App {
     fn draw_groups(&self, frame: &mut Frame, panel: &GroupPanel) {
         let people = self.candidates(panel);
-        let area = centered(frame.area(), 60, 70);
+        let name_height = if panel.target.is_some() { 0 } else { 2 };
+        // Name, the people (room for a few even when there are none), help.
+        let rows = name_height + 1 + people.len().max(3) as u16 + 1 + 3 + 2;
+        let area = fit(frame.area(), 72, rows);
         let title = match &panel.target {
             Some((_, name)) => format!("Add people to #{name}"),
             None => "New group".to_string(),
@@ -1203,7 +1260,6 @@ impl App {
         };
         let block = panel_block(&title).title(Line::from(count).alignment(Alignment::Right));
         let inner = float(frame, area, block);
-        let name_height = if panel.target.is_some() { 0 } else { 2 };
         let [name, list, help] = Layout::vertical([
             Constraint::Length(name_height),
             Constraint::Min(3),
@@ -1283,6 +1339,10 @@ fn candidate_line(person: &Candidate, panel: &GroupPanel, selected: bool, width:
     };
     let name = clip(&person.nick, 20);
     let pad = 22usize.saturating_sub(name.width());
+    // The address tells two people with one nick apart, when there's room.
+    let address = short(&person.address);
+    let address = if 30 + state.width() + 2 + address.width() < width { address } else { String::new() };
+    let state = Span::styled(clip(&state.content, width.saturating_sub(31)), state.style);
     let name = if !pickable {
         name.fg(FAINT)
     } else if selected {
@@ -1290,8 +1350,6 @@ fn candidate_line(person: &Candidate, panel: &GroupPanel, selected: bool, width:
     } else {
         name.into()
     };
-    // The address tells two people with one nick apart, when there's room.
-    let address = if width >= 66 { short(&person.address) } else { String::new() };
     let line = Line::from(vec![
         marker,
         " ".into(),
@@ -1402,7 +1460,8 @@ fn device_help(d: Option<&DeviceView>, panel: &Devices) -> Vec<Line<'static>> {
 }
 
 fn draw_picker(frame: &mut Frame, picker: &Picker) {
-    let area = centered(frame.area(), 76, 80);
+    let screen = frame.area();
+    let area = fit(screen, 100, screen.height * 4 / 5);
     let block = panel_block("Attach files").title_bottom(
         Line::from(if picker.marked.is_empty() {
             " Space marks several ".to_string()
@@ -1455,13 +1514,15 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
                 (file_icon(&entry.name).to_string(), entry.name.clone(), human_size(entry.size))
             };
             let name = clip(&name, width.saturating_sub(18));
-            let pad = width.saturating_sub(6 + name.width() + size.width());
+            // Mark and icon before, a margin after: the row fills the width.
+            let pad = width.saturating_sub(5 + name.width() + size.width() + 1);
             let line = Line::from(vec![
                 mark,
                 format!("{icon} ").into(),
                 if entry.dir { name.fg(FOAM).bold() } else { name.into() },
                 " ".repeat(pad).into(),
                 size.fg(MUTED),
+                " ".into(),
             ]);
             if i == picker.selected {
                 let mut line = line;
@@ -1475,15 +1536,88 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
     frame.render_widget(Paragraph::new(lines), list);
 }
 
-fn draw_help(frame: &mut Frame) {
+/// Keys and commands, scrolled `at` rows down. Gives back how far down it
+/// can go, for the scroll to stop there.
+fn draw_help(frame: &mut Frame, at: usize) -> usize {
     let screen = frame.area();
-    let wide = screen.width >= 130;
-    let area = centered(screen, if wide { 90 } else { 70 }, 88);
-    let key = |k: &str, what: &str| {
-        Line::from(vec![format!("  {k:<16}").fg(KEY).bold(), what.to_string().fg(TEXT)])
+    let wide = screen.width >= 120;
+    let w = if wide { screen.width.saturating_sub(8).min(150) } else { screen.width.saturating_sub(4).min(86) };
+    // Clear of the strip at the top and the keys at the bottom, shadow too.
+    let h = screen.height.saturating_sub(3).max(10).min(screen.height);
+    let area = Rect::new(screen.x + (screen.width - w.min(screen.width)) / 2, screen.y + 1, w.min(screen.width), h);
+    let key_width = 19;
+    let key = |k: &str, what: &str, width: usize| -> Vec<Line<'static>> {
+        wrap(what, width.saturating_sub(key_width + 1))
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let k = if i == 0 { format!("  {k:<16} ") } else { " ".repeat(key_width) };
+                Line::from(vec![k.fg(KEY).bold(), row.fg(TEXT)])
+            })
+            .collect()
     };
-    let head = |t: &str| Line::from(vec!["  ".into(), t.to_string().fg(ROSE).bold()]);
-    let mut lines = vec![
+    let section = |title: &str, rows: &[(&str, &str)], width: usize| -> Vec<Line<'static>> {
+        let mut out = vec![Line::from(vec!["  ".into(), title.to_string().fg(ROSE).bold()])];
+        for (k, what) in rows {
+            out.extend(key(k, what, width));
+        }
+        out.push(Line::from(""));
+        out
+    };
+    let chatting: &[(&str, &str)] = &[
+        ("Enter", "send (with any attached files)"),
+        ("Shift/Alt-Enter", "new line (Ctrl-J works everywhere)"),
+        ("Tab · Shift-Tab", "next / previous conversation (also Ctrl-N/P)"),
+        ("Alt-1 … 9", "jump to a conversation"),
+        ("PgUp · PgDn", "scroll history (or the mouse wheel)"),
+        ("Esc", "cancel reply · jump to newest"),
+    ];
+    let files: &[(&str, &str)] = &[
+        ("Ctrl-O", "browse for files to attach"),
+        ("drag & drop", "drop files on the window to attach them"),
+        ("/file PATH", "send a file by path"),
+    ];
+    let messages: &[(&str, &str)] = &[
+        ("r · Enter", "reply"),
+        ("o · f", "open a file · show it in its folder"),
+        ("y", "copy text to the clipboard"),
+        ("R", "retry a failed send"),
+    ];
+    let editing: &[(&str, &str)] = &[
+        ("Ctrl-A · Ctrl-E", "start / end of line"),
+        ("Ctrl-W · Ctrl-U", "delete word / to start of line"),
+        ("Alt-← · Alt-→", "move by word"),
+    ];
+    let elsewhere: &[(&str, &str)] = &[
+        ("Lobby", "everyone nearby, always at the top · @home your devices · @ai your model"),
+        ("Me", "just you: notes, and @home and @ai that never leave this machine"),
+        ("Ctrl-G", "new group: name it, pick people, Enter"),
+        ("Ctrl-D", "devices: find, pair and test them"),
+        ("Ctrl-E", "protocol event log"),
+        ("Ctrl-C · Ctrl-Q", "quit"),
+    ];
+    let first = |width: usize| -> Vec<Line<'static>> {
+        let mut out = vec![Line::from("")];
+        out.extend(section("Chatting", chatting, width));
+        out.extend(section("Files", files, width));
+        out.extend(section("Messages  (click one, or ↑ on an empty line)", messages, width));
+        out.extend(section("Editing", editing, width));
+        out
+    };
+    let second = |width: usize, lead: bool| -> Vec<Line<'static>> {
+        let mut out = if lead { vec![Line::from("")] } else { Vec::new() };
+        out.extend(section("Elsewhere", elsewhere, width));
+        out.extend(section("Commands  (type / to see them)", COMMANDS, width));
+        out.extend(wrap_line(
+            Line::from("  To select text with the mouse, hold Shift (Option in iTerm/Terminal).".fg(FAINT)),
+            width,
+        ));
+        out
+    };
+
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
+    let width = inner.width as usize;
+    let intro = wrap_line(
         Line::from(vec![
             "  Everything is clickable too: ".fg(MUTED),
             "chats".fg(TEXT).bold(),
@@ -1493,67 +1627,51 @@ fn draw_help(frame: &mut Frame) {
             "keys".fg(KEY).bold(),
             " along the bottom.".fg(MUTED),
         ]),
-        Line::from(""),
-        head("Chatting"),
-        key("Enter", "send (with any attached files)"),
-        key("Shift/Alt-Enter", "new line (Ctrl-J works everywhere)"),
-        key("Tab · Shift-Tab", "next / previous conversation (also Ctrl-N/P)"),
-        key("Alt-1 … 9", "jump to a conversation"),
-        key("PgUp · PgDn", "scroll history (or the mouse wheel)"),
-        key("Esc", "cancel reply · jump to newest"),
-        Line::from(""),
-        head("Files"),
-        key("Ctrl-O", "browse for files to attach"),
-        key("drag & drop", "drop files on the window to attach them"),
-        key("/file PATH", "send a file by path"),
-        Line::from(""),
-        head("Messages  (click one, or ↑ on an empty line)"),
-        key("r · Enter", "reply"),
-        key("o · f", "open a file · show it in its folder"),
-        key("y", "copy text to the clipboard"),
-        key("R", "retry a failed send"),
-        Line::from(""),
-        head("Editing"),
-        key("Ctrl-A · Ctrl-E", "start / end of line"),
-        key("Ctrl-W · Ctrl-U", "delete word / to start of line"),
-        key("Alt-← · Alt-→", "move by word"),
-        Line::from(""),
-        head("Elsewhere"),
-        key("Lobby", "everyone nearby, always at the top · @home your devices · @ai your model"),
-        key("Me", "just you: notes, and @home and @ai that never leave this machine"),
-        key("Ctrl-G", "new group: name it, pick people, Enter"),
-        key("Ctrl-D", "devices: find, pair and test them"),
-        key("Ctrl-E", "protocol event log"),
-        key("Ctrl-C · Ctrl-Q", "quit"),
-    ];
-    let mut commands = vec![head("Commands  (type / to see them)")];
-    for (name, what) in COMMANDS {
-        commands.push(key(name, what));
-    }
-    commands.push(Line::from(""));
-    commands.push(Line::from(
-        "  To select text with the mouse, hold Shift (Option in iTerm/Terminal).".fg(FAINT),
-    ));
-    let block = panel_block("hopchat · help").title_bottom(Line::from(vec![
+        width.saturating_sub(2),
+    );
+    let columns: Vec<Vec<Line<'static>>> = if wide {
+        let half = (width - 2) / 2;
+        let (left, right) = (first(half), second(width - 2 - half, true));
+        vec![left, right]
+    } else {
+        let mut all = first(width);
+        all.extend(second(width, false));
+        vec![all]
+    };
+    let height = (inner.height as usize).saturating_sub(intro.len());
+    let longest = columns.iter().map(Vec::len).max().unwrap_or(0);
+    let max = longest.saturating_sub(height);
+    let at = at.min(max);
+
+    let mut block = panel_block("hopchat · help").title_bottom(Line::from(vec![
         " ✓ on the wire · ".fg(MUTED),
         "✓✓".fg(SAGE),
         " delivered · ".fg(MUTED),
         "✓✓".fg(READ),
         " read ".fg(MUTED),
     ]));
-    let inner = float(frame, area, block);
-    if wide {
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(inner);
-        frame.render_widget(Paragraph::new(lines), left);
-        let mut right_lines = vec![Line::from(""), Line::from("")];
-        right_lines.extend(commands);
-        frame.render_widget(Paragraph::new(right_lines), right);
-    } else {
-        lines.push(Line::from(""));
-        lines.extend(commands);
-        frame.render_widget(Paragraph::new(lines), inner);
+    if max > 0 {
+        let more = if at < max { " ↓ more " } else { " ↑ top " };
+        block = block.title_bottom(Line::from(more.fg(KEY)).alignment(Alignment::Right));
     }
+    let inner = float(frame, area, block);
+    let [top, body] =
+        Layout::vertical([Constraint::Length(intro.len() as u16), Constraint::Min(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(intro), top);
+    let areas: Vec<Rect> = if wide {
+        let half = (body.width.saturating_sub(2)) / 2;
+        vec![
+            Rect::new(body.x, body.y, half, body.height),
+            Rect::new(body.x + half + 2, body.y, body.width.saturating_sub(half + 2), body.height),
+        ]
+    } else {
+        vec![body]
+    };
+    for (lines, rect) in columns.into_iter().zip(areas) {
+        let lines: Vec<Line> = lines.into_iter().skip(at).collect();
+        frame.render_widget(Paragraph::new(lines), rect);
+    }
+    max
 }
 
 /// What an empty lobby says: who's here, and what you can say to it.
@@ -1575,13 +1693,9 @@ fn lobby_hint(others: bool, open: bool) -> Vec<Line<'static>> {
         Line::from(who.fg(MUTED)).centered(),
         private.centered(),
         Line::from(""),
-        Line::from(vec![
-            "@home".fg(GOLD).bold(),
-            " turn the lights down  ·  ".fg(MUTED),
-            "@ai".fg(GOLD).bold(),
-            " ask your model anything".fg(MUTED),
-        ])
-        .centered(),
+        Line::from(vec!["@home".fg(GOLD).bold(), " turn the lights down".fg(MUTED)]).centered(),
+        Line::from(vec!["@ai".fg(GOLD).bold(), " ask your model anything".fg(MUTED)]).centered(),
+        Line::from(""),
         Line::from(
             if open {
                 "You've let everyone here use them too (Ctrl-D to change)."
@@ -1624,10 +1738,17 @@ fn me_hint(view: &home::View) -> Vec<Line<'static>> {
     lines
 }
 
-fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
-    let w = (area.width * width_pct / 100).max(40).min(area.width);
-    let h = (area.height * height_pct / 100).max(10).min(area.height);
-    Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
+/// How wide a panel of at most `max` columns can be on `screen`.
+fn fit_width(screen: Rect, max: u16) -> u16 {
+    max.min(screen.width.saturating_sub(4)).max(40).min(screen.width)
+}
+
+/// A panel up to `max` wide and `rows` tall, centred, never past the
+/// edges.
+fn fit(screen: Rect, max: u16, rows: u16) -> Rect {
+    let w = fit_width(screen, max);
+    let h = rows.min(screen.height.saturating_sub(4)).max(10).min(screen.height);
+    Rect::new(screen.x + (screen.width - w) / 2, screen.y + (screen.height - h) / 2, w, h)
 }
 
 fn progress_bar(fraction: f64, width: usize) -> Vec<Span<'static>> {
@@ -1727,9 +1848,9 @@ fn day_separator(ms: i64, width: usize) -> Line<'static> {
     let label_width = label.width();
     let side = width.saturating_sub(label_width) / 2;
     Line::from(vec![
-        "─".repeat(side).fg(theme::mix(FAINT, BG, 0.4)),
+        "─".repeat(side).fg(theme::line()),
         label.fg(MUTED),
-        "─".repeat(width.saturating_sub(side + label_width)).fg(theme::mix(FAINT, BG, 0.4)),
+        "─".repeat(width.saturating_sub(side + label_width)).fg(theme::line()),
     ])
 }
 
@@ -1783,6 +1904,104 @@ pub fn clip(text: &str, max: usize) -> String {
         w += cw;
     }
     out.push('…');
+    out
+}
+
+/// Styled spans re-flowed into rows at most `width` wide, breaking between
+/// words; a row's leading indent is kept, the spaces at a break are not.
+fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(4);
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0;
+    let trim = |row: &mut Vec<Span<'static>>| {
+        while let Some(last) = row.last_mut() {
+            let kept = last.content.trim_end().to_string();
+            if kept.is_empty() {
+                row.pop();
+            } else {
+                last.content = kept.into();
+                break;
+            }
+        }
+    };
+    for span in spans {
+        for word in span.content.split_inclusive(' ') {
+            let bare = word.trim_end().width();
+            if used > 0 && used + bare > width {
+                trim(rows.last_mut().unwrap());
+                rows.push(Vec::new());
+                used = 0;
+            }
+            if used == 0 && rows.len() > 1 && bare == 0 {
+                continue;
+            }
+            if bare > width {
+                for c in word.chars() {
+                    let cw = c.width().unwrap_or(0);
+                    if used + cw > width {
+                        rows.push(Vec::new());
+                        used = 0;
+                    }
+                    rows.last_mut().unwrap().push(Span::styled(c.to_string(), span.style));
+                    used += cw;
+                }
+                continue;
+            }
+            rows.last_mut().unwrap().push(Span::styled(word.to_string(), span.style));
+            used += word.width();
+        }
+    }
+    for row in &mut rows {
+        trim(row);
+    }
+    rows
+}
+
+/// A line wrapped to `width`, each row keeping its alignment, its style
+/// and the first row's indent.
+fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let (alignment, style) = (line.alignment, line.style);
+    // Take the indent off, wrap what's left, and put it back on every row.
+    let mut spans = line.spans;
+    let mut indent = 0;
+    while let Some(first) = spans.first_mut() {
+        let rest = first.content.trim_start_matches(' ');
+        indent += first.content.len() - rest.len();
+        if rest.is_empty() {
+            spans.remove(0);
+        } else {
+            first.content = rest.to_string().into();
+            break;
+        }
+    }
+    let mut rows = wrap_spans(spans, width.saturating_sub(indent));
+    if indent > 0 {
+        for row in &mut rows {
+            row.insert(0, " ".repeat(indent).into());
+        }
+    }
+    rows.into_iter()
+        .map(|spans| {
+            let mut row = Line::from(spans).style(style);
+            row.alignment = alignment;
+            row
+        })
+        .collect()
+}
+
+/// As many of `segments`, in order, as fit in `room` columns: the first
+/// that doesn't fit and everything after it are left out.
+fn fitting(segments: Vec<Vec<Span<'static>>>, room: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for segment in segments {
+        let w: usize = segment.iter().map(Span::width).sum();
+        if used + w > room {
+            break;
+        }
+        used += w;
+        out.extend(segment);
+    }
     out
 }
 

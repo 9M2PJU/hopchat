@@ -69,9 +69,14 @@ pub fn fade_in(c: Color, t: i64, from_ms: i64, over_ms: i64) -> Color {
     mix(BG, c, (t - from_ms) as f64 / over_ms.max(1) as f64)
 }
 
+/// Every divider: rules, panel edges, the day separator.
+pub fn line() -> Color {
+    mix(FAINT, BG, 0.35)
+}
+
 /// The quiet line under headers.
 pub fn rule(width: usize) -> Line<'static> {
-    Line::from("─".repeat(width).fg(mix(FAINT, BG, 0.35)))
+    Line::from("─".repeat(width).fg(line()))
 }
 
 /// Ripples leaving the middle, slowly, for while hopchat listens for

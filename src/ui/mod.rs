@@ -108,7 +108,8 @@ pub enum Mode {
     Picker(Picker),
     Devices(Devices),
     Groups(GroupPanel),
-    Help,
+    /// Keys and commands, scrolled down this many rows.
+    Help(usize),
 }
 
 pub struct App {
@@ -901,8 +902,8 @@ impl App {
             }
             KeyCode::F(1) => {
                 self.mode = match self.mode {
-                    Mode::Help => Mode::Normal,
-                    _ => Mode::Help,
+                    Mode::Help(_) => Mode::Normal,
+                    _ => Mode::Help(0),
                 };
                 return;
             }
@@ -910,7 +911,15 @@ impl App {
         }
 
         match std::mem::replace(&mut self.mode, Mode::Normal) {
-            Mode::Help => {} // any key closes it
+            // The arrows and pages scroll it; any other key closes it.
+            Mode::Help(at) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.mode = Mode::Help(at.saturating_sub(1)),
+                KeyCode::Down | KeyCode::Char('j') => self.mode = Mode::Help(at + 1),
+                KeyCode::PageUp => self.mode = Mode::Help(at.saturating_sub(10)),
+                KeyCode::PageDown | KeyCode::Char(' ') => self.mode = Mode::Help(at + 10),
+                KeyCode::Home => self.mode = Mode::Help(0),
+                _ => {}
+            },
             Mode::Picker(mut picker) => {
                 if let Some(chosen) = picker_key(&mut picker, key) {
                     self.attach(chosen);
@@ -1206,11 +1215,13 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp => match &mut self.mode {
                 Mode::Picker(p) => p.up(),
+                Mode::Help(at) => *at = at.saturating_sub(3),
                 _ if inside(self.chat_area) => self.scroll += 3,
                 _ => {}
             },
             MouseEventKind::ScrollDown => match &mut self.mode {
                 Mode::Picker(p) => p.down(),
+                Mode::Help(at) => *at += 3,
                 _ if inside(self.chat_area) => self.scroll = self.scroll.saturating_sub(3),
                 _ => {}
             },
@@ -1475,7 +1486,7 @@ impl App {
                 });
             }
             "log" => self.show_log = !self.show_log,
-            "help" | "?" => self.mode = Mode::Help,
+            "help" | "?" => self.mode = Mode::Help(0),
             "quit" | "exit" | "q" => self.quit = true,
             _ => self.flash_error(format!("unknown command /{name} · /help lists them")),
         }
@@ -2020,7 +2031,7 @@ mod render_tests {
         assert_eq!(app.selected.as_deref(), Some(LOBBY));
         let alone = screen(&mut app);
         println!("{alone}");
-        for needle in ["◎ Lobby", "everyone nearby", "just you so far", "0 nearby", "Looking for people", "@home", "@ai", "Only you can use them"] {
+        for needle in ["◎ Lobby", "everyone nearby", "just you so far", "nobody nearby yet", "Looking for people", "@home", "@ai", "Only you can use them"] {
             assert!(alone.contains(needle), "missing {needle:?}");
         }
 
