@@ -30,6 +30,11 @@ const BEACON_INTERVAL: Duration = Duration::from_secs(2);
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const KEEPALIVE_RETRIES: u32 = 3;
+/// How long a stream may take to prove who it is before it is dropped.
+const PREAMBLE_WAIT: Duration = Duration::from_secs(10);
+/// How long one write may stall before the peer counts as gone, so a peer
+/// that stops reading cannot block the engine.
+const WRITE_WAIT: Duration = Duration::from_secs(5);
 
 /// What the network tells the engine.
 pub enum NetEvent {
@@ -172,6 +177,8 @@ fn spawn_stream(
             .with_interval(KEEPALIVE_INTERVAL)
             .with_retries(KEEPALIVE_RETRIES);
         let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+        let _ = stream.set_read_timeout(Some(PREAMBLE_WAIT));
+        let _ = stream.set_write_timeout(Some(WRITE_WAIT));
         let Ok(preamble) = frame(&me.preamble) else {
             return;
         };
@@ -195,14 +202,16 @@ fn spawn_stream(
             for event in reader.feed(&buf[..n]) {
                 match event {
                     StreamEvent::Announced(address) => {
-                        let fresh = address != me.address
-                            && announced.lock().unwrap().insert(address.clone());
                         let Ok(writer) = stream.try_clone() else {
                             break 'read;
                         };
+                        let fresh = address != me.address
+                            && announced.lock().unwrap().insert(address.clone());
                         if !fresh {
                             break 'read;
                         }
+                        // Proven: from here keepalive notices a dead peer.
+                        let _ = stream.set_read_timeout(None);
                         peer = Some(address.clone());
                         let _ = events.send(NetEvent::Up {
                             address,
