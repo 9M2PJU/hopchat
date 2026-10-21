@@ -243,7 +243,8 @@ impl Home {
                         self.tv(&id)?.wake()?;
                         Ok("sent the TV a wake-up signal".into())
                     }
-                    _ => self.tv_do(&id, webos::power_off),
+                    Some(false) => self.tv_do(&id, webos::power_off),
+                    None => Err("say whether to turn the TV on or off".into()),
                 }
             }
             "tv_volume" => {
