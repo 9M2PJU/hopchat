@@ -35,6 +35,9 @@ use groups::{Candidate, GroupPanel};
 use picker::{Outcome, Picker};
 
 const LOG_LINES: usize = 300;
+/// The longest nick or group name kept from the network; a new group's
+/// own name is capped the same.
+const NAME_MAX: usize = 40;
 /// How long a peer's "typing…" lasts without a refresh.
 const TYPING_SHOWN: Duration = Duration::from_secs(6);
 /// How often we re-announce that we are typing, and how long after the last
@@ -408,6 +411,7 @@ impl App {
     fn apply(&mut self, update: Update, send: &impl Fn(Command)) {
         match update {
             Update::PeerSeen { address, nick } => {
+                let nick = render::display_name(&nick, NAME_MAX).unwrap_or_else(|| render::short(&address));
                 let convo = self.convo_mut(&address);
                 if convo.data.nick != nick {
                     convo.data.nick = nick;
@@ -600,6 +604,7 @@ impl App {
                 }
             }
             Update::Group { id, name, members } => {
+                let name = render::display_name(&name, NAME_MAX).unwrap_or_else(|| "group".into());
                 let me = self.me_address.clone();
                 let convo = self.convo_mut(&id);
                 let fresh = !convo.data.group || !convo.online;
@@ -2204,5 +2209,60 @@ mod render_tests {
         for needle in ["bob", "carol", "Today", "sure, one sec", "✓✓ read", "q3-deck.pdf", "40%", "bob is typing", "looks good"] {
             assert!(screen.contains(needle), "missing {needle:?}");
         }
+    }
+
+    #[test]
+    fn long_names_stay_in_their_lane() {
+        let mut app = test_app();
+        let send = |_: Command| {};
+        let long = "Bartholomew the Extremely Long-Named Wanderer of the Northern Hills";
+        let bob = "off1bob00000000000000";
+        app.apply(Update::PeerSeen { address: bob.into(), nick: format!("{long}\n\x1b[2J") }, &send);
+        let convo = app.convo_mut(bob);
+        convo.online = true;
+        convo.secure = true;
+        convo.push(text("m1", false, &format!("{} https://example.com/a/really/long/link", "word ".repeat(30)), Status::Sent));
+        let mut reply = text("m2", true, "sure", Status::Read);
+        reply.reply = Some(Quoted { id: "m1".into(), mine: false, text: "word ".repeat(30) });
+        convo.push(reply);
+        convo.push(Entry {
+            id: "f1".into(),
+            mine: false,
+            at_ms: now_ms(),
+            body: Body::File {
+                file_id: "f1".into(),
+                name: "the-quarterly-planning-report-final-final-really-final-v12.pdf".into(),
+                size: 4_200_000,
+                path: "/tmp/some/deeply/nested/folder/for/downloads/the-quarterly-planning-report-final-final-really-final-v12.pdf".into(),
+                transfer: Transfer::Done,
+            },
+            status: Status::Sent,
+            hops: 1,
+            reply: None,
+            read: true,
+            sender: None,
+        });
+        convo.typing_until = Some(Instant::now() + Duration::from_secs(5));
+        app.selected = Some(bob.into());
+        app.reply = Some("m1".into());
+
+        assert_eq!(app.nick_of(bob), long[..40].trim_end(), "one tidy line, capped");
+        for (w, h) in [(100, 30), (72, 30), (150, 36)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let shown: String = (0..buffer.area.height)
+                .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>() + "\n")
+                .collect();
+            println!("{w}x{h}\n{shown}");
+            assert!(!shown.contains('\x1b'));
+            assert!(shown.contains(".pdf"), "the extension survives at {w}");
+            assert!(shown.contains(&clock_now()), "the time beside the name survives at {w}");
+            assert!(shown.contains("is typing"), "at {w}");
+        }
+    }
+
+    fn clock_now() -> String {
+        chrono::Local::now().format("%H:%M").to_string()
     }
 }

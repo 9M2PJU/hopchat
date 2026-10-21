@@ -9,7 +9,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -35,6 +35,9 @@ pub const READ: Color = FOAM;
 const KEY: Color = GOLD;
 const SELECTED_BG: Color = RAISED;
 const SIDEBAR: u16 = 30;
+/// The most a name takes in a line of other things, so whatever follows
+/// it (a time, a hint, a key) still shows.
+const NAME_ROOM: usize = 24;
 /// A new header is drawn when the same sender pauses this long.
 const GROUP_GAP_MS: i64 = 5 * 60 * 1000;
 const INDENT: &str = "  ";
@@ -158,7 +161,7 @@ impl App {
             Line::from(""),
             Line::from(""),
             Line::from(vec![
-                self.me_nick.clone().fg(theme::fade_in(IRIS, t, 800, 500)),
+                clip(&self.me_nick, (area.width as usize).saturating_sub(24)).fg(theme::fade_in(IRIS, t, 800, 500)),
                 format!("  ·  {}", short(&self.me_address)).fg(theme::fade_in(FAINT, t, 800, 500)),
             ])
             .centered(),
@@ -182,7 +185,7 @@ impl App {
         };
         let segments: Vec<Vec<Span>> = vec![
             vec!["  hopchat".fg(IRIS).bold()],
-            vec!["   ".into(), self.me_nick.clone().fg(TEXT)],
+            vec!["   ".into(), clip(&self.me_nick, NAME_ROOM).fg(TEXT)],
             vec!["   ".into(), "●".fg(if online > 0 { SAGE } else { FAINT }), " ".into(), nearby],
             vec!["   end-to-end · offline".fg(FAINT)],
         ];
@@ -212,7 +215,8 @@ impl App {
 
         // A button: the same panel as Ctrl-G.
         let open = matches!(self.mode, Mode::Groups(_));
-        let row = Rect::new(new_group.x + 1, new_group.y, new_group.width.saturating_sub(2), 1);
+        // Its + sits in the column of the chats' dots, its words in theirs.
+        let row = Rect::new(new_group.x, new_group.y, new_group.width, 1);
         if open {
             frame.render_widget(Block::new().style(Style::new().bg(RAISED)), row);
         }
@@ -220,7 +224,7 @@ impl App {
             Line::from(vec![" + ".fg(IRIS), "New group".fg(if open { TEXT } else { MUTED })]),
             row,
         );
-        frame.render_widget(Line::from("Ctrl-G ".fg(FAINT)).alignment(Alignment::Right), row);
+        frame.render_widget(Line::from("Ctrl-G  ".fg(FAINT)).alignment(Alignment::Right), row);
         self.new_group_row = row;
 
         let width = me.width as usize;
@@ -229,11 +233,11 @@ impl App {
             Paragraph::new(vec![
                 theme::rule(width),
                 Line::from(vec![
-                    "  ".into(),
-                    clip(&self.me_nick, width.saturating_sub(8)).fg(IRIS).bold(),
+                    "   ".into(),
+                    clip(&self.me_nick, width.saturating_sub(9)).fg(IRIS).bold(),
                     "  you".fg(FAINT),
                 ]),
-                Line::from(format!("  {}", short(&self.me_address)).fg(FAINT)),
+                Line::from(format!("   {}", short(&self.me_address)).fg(FAINT)),
             ]),
             me,
         );
@@ -287,7 +291,7 @@ impl App {
                 name
             };
             let used = 3 + UnicodeWidthStr::width(name.content.as_ref());
-            let pad = width.saturating_sub(used + badge.width() + 1);
+            let pad = width.saturating_sub(used + badge.width() + 2);
             let badge = if convo.unread > 0 {
                 Span::styled(badge, Style::new().fg(BG).bg(IRIS))
             } else {
@@ -315,6 +319,10 @@ impl App {
                     .unwrap_or_else(|| match convo.data.address.as_str() {
                         LOBBY => "everyone nearby".into(),
                         ME => "notes, @home, @ai".into(),
+                        _ if convo.data.group => match convo.data.members.len() {
+                            1 => "just you so far".into(),
+                            n => format!("{n} members"),
+                        },
                         address => short(address),
                     });
                 clip(&text.replace('\n', " "), width.saturating_sub(4)).fg(if selected { MUTED } else { FAINT })
@@ -339,13 +347,20 @@ impl App {
     }
 
     fn draw_main(&mut self, frame: &mut Frame, area: Rect) {
-        let composer_height = self.composer_height(area.width.saturating_sub(4) as usize);
-        let [header, history, composer] = Layout::vertical([
+        // The composer sits a column in from each side, level with the
+        // messages, and keeps a column inside its frame: borders and
+        // padding take 6, the prompt 2.
+        let composer_height = self.composer_height(area.width.saturating_sub(8) as usize);
+        // A blank row between the newest message and the composer, so the
+        // last line never sits on the frame.
+        let [header, history, _, composer] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(3),
+            Constraint::Length(1),
             Constraint::Length(composer_height),
         ])
         .areas(area);
+        let composer = Rect::new(composer.x + 1, composer.y, composer.width.saturating_sub(2), composer.height);
         self.chat_area = history;
         self.composer_area = composer;
 
@@ -431,6 +446,8 @@ impl App {
             return;
         };
 
+        // Dividers, notices and the selection bar span the chat, centred
+        // in it; only the messages themselves keep to a reading width.
         let full = area.width.saturating_sub(2).max(10) as usize;
         let width = full.min(READING_WIDTH);
         let selected = match self.mode {
@@ -458,7 +475,7 @@ impl App {
             rows.push((
                 Line::from(vec![
                     "▎ ".fg(theme::dim(tint)),
-                    format!("{} is typing", convo.data.nick).fg(tint).italic(),
+                    format!("{} is typing", clip(&convo.data.nick, NAME_ROOM)).fg(tint).italic(),
                     dots().fg(tint),
                 ]),
                 None,
@@ -499,7 +516,7 @@ impl App {
                     rows.push((line, None));
                     continue;
                 }
-                rows.extend(wrap_line(line, full.saturating_sub(4)).into_iter().map(|l| (l, None)));
+                rows.extend(balanced(line, full.saturating_sub(4)).into_iter().map(|l| (l, None)));
             }
         }
 
@@ -578,6 +595,7 @@ impl App {
                 Some(sender) => self.nick_of(sender),
                 None => convo.data.nick.clone(),
             };
+            let name = clip(&name, NAME_ROOM.min(width.saturating_sub(10)));
             let mut header = vec!["  ".into(), name.fg(tint).bold(), "  ".into(), clock(entry.at_ms).fg(FAINT)];
             if !entry.mine && entry.hops > 1 {
                 header.push(format!("  via {} hops", entry.hops).fg(FAINT));
@@ -589,7 +607,7 @@ impl App {
             let who = match () {
                 _ if q.mine => "you".to_string(),
                 _ if convo.data.group => "reply".to_string(),
-                _ => convo.data.nick.clone(),
+                _ => clip(&convo.data.nick, NAME_ROOM),
             };
             let text = clip(&q.text.replace('\n', " "), width.saturating_sub(who.width() + 8));
             out.push(Line::from(vec![
@@ -642,7 +660,7 @@ impl App {
                 out.push(Line::from(vec![
                     gutter(),
                     format!(" {icon} ").bg(RAISED),
-                    clip(name, name_room).fg(TEXT).bg(RAISED),
+                    clip_middle(name, name_room).fg(TEXT).bg(RAISED),
                     format!("  {size_text} ").fg(MUTED).bg(RAISED),
                 ]));
                 // Lined up under the icon. The first piece always shows; the
@@ -675,7 +693,7 @@ impl App {
                         }
                     }
                     Transfer::Done => {
-                        let saved = clip(&picker::tilde(path), width.saturating_sub(12));
+                        let saved = clip_start(&picker::tilde(path), width.saturating_sub(14));
                         detail.push("saved to ".fg(MUTED));
                         detail.push(saved.fg(MUTED).underlined());
                         hint = Some("  click, then o to open".fg(FAINT));
@@ -722,22 +740,28 @@ impl App {
     fn draw_composer(&self, frame: &mut Frame, area: Rect) {
         let focused = matches!(self.mode, Mode::Normal);
         let edge = if focused { theme::dim(IRIS) } else { theme::mix(FAINT, BG, 0.3) };
+        // The name gets what the corners, " to " and the send hint leave.
+        let send_hint = Line::from(vec![" enter ".fg(MUTED), "to send ".fg(FAINT)]);
+        let name_room = (area.width as usize).saturating_sub(2 + 4 + 1 + send_hint.width() + 2);
         let to = match self.current() {
             Some(c) if c.data.address == LOBBY => vec!["everyone nearby".fg(FOAM)],
             Some(c) if c.data.address == ME => vec!["yourself".fg(IRIS)],
-            Some(c) if c.data.group => vec![format!("#{}", c.data.nick).fg(ROSE)],
-            Some(c) => vec![c.data.nick.clone().fg(theme::person(&c.data.address))],
+            Some(c) if c.data.group => vec![clip(&format!("#{}", c.data.nick), name_room).fg(ROSE)],
+            Some(c) => vec![clip(&c.data.nick, name_room).fg(theme::person(&c.data.address))],
             None => vec!["nobody yet".fg(MUTED)],
         };
         let mut title = vec![" to ".fg(FAINT)];
         title.extend(to);
         title.push(" ".into());
-        let block = Block::bordered()
+        let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(edge))
             .style(Style::new().bg(PANEL))
-            .title(Line::from(title))
-            .title(Line::from(vec![" enter ".fg(MUTED), "to send ".fg(FAINT)]).alignment(Alignment::Right));
+            .padding(Padding::horizontal(1))
+            .title(Line::from(title));
+        if name_room > 0 {
+            block = block.title(send_hint.alignment(Alignment::Right));
+        }
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -746,29 +770,45 @@ impl App {
             let who = if target.mine {
                 "yourself".to_string()
             } else {
-                self.current().map(|c| c.data.nick.clone()).unwrap_or_default()
+                self.current().map(|c| clip(&c.data.nick, NAME_ROOM)).unwrap_or_default()
             };
-            let text = clip(&entry_summary(target).replace('\n', " "), (inner.width as usize).saturating_sub(who.width() + 28));
+            // The quote gives way first, then the hint to cancel.
+            let room = inner.width as usize;
+            let cancel = "  Esc cancels";
+            let fixed = "↳ replying to ".width() + who.width() + 2;
+            let cancel = if fixed + 8 + cancel.width() <= room { cancel } else { "" };
+            let text = clip(&entry_summary(target).replace('\n', " "), room.saturating_sub(fixed + cancel.width()));
             lines.push(Line::from(vec![
                 "↳ replying to ".fg(FAINT),
                 who.fg(IRIS),
                 format!("  {text}").fg(MUTED),
-                "  Esc cancels".fg(FAINT),
+                cancel.fg(FAINT),
             ]));
         }
         if !self.attachments.is_empty() {
+            // As many chips as fit on the one row; the rest are counted.
+            let room = inner.width as usize;
+            let removes = "⌫ removes";
             let mut spans = Vec::new();
-            for path in &self.attachments {
+            let mut used = 0;
+            for (i, path) in self.attachments.iter().enumerate() {
                 let name = super::file_name(path);
                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                spans.push(
-                    format!(" {} {} · {} ", file_icon(&name), clip(&name, 24), human_size(size))
-                        .fg(TEXT)
-                        .bg(RAISED),
-                );
+                let chip = format!(" {} {} · {} ", file_icon(&name), clip_middle(&name, 24), human_size(size));
+                let left = self.attachments.len() - i - 1;
+                let more = if left > 0 { format!("+{left} more  ").width() } else { 0 };
+                if i > 0 && used + chip.width() + 1 + more.max(removes.width()) > room {
+                    spans.push(format!("+{} more  ", left + 1).fg(MUTED));
+                    break;
+                }
+                used += chip.width() + 1;
+                spans.push(chip.fg(TEXT).bg(RAISED));
                 spans.push(" ".into());
             }
-            spans.push("⌫ removes".fg(FAINT));
+            let used: usize = spans.iter().map(Span::width).sum();
+            if used + removes.width() <= room {
+                spans.push(removes.fg(FAINT));
+            }
             lines.push(Line::from(spans));
         }
 
@@ -787,9 +827,9 @@ impl App {
                     "a note to yourself  ·  @home your devices  ·  @ai your model".to_string()
                 }
                 Some(c) if c.data.group => {
-                    format!("message #{}  ·  @home @ai  ·  / commands", c.data.nick)
+                    format!("message #{}  ·  @home @ai  ·  / commands", clip(&c.data.nick, NAME_ROOM))
                 }
-                Some(c) => format!("message {}  ·  Ctrl-O attach a file  ·  / commands", c.data.nick),
+                Some(c) => format!("message {}  ·  Ctrl-O attach a file  ·  / commands", clip(&c.data.nick, NAME_ROOM)),
                 None => "waiting for someone to talk to  ·  F1 help".to_string(),
             };
             // Whole hints only: the tail ones drop off when it's narrow.
@@ -940,13 +980,15 @@ impl App {
         if let Some((text, error)) = self.flash_text() {
             let (mark, tone) = if error { ("✗ ", ERR) } else { ("✓ ", SAGE) };
             right.push(mark.fg(tone));
-            right.push(clip(text, 60).fg(if error { ERR } else { TEXT }));
+            // Never more than half the strip: the keys keep the rest.
+            let room = 60.min((area.width as usize / 2).saturating_sub(4));
+            right.push(clip(text, room).fg(if error { ERR } else { TEXT }));
             right.push("  ".into());
         }
         for incoming in self.incoming.values().take(2) {
             let pct = (incoming.done * 100).checked_div(incoming.total).unwrap_or(0);
             right.push(
-                format!("⇣ {} {}% of {}  ", clip(&incoming.name, 18), pct, human_size(incoming.size))
+                format!("⇣ {} {}% of {}  ", clip_middle(&incoming.name, 18), pct, human_size(incoming.size))
                     .fg(FOAM),
             );
         }
@@ -1130,7 +1172,7 @@ impl App {
         frame.render_widget(Paragraph::new(lines), list);
 
         let current = panel.current(view);
-        frame.render_widget(Paragraph::new(device_help(current, panel)), help);
+        frame.render_widget(Paragraph::new(device_help(current, panel, width)), help);
 
         frame.render_widget(Paragraph::new(self.devices_footer(width)), footer);
     }
@@ -1139,10 +1181,11 @@ impl App {
         let view = &self.home_view;
         let rule = Line::from("─".repeat(width).fg(FAINT));
         let model = match view.model_state {
-            ModelState::Ready => vec!["● ".fg(OK), view.model.clone().bold(), " ready".fg(MUTED)],
+            ModelState::Ready => vec!["● ".fg(OK), clip(&view.model, 32).bold(), " ready".fg(MUTED)],
+            // The command is what matters, and is only any use whole.
             ModelState::Missing => vec![
                 "◐ ".fg(WARN),
-                format!("{} isn't downloaded · ", view.model).fg(WARN),
+                "not downloaded · ".fg(WARN),
                 format!("ollama pull {}", view.model).fg(ACCENT),
             ],
             ModelState::NoServer => vec![
@@ -1160,7 +1203,7 @@ impl App {
                 "  Model   ".fg(MUTED),
                 "● ".fg(OK),
                 "borrowing ".fg(MUTED),
-                view.lenders.join(", ").bold(),
+                clip(&view.lenders.join(", "), width.saturating_sub(24)).bold(),
             ];
         } else if view.model_state == ModelState::Ready && view.share {
             model_line.push("  · lent to the group".fg(FAINT));
@@ -1169,25 +1212,25 @@ impl App {
             None if self.in_me() => vec!["◇ ".fg(IRIS), "Me".bold(), ": always yours".fg(MUTED)],
             Some((id, name, true)) if id == LOBBY => vec![
                 "# ".fg(ACCENT),
-                name.bold(),
+                clip(&name, NAME_ROOM).bold(),
                 ": everyone nearby can use them".fg(OK),
                 "  · g lets only you".fg(FAINT),
             ],
             Some((id, name, false)) if id == LOBBY => vec![
                 "# ".fg(ACCENT),
-                name.bold(),
+                clip(&name, NAME_ROOM).bold(),
                 ": only you can use them".fg(MUTED),
                 "  · g lets everyone nearby in".fg(ACCENT),
             ],
             Some((_, name, true)) => vec![
                 "# ".fg(ACCENT),
-                name.bold(),
+                clip(&name, NAME_ROOM).bold(),
                 " can use them".fg(OK),
                 "  · g switches off".fg(FAINT),
             ],
             Some((_, name, false)) => vec![
                 "# ".fg(FAINT),
-                name.bold(),
+                clip(&name, NAME_ROOM).bold(),
                 " can't use them".fg(MUTED),
                 "  · g lets this group in".fg(ACCENT),
             ],
@@ -1205,25 +1248,25 @@ impl App {
             None if self.in_me() => vec!["◇ ".fg(IRIS), "Me".bold(), ": always answers you".fg(MUTED)],
             Some((id, name, true)) if id == LOBBY => vec![
                 "# ".fg(ACCENT),
-                name.bold(),
+                clip(&name, NAME_ROOM).bold(),
                 ": everyone nearby can ask the model".fg(OK),
                 "  · i lets only you".fg(FAINT),
             ],
             Some((id, name, false)) if id == LOBBY => vec![
                 "# ".fg(ACCENT),
-                name.bold(),
+                clip(&name, NAME_ROOM).bold(),
                 ": only you can ask the model".fg(MUTED),
                 "  · i lets everyone nearby ask".fg(ACCENT),
             ],
             Some((_, name, true)) => vec![
                 "# ".fg(ACCENT),
-                name.bold(),
+                clip(&name, NAME_ROOM).bold(),
                 " can ask the model with @ai".fg(OK),
                 "  · i switches off".fg(FAINT),
             ],
             Some((_, name, false)) => vec![
                 "# ".fg(FAINT),
-                name.bold(),
+                clip(&name, NAME_ROOM).bold(),
                 " can't ask the model".fg(MUTED),
                 "  · i lets it ask with @ai".fg(ACCENT),
             ],
@@ -1237,7 +1280,12 @@ impl App {
         };
         let mut ai_line = vec!["  @ai     ".fg(MUTED)];
         ai_line.extend(ai);
-        vec![rule, Line::from(model_line), Line::from(access_line), Line::from(ai_line)]
+        vec![
+            rule,
+            Line::from(squeeze(model_line, width.saturating_sub(1))),
+            Line::from(squeeze(access_line, width.saturating_sub(1))),
+            Line::from(squeeze(ai_line, width.saturating_sub(1))),
+        ]
     }
 }
 
@@ -1249,7 +1297,7 @@ impl App {
         let rows = name_height + 1 + people.len().max(3) as u16 + 1 + 3 + 2;
         let area = fit(frame.area(), 72, rows);
         let title = match &panel.target {
-            Some((_, name)) => format!("Add people to #{name}"),
+            Some((_, name)) => format!("Add people to #{}", clip(name, (area.width as usize).saturating_sub(40))),
             None => "New group".to_string(),
         };
         let picked = people.iter().filter(|p| panel.is_picked(&p.address)).count();
@@ -1269,17 +1317,20 @@ impl App {
 
         if panel.target.is_none() {
             let naming = panel.focus == Focus::Name;
+            // While typing, the end of a long name stays in view.
+            let room = (name.width as usize).saturating_sub(12);
+            let shown = if naming { clip_start(&panel.name, room) } else { clip(&panel.name, room) };
             let field = if panel.name.is_empty() && !naming {
                 "untitled".fg(FAINT)
             } else if panel.name.is_empty() {
                 "e.g. house, weekend trip".fg(FAINT)
             } else {
-                Span::raw(panel.name.clone()).bold()
+                Span::raw(shown.clone()).bold()
             };
             let label = if naming { " Name  › ".fg(ACCENT).bold() } else { " Name  › ".fg(MUTED) };
             frame.render_widget(Line::from(vec![label, "#".fg(ACCENT), field]), name);
             if naming {
-                let x = name.x + 10 + panel.name.width() as u16;
+                let x = name.x + 10 + shown.width() as u16;
                 frame.set_cursor_position(Position::new(x.min(name.right().saturating_sub(1)), name.y));
             }
         }
@@ -1384,7 +1435,7 @@ fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) ->
     };
     let marker = if selected { "▎".fg(ACCENT) } else { " ".into() };
     let name = match &panel.renaming {
-        Some(typed) if selected => Span::from(format!("{typed}▏")).fg(ACCENT).bold(),
+        Some(typed) if selected => Span::from(format!("{}▏", clip_start(typed, 21))).fg(ACCENT).bold(),
         _ if selected => Span::from(clip(&d.name, 22)).bold(),
         _ => Span::from(clip(&d.name, 22)),
     };
@@ -1408,7 +1459,7 @@ fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) ->
 }
 
 /// Two lines under the list saying what the selected device needs.
-fn device_help(d: Option<&DeviceView>, panel: &Devices) -> Vec<Line<'static>> {
+fn device_help(d: Option<&DeviceView>, panel: &Devices, width: usize) -> Vec<Line<'static>> {
     let key = |k: &str| k.to_string().fg(KEY).bold();
     let say = |t: &str| t.to_string().fg(MUTED);
     let Some(d) = d else { return Vec::new() };
@@ -1416,7 +1467,7 @@ fn device_help(d: Option<&DeviceView>, panel: &Devices) -> Vec<Line<'static>> {
         return vec![Line::from(""), Line::from(vec!["  ".into(), say("Type a name people will use, like "), "Desk lamp".bold(), say(". "), key("Enter"), say(" saves.")])];
     }
     if panel.confirm_forget {
-        return vec![Line::from(""), Line::from(vec!["  ".into(), format!("Forget {}? ", d.name).fg(WARN), key("x"), say(" again to forget, anything else keeps it.")])];
+        return vec![Line::from(""), Line::from(vec!["  ".into(), format!("Forget {}? ", clip(&d.name, NAME_ROOM)).fg(WARN), key("x"), say(" again to forget, anything else keeps it.")])];
     }
     let lines = match (&d.state, devices::primary(d)) {
         (State::Pairing { .. }, _) => vec![
@@ -1424,7 +1475,7 @@ fn device_help(d: Option<&DeviceView>, panel: &Devices) -> Vec<Line<'static>> {
             Line::from(vec!["  ".into(), say("Choose "), "Allow".bold(), say(" with the remote. Nothing to do here.")]),
         ],
         (State::Failed(why), _) => vec![
-            Line::from(vec!["  ".into(), clip(why, 90).fg(ERR)]),
+            Line::from(vec!["  ".into(), clip(why, width.saturating_sub(4)).fg(ERR)]),
             Line::from(vec!["  ".into(), key("Enter"), say(" tries again")]),
         ],
         (_, Primary::Pair) => vec![
@@ -1447,14 +1498,14 @@ fn device_help(d: Option<&DeviceView>, panel: &Devices) -> Vec<Line<'static>> {
             vec![
                 Line::from(vec!["  ".into(), key("Enter"), say(test), say(" · "), key("n"), say(" renames · "), key("x"), say(" forgets")]),
                 Line::from(vec!["  ".into(), say("In a group, people ask for it by name: "), match d.kind {
-                    home::Kind::Light => format!("@home dim the {}", d.name.to_lowercase()),
-                    home::Kind::Tv => format!("@home put netflix on the {}", d.name.to_lowercase()),
+                    home::Kind::Light => format!("@home dim the {}", clip(&d.name.to_lowercase(), NAME_ROOM)),
+                    home::Kind::Tv => format!("@home put netflix on the {}", clip(&d.name.to_lowercase(), NAME_ROOM)),
                 }.fg(THEIRS)]),
             ]
         }
     };
     let mut out = vec![Line::from("")];
-    out.extend(lines);
+    out.extend(lines.into_iter().map(|l| Line::from(squeeze(l.spans, width.saturating_sub(1)))));
     out.truncate(3);
     out
 }
@@ -1479,7 +1530,10 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
     .areas(inner);
 
     frame.render_widget(
-        Line::from(vec![" 📁 ".into(), picker::tilde(&picker.dir).bold()]),
+        Line::from(vec![
+            " 📁 ".into(),
+            clip_start(&picker::tilde(&picker.dir), (path.width as usize).saturating_sub(6)).bold(),
+        ]),
         path,
     );
     let filter_line = if picker.filter.is_empty() {
@@ -1513,7 +1567,7 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
             } else {
                 (file_icon(&entry.name).to_string(), entry.name.clone(), human_size(entry.size))
             };
-            let name = clip(&name, width.saturating_sub(18));
+            let name = if entry.dir { clip(&name, width.saturating_sub(18)) } else { clip_middle(&name, width.saturating_sub(18)) };
             // Mark and icon before, a margin after: the row fills the width.
             let pad = width.saturating_sub(5 + name.width() + size.width() + 1);
             let line = Line::from(vec![
@@ -1759,8 +1813,8 @@ fn progress_bar(fraction: f64, width: usize) -> Vec<Span<'static>> {
 fn highlight_line(line: Line<'static>, width: usize) -> Line<'static> {
     let used = line.width();
     let mut line = line;
-    if used < width + 2 {
-        line.spans.push(" ".repeat(width + 2 - used).into());
+    if used < width {
+        line.spans.push(" ".repeat(width - used).into());
     }
     line.style(Style::new().bg(SELECTED_BG))
 }
@@ -1913,6 +1967,66 @@ pub fn clip(text: &str, max: usize) -> String {
     out
 }
 
+/// Shortens to `max` columns by cutting the middle, so both ends stay:
+/// a file keeps its extension, `report-final-…-v2.pdf`.
+pub fn clip_middle(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_string();
+    }
+    let room = max.saturating_sub(1);
+    let tail_room = room / 3;
+    let head = clip(text, room - tail_room + 1);
+    let head = head.trim_end_matches('…');
+    let mut tail: Vec<char> = Vec::new();
+    let mut w = 0;
+    for c in text.chars().rev() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > room.saturating_sub(head.width()) {
+            break;
+        }
+        tail.push(c);
+        w += cw;
+    }
+    tail.reverse();
+    format!("{head}…{}", tail.into_iter().collect::<String>())
+}
+
+/// Shortens to `max` columns by dropping the start: for paths, where the
+/// end is where you are.
+pub fn clip_start(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_string();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut w = 0;
+    for c in text.chars().rev() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw + 1 > max {
+            break;
+        }
+        tail.push(c);
+        w += cw;
+    }
+    tail.reverse();
+    format!("…{}", tail.into_iter().collect::<String>())
+}
+
+/// A name someone else chose, made safe to lay out: one line, no control
+/// characters, no runs of spaces, at most `max` characters. `None` when
+/// nothing is left.
+pub fn display_name(raw: &str, max: usize) -> Option<String> {
+    let name: String = raw
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max)
+        .collect();
+    let name = name.trim_end().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Styled spans re-flowed into rows at most `width` wide, breaking between
 /// words; a row's leading indent is kept, the spaces at a break are not.
 fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
@@ -1993,6 +2107,42 @@ fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             row
         })
         .collect()
+}
+
+/// A centred line wrapped into rows of even length: as few rows as at
+/// `width`, but no lone word left on the last.
+fn balanced(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let rows = wrap_line(line.clone(), width).len();
+    if rows < 2 {
+        return wrap_line(line, width);
+    }
+    let narrowest = (width / 2..width)
+        .find(|&w| wrap_line(line.clone(), w).len() == rows)
+        .unwrap_or(width);
+    wrap_line(line, narrowest)
+}
+
+/// Spans cut to `width`: the trailing hints (those that start "  ·")
+/// go first, then the end of what's left is clipped.
+fn squeeze(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let total = |s: &[Span]| s.iter().map(Span::width).sum::<usize>();
+    while total(&spans) > width
+        && spans.len() > 1
+        && spans.last().is_some_and(|s| s.content.starts_with("  ·"))
+    {
+        spans.pop();
+    }
+    while total(&spans) > width {
+        let before = total(&spans[..spans.len() - 1]);
+        if before + 2 > width && spans.len() > 1 {
+            spans.pop();
+            continue;
+        }
+        let last = spans.last_mut().unwrap();
+        last.content = clip(&last.content, width - before).into();
+        break;
+    }
+    spans
 }
 
 /// As many of `segments`, in order, as fit in `room` columns: the first
@@ -2101,6 +2251,23 @@ mod tests {
         assert_eq!(wrap("a\n\nb", 10), ["a", "", "b"]);
         assert_eq!(wrap("abcd efg", 4), ["abcd", "efg"]);
         assert_eq!(wrap("abcdefgh ij", 4), ["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn clips_keep_the_useful_end() {
+        assert_eq!(clip_middle("short.pdf", 20), "short.pdf");
+        let file = clip_middle("quarterly-report-final-version-2.pdf", 20);
+        assert_eq!(file.width(), 20);
+        assert!(file.ends_with(".pdf") && file.starts_with("quarterly"), "{file}");
+        assert_eq!(clip_start("~/a/b/c/projects", 10), "…/projects");
+        assert_eq!(clip_start("~/a", 10), "~/a");
+    }
+
+    #[test]
+    fn names_are_one_tidy_line() {
+        assert_eq!(display_name("  bob\n\x1b[2J  the\tbuilder ", 32).as_deref(), Some("bob [2J the builder"));
+        assert_eq!(display_name("\n\t", 32), None);
+        assert_eq!(display_name("abcdefgh", 4).as_deref(), Some("abcd"));
     }
 
     #[test]
