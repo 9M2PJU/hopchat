@@ -7,7 +7,7 @@ mod groups;
 mod picker;
 mod render;
 mod tasks;
-mod theme;
+pub mod theme;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -430,7 +430,7 @@ impl App {
             Update::PeerUp { address } => {
                 self.convo_mut(&address).online = true;
                 let who = self.nick_of(&address);
-                self.note(render::OK, format!("link up    {who}"));
+                self.note(render::ok(), format!("link up    {who}"));
             }
             Update::PeerDown { address } => {
                 let convo = self.convo_mut(&address);
@@ -439,7 +439,7 @@ impl App {
                 convo.typing_until = None;
                 self.refresh_lobby();
                 let who = self.nick_of(&address);
-                self.note(render::ERR, format!("link down  {who}"));
+                self.note(render::err(), format!("link down  {who}"));
                 self.flash(format!("{who} dropped off the mesh"));
             }
             Update::SessionReady { address } => {
@@ -448,7 +448,7 @@ impl App {
                 convo.secure = true;
                 self.refresh_lobby();
                 let who = self.nick_of(&address);
-                self.note(render::OK, format!("mls ready  {who}"));
+                self.note(render::ok(), format!("mls ready  {who}"));
                 if fresh {
                     self.flash(format!("{who} jacked in · click them to talk privately"));
                 }
@@ -633,7 +633,7 @@ impl App {
                     }
                 }
                 if fresh {
-                    self.note(render::OK, format!("group      {name}"));
+                    self.note(render::ok(), format!("group      {name}"));
                 }
             }
             Update::GroupLeft { id } => {
@@ -694,13 +694,13 @@ impl App {
                 self.receive(&group, entry, &preview);
             }
             Update::Home(text) => {
-                self.note(render::ACCENT, text.clone());
+                self.note(render::accent(), text.clone());
                 self.flash(text);
             }
             Update::HomeView(view) => self.home_view = *view,
             Update::Protocol(event) => self.on_protocol(*event),
             Update::Error(e) => {
-                self.note(render::ERR, format!("error      {e}"));
+                self.note(render::err(), format!("error      {e}"));
                 if e.starts_with("send failed") {
                     self.flash_error(e);
                 }
@@ -1592,6 +1592,19 @@ impl App {
                 self.add_task(draft, self.origin_here());
             }
             "log" => self.show_log = !self.show_log,
+            "theme" => {
+                let light = match arg {
+                    "" => !theme::is_light(),
+                    _ => match theme::parse(arg) {
+                        Some(light) => light,
+                        None => return self.flash_error("/theme dark or /theme light"),
+                    },
+                };
+                match theme::set(light) {
+                    Ok(()) => self.flash(format!("{} theme", if light { "light" } else { "dark" })),
+                    Err(e) => self.flash_error(format!("theme not saved: {e}")),
+                }
+            }
             "help" | "?" => self.mode = Mode::Help(0),
             "quit" | "exit" | "q" => self.quit = true,
             _ => self.flash_error(format!("unknown command /{name} · /help lists them")),
@@ -1737,7 +1750,7 @@ impl App {
             };
             self.receive(ME, entry, &fired.text);
             self.flash(format!("⏰ {} · in Me", first_line(&fired.text)));
-            self.note(render::ACCENT, format!("reminder   {}", first_line(&fired.text)));
+            self.note(render::accent(), format!("reminder   {}", first_line(&fired.text)));
             if visible {
                 let _ = std::io::stdout().write_all(b"\x07");
             }

@@ -17,13 +17,14 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-const USAGE: &str = "usage: hopchat [--name NICK] [--dir PATH] [--downloads PATH]
+const USAGE: &str = "usage: hopchat [--name NICK] [--dir PATH] [--downloads PATH] [--theme dark|light]
                [--echo | --say TEXT | --file PATH] [--to NICK]
                [--lobby | --group NAME [--home] [--ai]]
 
   --name NICK       what peers see you as (default: $USER)
   --dir PATH        where your identity and history live (default: ~/.hopchat/NICK)
   --downloads PATH  where received files are saved (default: ~/Downloads/hopchat)
+  --theme NAME      dark or light (default: the last /theme, else the terminal's)
   --echo            no UI: answer every message (a bot to test against)
   --say TEXT        no UI: send TEXT to the first peer that connects
   --file PATH       no UI: send the file at PATH to the first peer that connects
@@ -41,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut nick = std::env::var("USER").unwrap_or_else(|_| "anon".into());
     let mut dir: Option<PathBuf> = None;
     let mut downloads: Option<PathBuf> = None;
+    let mut theme: Option<bool> = None;
     let mut echo = false;
     let mut say: Option<String> = None;
     let mut file: Option<PathBuf> = None;
@@ -55,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--name" | "-n" => nick = args.next().ok_or(USAGE)?,
             "--dir" => dir = Some(args.next().ok_or(USAGE)?.into()),
             "--downloads" => downloads = Some(args.next().ok_or(USAGE)?.into()),
+            "--theme" => theme = Some(args.next().as_deref().and_then(ui::theme::parse).ok_or(USAGE)?),
             "--echo" => echo = true,
             "--say" => say = Some(args.next().ok_or(USAGE)?),
             "--file" => file = Some(args.next().ok_or(USAGE)?.into()),
@@ -145,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    ui::theme::init(dir.join("theme"), theme);
     let app = ui::App::new(me.nick, me.address, store, downloads, home_tx);
     let mut terminal = ratatui::init();
     enable_extras();

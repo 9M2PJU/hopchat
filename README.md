@@ -292,13 +292,14 @@ Without `--to`, `--say` and `--file` go to the first peer whose secure session c
 | `/ai share on\|off` | lend your model to people you share a group with, or stop |
 | `/clear` | delete this conversation from this device |
 | `/log` | show or hide the protocol event log |
+| `/theme` | switch between dark and light (`/theme dark`, `/theme light`) |
 | `/help` | keys and commands |
 | `/quit` | quit |
 
 ## Configuration
 
 ```
-hopchat [--name NICK] [--dir PATH] [--downloads PATH]
+hopchat [--name NICK] [--dir PATH] [--downloads PATH] [--theme dark|light]
         [--echo | --say TEXT | --file PATH] [--to NICK]
         [--lobby | --group NAME [--home] [--ai]]
 ```
@@ -308,6 +309,7 @@ hopchat [--name NICK] [--dir PATH] [--downloads PATH]
 | `--name`, `-n` | `$USER` | the name peers see |
 | `--dir` | `~/.hopchat/<name>` | where identity, history and settings live |
 | `--downloads` | `~/Downloads/hopchat` | where received files are saved |
+| `--theme` | last `/theme`, else the terminal's | `dark` or `light` |
 | `--echo` | | no UI: answer every message |
 | `--say TEXT` | | no UI: send one message |
 | `--file PATH` | | no UI: send one file |

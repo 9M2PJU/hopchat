@@ -17,7 +17,7 @@ use super::devices::{self, Devices, Primary};
 use super::groups::{Candidate, Focus, GroupPanel};
 use super::tasks::{self as task_panel, TaskPanel};
 use crate::tasks::{self, Section, Task};
-use super::theme::{self, BG, FOAM, SAGE, IRIS, PEACH, PANEL, RAISED, TEXT, ROSE, GOLD};
+use super::theme;
 use crate::lobby::LOBBY;
 use crate::me::ME;
 use super::picker::{self, Picker};
@@ -25,17 +25,15 @@ use crate::home::{self, DeviceView, ModelState, State};
 use super::{App, Convo, Mode};
 use crate::history::{Body, Entry, Status, Transfer};
 
-pub const ACCENT: Color = IRIS;
-pub const THEIRS: Color = FOAM;
-pub const OK: Color = SAGE;
-pub const WARN: Color = PEACH;
-pub const ERR: Color = theme::RED;
-pub const MUTED: Color = theme::MUTED;
-pub const FAINT: Color = theme::FAINT;
-pub const READ: Color = FOAM;
+pub fn accent() -> Color { theme::iris() }
+pub fn theirs() -> Color { theme::foam() }
+pub fn ok() -> Color { theme::sage() }
+pub fn warn() -> Color { theme::peach() }
+pub fn err() -> Color { theme::red() }
+pub fn read() -> Color { theme::foam() }
 /// Keys to press, wherever they are mentioned.
-const KEY: Color = GOLD;
-const SELECTED_BG: Color = RAISED;
+fn key_color() -> Color { theme::gold() }
+fn selected_bg() -> Color { theme::raised() }
 const SIDEBAR: u16 = 30;
 /// The most a name takes in a line of other things, so whatever follows
 /// it (a time, a hint, a key) still shows.
@@ -65,6 +63,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/me", "show and copy your own address"),
     ("/clear", "delete this conversation from this device"),
     ("/log", "show or hide the protocol event log"),
+    ("/theme", "switch between dark and light · /theme dark · /theme light"),
     ("/help", "keys and commands"),
     ("/quit", "leave"),
 ];
@@ -103,7 +102,7 @@ pub fn mention_matches(input: &str) -> Vec<(&'static str, &'static str)> {
 
 impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
-        frame.render_widget(Block::new().style(Style::new().bg(BG).fg(TEXT)), frame.area());
+        frame.render_widget(Block::new().style(Style::new().bg(theme::bg()).fg(theme::text())), frame.area());
         if self.booting() {
             self.draw_boot(frame);
             return;
@@ -156,19 +155,19 @@ impl App {
         let area = frame.area();
         let t = self.boot.map_or(i64::MAX, |at| at.elapsed().as_millis() as i64);
         let lines = vec![
-            Line::from("◌".fg(theme::fade_in(IRIS, t, 0, 500))).centered(),
+            Line::from("◌".fg(theme::fade_in(theme::iris(), t, 0, 500))).centered(),
             Line::from(""),
-            Line::from("h o p c h a t".fg(theme::fade_in(TEXT, t, 100, 600)).bold()).centered(),
+            Line::from("h o p c h a t".fg(theme::fade_in(theme::text(), t, 100, 600)).bold()).centered(),
             Line::from(""),
             Line::from(
-                "talk to the people around you, no internet needed".fg(theme::fade_in(MUTED, t, 450, 600)),
+                "talk to the people around you, no internet needed".fg(theme::fade_in(theme::muted(), t, 450, 600)),
             )
             .centered(),
             Line::from(""),
             Line::from(""),
             Line::from(vec![
-                clip(&self.me_nick, (area.width as usize).saturating_sub(24)).fg(theme::fade_in(IRIS, t, 800, 500)),
-                format!("  ·  {}", short(&self.me_address)).fg(theme::fade_in(FAINT, t, 800, 500)),
+                clip(&self.me_nick, (area.width as usize).saturating_sub(24)).fg(theme::fade_in(theme::iris(), t, 800, 500)),
+                format!("  ·  {}", short(&self.me_address)).fg(theme::fade_in(theme::faint(), t, 800, 500)),
             ])
             .centered(),
         ];
@@ -179,49 +178,49 @@ impl App {
 
     /// The strip along the top: who you are, who's around, and the time.
     fn draw_hud(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(Block::new().style(Style::new().bg(PANEL)), area);
+        frame.render_widget(Block::new().style(Style::new().bg(theme::panel())), area);
         let online = self.convos.iter().filter(|c| !c.data.group && c.online && c.secure).count();
         let clock = Local::now().format("%H:%M  ").to_string();
         let room = (area.width as usize).saturating_sub(clock.width() + 1);
 
         let nearby = match online {
-            0 => "nobody nearby yet".fg(FAINT),
-            1 => "1 person nearby".fg(MUTED),
-            n => format!("{n} people nearby").fg(MUTED),
+            0 => "nobody nearby yet".fg(theme::faint()),
+            1 => "1 person nearby".fg(theme::muted()),
+            n => format!("{n} people nearby").fg(theme::muted()),
         };
         // What's waiting for you: due first, else the next reminder, else
         // how many todos.
         let due = self.tasks.due_count();
         let waiting = if due > 0 {
-            vec!["   ".into(), format!("⏰ {due} due").fg(GOLD).bold(), " Ctrl-T".fg(FAINT)]
+            vec!["   ".into(), format!("⏰ {due} due").fg(theme::gold()).bold(), " Ctrl-T".fg(theme::faint())]
         } else if let Some(next) = self.tasks.next() {
             let at = next.due_ms.unwrap_or_default();
             let when = if at - theme::now_ms() < 60 * 60 * 1000 { tasks::until(at, theme::now_ms()) } else { self::clock(at) };
-            vec!["   ".into(), "◷ ".fg(FOAM), when.fg(MUTED), " ".into(), clip(&next.text, 24).fg(FAINT)]
+            vec!["   ".into(), "◷ ".fg(theme::foam()), when.fg(theme::muted()), " ".into(), clip(&next.text, 24).fg(theme::faint())]
         } else {
             match self.tasks.open_count() {
                 0 => Vec::new(),
-                n => vec!["   ".into(), format!("☐ {n} todo{}", if n == 1 { "" } else { "s" }).fg(MUTED)],
+                n => vec!["   ".into(), format!("☐ {n} todo{}", if n == 1 { "" } else { "s" }).fg(theme::muted())],
             }
         };
         let mut segments: Vec<Vec<Span>> = vec![
-            vec!["  hopchat".fg(IRIS).bold()],
-            vec!["   ".into(), clip(&self.me_nick, NAME_ROOM).fg(TEXT)],
-            vec!["   ".into(), "●".fg(if online > 0 { SAGE } else { FAINT }), " ".into(), nearby],
+            vec!["  hopchat".fg(theme::iris()).bold()],
+            vec!["   ".into(), clip(&self.me_nick, NAME_ROOM).fg(theme::text())],
+            vec!["   ".into(), "●".fg(if online > 0 { theme::sage() } else { theme::faint() }), " ".into(), nearby],
         ];
         if !waiting.is_empty() {
             segments.push(waiting);
         }
-        segments.push(vec!["   end-to-end · offline".fg(FAINT)]);
+        segments.push(vec!["   end-to-end · offline".fg(theme::faint())]);
         frame.render_widget(Line::from(fitting(segments, room)), area);
-        frame.render_widget(Line::from(clock.fg(FAINT)).alignment(Alignment::Right), area);
+        frame.render_widget(Line::from(clock.fg(theme::faint())).alignment(Alignment::Right), area);
     }
 
     fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::new()
             .borders(Borders::RIGHT)
             .border_style(Style::new().fg(theme::line()))
-            .style(Style::new().bg(PANEL));
+            .style(Style::new().bg(theme::panel()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -242,13 +241,13 @@ impl App {
         // Its + sits in the column of the chats' dots, its words in theirs.
         let row = Rect::new(new_group.x, new_group.y, new_group.width, 1);
         if open {
-            frame.render_widget(Block::new().style(Style::new().bg(RAISED)), row);
+            frame.render_widget(Block::new().style(Style::new().bg(theme::raised())), row);
         }
         frame.render_widget(
-            Line::from(vec![" + ".fg(IRIS), "New group".fg(if open { TEXT } else { MUTED })]),
+            Line::from(vec![" + ".fg(theme::iris()), "New group".fg(if open { theme::text() } else { theme::muted() })]),
             row,
         );
-        frame.render_widget(Line::from("Ctrl-G  ".fg(FAINT)).alignment(Alignment::Right), row);
+        frame.render_widget(Line::from("Ctrl-G  ".fg(theme::faint())).alignment(Alignment::Right), row);
         self.new_group_row = row;
 
         let width = me.width as usize;
@@ -258,10 +257,10 @@ impl App {
                 theme::rule(width),
                 Line::from(vec![
                     "   ".into(),
-                    clip(&self.me_nick, width.saturating_sub(9)).fg(IRIS).bold(),
-                    "  you".fg(FAINT),
+                    clip(&self.me_nick, width.saturating_sub(9)).fg(theme::iris()).bold(),
+                    "  you".fg(theme::faint()),
                 ]),
-                Line::from(format!("   {}", short(&self.me_address)).fg(FAINT)),
+                Line::from(format!("   {}", short(&self.me_address)).fg(theme::faint())),
             ]),
             me,
         );
@@ -282,25 +281,25 @@ impl App {
             }
             let selected = self.selected.as_deref() == Some(&convo.data.address);
             let style = if selected {
-                Style::new().bg(SELECTED_BG)
+                Style::new().bg(selected_bg())
             } else {
                 Style::new()
             };
             let dot = match (convo.data.address == LOBBY, convo.data.group, convo.online, convo.secure) {
-                (true, ..) => "◎".fg(FOAM),
-                _ if convo.data.address == ME => "◇".fg(IRIS),
-                (_, true, true, _) => "#".fg(ROSE),
-                (_, true, false, _) => "#".fg(FAINT),
-                (_, false, true, true) => "●".fg(SAGE),
-                (_, false, true, false) => "◐".fg(PEACH),
-                (_, false, false, _) => "○".fg(FAINT),
+                (true, ..) => "◎".fg(theme::foam()),
+                _ if convo.data.address == ME => "◇".fg(theme::iris()),
+                (_, true, true, _) => "#".fg(theme::rose()),
+                (_, true, false, _) => "#".fg(theme::faint()),
+                (_, false, true, true) => "●".fg(theme::sage()),
+                (_, false, true, false) => "◐".fg(theme::peach()),
+                (_, false, false, _) => "○".fg(theme::faint()),
             };
             let tint = match () {
-                _ if convo.data.group => TEXT,
+                _ if convo.data.group => theme::text(),
                 _ if convo.online => theme::person(&convo.data.address),
-                _ => MUTED,
+                _ => theme::muted(),
             };
-            let marker = if selected { "▎".fg(IRIS) } else { " ".into() };
+            let marker = if selected { "▎".fg(theme::iris()) } else { " ".into() };
             let badge = if convo.unread > 0 {
                 format!(" {} ", convo.unread.min(99))
             } else {
@@ -317,9 +316,9 @@ impl App {
             let used = 3 + UnicodeWidthStr::width(name.content.as_ref());
             let pad = width.saturating_sub(used + badge.width() + 2);
             let badge = if convo.unread > 0 {
-                Span::styled(badge, Style::new().fg(BG).bg(IRIS))
+                Span::styled(badge, Style::new().fg(theme::bg()).bg(theme::iris()))
             } else {
-                badge.fg(FAINT)
+                badge.fg(theme::faint())
             };
             let top = Line::from(vec![marker, dot, " ".into(), name, " ".repeat(pad).into(), badge]);
 
@@ -349,7 +348,7 @@ impl App {
                         },
                         address => short(address),
                     });
-                clip(&text.replace('\n', " "), width.saturating_sub(4)).fg(if selected { MUTED } else { FAINT })
+                clip(&text.replace('\n', " "), width.saturating_sub(4)).fg(if selected { theme::muted() } else { theme::faint() })
             };
             let bottom = Line::from(vec!["   ".into(), preview]);
 
@@ -361,10 +360,10 @@ impl App {
         self.peer_rows = rows;
         if alone && y < list.y + list.height {
             let lines = vec![
-                Line::from(vec!["  Looking for people".fg(MUTED), dots().fg(MUTED)]),
+                Line::from(vec!["  Looking for people".fg(theme::muted()), dots().fg(theme::muted())]),
                 Line::from(""),
-                Line::from("  Run hopchat on another".fg(FAINT)),
-                Line::from("  device on this network.".fg(FAINT)),
+                Line::from("  Run hopchat on another".fg(theme::faint())),
+                Line::from("  device on this network.".fg(theme::faint())),
             ];
             frame.render_widget(Paragraph::new(lines), Rect::new(list.x, y, list.width, list.y + list.height - y));
         }
@@ -397,16 +396,16 @@ impl App {
         let [top, line] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
         frame.render_widget(theme::rule(line.width as usize), line);
         let Some(convo) = self.current() else {
-            frame.render_widget(Line::from("  no conversation yet".fg(MUTED)), top);
+            frame.render_widget(Line::from("  no conversation yet".fg(theme::muted())), top);
             return;
         };
         let (icon, tint) = match (convo.online, convo.secure) {
-            _ if convo.data.address == LOBBY => ("◎ ".fg(FOAM), TEXT),
-            _ if convo.data.address == ME => ("◇ ".fg(IRIS), TEXT),
-            _ if convo.data.group => ("# ".fg(if convo.online { ROSE } else { FAINT }), TEXT),
-            (true, true) => ("● ".fg(SAGE), theme::person(&convo.data.address)),
-            (true, false) => ("◐ ".fg(PEACH), theme::person(&convo.data.address)),
-            (false, _) => ("○ ".fg(FAINT), MUTED),
+            _ if convo.data.address == LOBBY => ("◎ ".fg(theme::foam()), theme::text()),
+            _ if convo.data.address == ME => ("◇ ".fg(theme::iris()), theme::text()),
+            _ if convo.data.group => ("# ".fg(if convo.online { theme::rose() } else { theme::faint() }), theme::text()),
+            (true, true) => ("● ".fg(theme::sage()), theme::person(&convo.data.address)),
+            (true, false) => ("◐ ".fg(theme::peach()), theme::person(&convo.data.address)),
+            (false, _) => ("○ ".fg(theme::faint()), theme::muted()),
         };
         let state = match (convo.online, convo.secure) {
             _ if convo.data.address == LOBBY => {
@@ -415,23 +414,23 @@ impl App {
                     0 => "just you so far".to_string(),
                     n => format!("you and {n} nearby"),
                 };
-                vec![here.fg(MUTED), "  ·  everyone on this network".fg(FAINT)]
+                vec![here.fg(theme::muted()), "  ·  everyone on this network".fg(theme::faint())]
             }
             _ if convo.data.address == ME => {
-                vec!["you and your devices".fg(MUTED), "  ·  never leaves this machine".fg(FAINT)]
+                vec!["you and your devices".fg(theme::muted()), "  ·  never leaves this machine".fg(theme::faint())]
             }
             _ if convo.data.group => {
                 let n = convo.data.members.len();
                 let members = format!("{n} member{}", if n == 1 { "" } else { "s" });
                 if convo.online {
-                    vec![members.fg(MUTED), "  ·  end-to-end encrypted group".fg(FAINT)]
+                    vec![members.fg(theme::muted()), "  ·  end-to-end encrypted group".fg(theme::faint())]
                 } else {
-                    vec!["you left this group".fg(FAINT)]
+                    vec!["you left this group".fg(theme::faint())]
                 }
             }
-            (true, true) => vec!["online".fg(SAGE), "  ·  end-to-end encrypted".fg(FAINT)],
-            (true, false) => vec![format!("securing the link{}", dots()).fg(PEACH)],
-            (false, _) => vec!["away  ·  messages wait for them".fg(FAINT)],
+            (true, true) => vec!["online".fg(theme::sage()), "  ·  end-to-end encrypted".fg(theme::faint())],
+            (true, false) => vec![format!("securing the link{}", dots()).fg(theme::peach())],
+            (false, _) => vec!["away  ·  messages wait for them".fg(theme::faint())],
         };
         let width = top.width as usize;
         let name = clip(&convo.data.nick, width.saturating_sub(6)).fg(tint).bold();
@@ -452,7 +451,7 @@ impl App {
         spans.extend(fitting(segments, room));
         frame.render_widget(Line::from(spans), top);
         if let Some(address) = address {
-            frame.render_widget(Line::from(address.fg(FAINT)).alignment(Alignment::Right), top);
+            frame.render_widget(Line::from(address.fg(theme::faint())).alignment(Alignment::Right), top);
         }
     }
 
@@ -461,10 +460,10 @@ impl App {
         let Some(convo) = self.current() else {
             let lines = vec![
                 Line::from(""),
-                Line::from("Nobody here yet.".fg(MUTED)).centered(),
+                Line::from("Nobody here yet.".fg(theme::muted())).centered(),
                 Line::from(""),
-                Line::from("hopchat finds people on your local network by itself —".fg(FAINT)).centered(),
-                Line::from("start it on another laptop and they'll appear on the left.".fg(FAINT)).centered(),
+                Line::from("hopchat finds people on your local network by itself —".fg(theme::faint())).centered(),
+                Line::from("start it on another laptop and they'll appear on the left.".fg(theme::faint())).centered(),
             ];
             frame.render_widget(Paragraph::new(lines), area);
             return;
@@ -532,7 +531,7 @@ impl App {
                 "Messages you write now are delivered when they're reachable."
             };
             if !hint.is_empty() {
-                hints.push(Line::from(hint.fg(MUTED)).centered());
+                hints.push(Line::from(hint.fg(theme::muted())).centered());
             }
             rows.push((Line::from(""), None));
             for line in hints {
@@ -578,7 +577,7 @@ impl App {
             let label = format!(" ↓ {} more · Esc to jump down ", self.scroll);
             let w = label.width() as u16;
             let at = Rect::new(area.x + area.width.saturating_sub(w + 1), area.y + area.height - 1, w, 1);
-            frame.render_widget(Line::from(label.fg(TEXT).bg(RAISED)), at);
+            frame.render_widget(Line::from(label.fg(theme::text()).bg(theme::raised())), at);
         }
     }
 
@@ -593,14 +592,14 @@ impl App {
         if let Body::Notice(text) = &entry.body {
             out.push(Line::from(""));
             for row in wrap(text, width.saturating_sub(8)) {
-                out.push(Line::from(row.fg(FAINT).italic()).centered());
+                out.push(Line::from(row.fg(theme::faint()).italic()).centered());
             }
             return out;
         }
         let reminder = matches!(entry.body, Body::Reminder { .. });
         let tint = match &entry.sender {
-            _ if reminder => GOLD,
-            _ if entry.mine => IRIS,
+            _ if reminder => theme::gold(),
+            _ if entry.mine => theme::iris(),
             Some(sender) => theme::person(sender),
             None => theme::person(&convo.data.address),
         };
@@ -623,9 +622,9 @@ impl App {
                 None => convo.data.nick.clone(),
             };
             let name = clip(&name, NAME_ROOM.min(width.saturating_sub(10)));
-            let mut header = vec!["  ".into(), name.fg(tint).bold(), "  ".into(), clock(entry.at_ms).fg(FAINT)];
+            let mut header = vec!["  ".into(), name.fg(tint).bold(), "  ".into(), clock(entry.at_ms).fg(theme::faint())];
             if !entry.mine && entry.hops > 1 {
-                header.push(format!("  via {} hops", entry.hops).fg(FAINT));
+                header.push(format!("  via {} hops", entry.hops).fg(theme::faint()));
             }
             out.push(Line::from(header));
         }
@@ -639,9 +638,9 @@ impl App {
             let text = clip(&q.text.replace('\n', " "), width.saturating_sub(who.width() + 8));
             out.push(Line::from(vec![
                 gutter(),
-                "↳ ".fg(FAINT),
-                who.fg(MUTED).bold(),
-                format!(" {text}").fg(MUTED),
+                "↳ ".fg(theme::faint()),
+                who.fg(theme::muted()).bold(),
+                format!(" {text}").fg(theme::muted()),
             ]));
         }
 
@@ -686,9 +685,9 @@ impl App {
                 let name_room = width.saturating_sub(size_text.width() + 10);
                 out.push(Line::from(vec![
                     gutter(),
-                    format!(" {icon} ").bg(RAISED),
-                    clip_middle(name, name_room).fg(TEXT).bg(RAISED),
-                    format!("  {size_text} ").fg(MUTED).bg(RAISED),
+                    format!(" {icon} ").bg(theme::raised()),
+                    clip_middle(name, name_room).fg(theme::text()).bg(theme::raised()),
+                    format!("  {size_text} ").fg(theme::muted()).bg(theme::raised()),
                 ]));
                 // Lined up under the icon. The first piece always shows; the
                 // hints after it only when there's room.
@@ -701,19 +700,19 @@ impl App {
                         } else {
                             "waiting for them to come online"
                         };
-                        detail.push(format!("◷ {why}").fg(MUTED));
+                        detail.push(format!("◷ {why}").fg(theme::muted()));
                     }
                     Transfer::Moving { done, total } => {
                         let fraction = if *total == 0 { 0.0 } else { *done as f64 / *total as f64 };
                         let bar_width = (width.saturating_sub(30)).clamp(10, 30);
                         detail.extend(progress_bar(fraction, bar_width));
-                        detail.push(format!(" {:>3}%", (fraction * 100.0) as u32).fg(TEXT).bold());
+                        detail.push(format!(" {:>3}%", (fraction * 100.0) as u32).fg(theme::text()).bold());
                         if let Some(rate) = self.rate(&entry.id, *size, fraction) {
-                            detail.push(format!("  {rate}").fg(MUTED));
+                            detail.push(format!("  {rate}").fg(theme::muted()));
                         }
                     }
                     Transfer::Done if entry.mine => {
-                        detail.push("sent".fg(MUTED));
+                        detail.push("sent".fg(theme::muted()));
                         if let Some(tick) = &tick {
                             detail.push("  ".into());
                             detail.push(tick.clone());
@@ -721,19 +720,19 @@ impl App {
                     }
                     Transfer::Done => {
                         let saved = clip_start(&picker::tilde(path), width.saturating_sub(14));
-                        detail.push("saved to ".fg(MUTED));
-                        detail.push(saved.fg(MUTED).underlined());
-                        hint = Some("  click, then o to open".fg(FAINT));
+                        detail.push("saved to ".fg(theme::muted()));
+                        detail.push(saved.fg(theme::muted()).underlined());
+                        hint = Some("  click, then o to open".fg(theme::faint()));
                     }
                     Transfer::Failed(reason) => {
-                        detail.push(format!("✗ {}", clip(reason, width.saturating_sub(6))).fg(ERR));
+                        detail.push(format!("✗ {}", clip(reason, width.saturating_sub(6))).fg(err()));
                         if entry.mine {
-                            hint = Some("  click, then R to retry".fg(FAINT));
+                            hint = Some("  click, then R to retry".fg(theme::faint()));
                         }
                     }
                     Transfer::Interrupted => {
-                        detail.push("interrupted when hopchat closed".fg(WARN));
-                        hint = Some("  click, then R to retry".fg(FAINT));
+                        detail.push("interrupted when hopchat closed".fg(warn()));
+                        hint = Some("  click, then R to retry".fg(theme::faint()));
                     }
                 }
                 let used: usize = detail.iter().map(Span::width).sum();
@@ -744,23 +743,23 @@ impl App {
             }
             Body::Reminder { task, text, from } => {
                 for row in wrap(text, width.saturating_sub(6)) {
-                    out.push(Line::from(vec![gutter(), format!(" {row} ").fg(TEXT).bg(RAISED).bold()]));
+                    out.push(Line::from(vec![gutter(), format!(" {row} ").fg(theme::text()).bg(theme::raised()).bold()]));
                 }
                 // What has happened to it since, from the list itself.
                 let now = theme::now_ms();
                 let state = match self.tasks.get(task) {
-                    None => "deleted".fg(FAINT),
-                    Some(t) if t.done() => "✓ done".fg(OK),
-                    Some(t) if t.due() => "due".fg(GOLD).bold(),
+                    None => "deleted".fg(theme::faint()),
+                    Some(t) if t.done() => "✓ done".fg(ok()),
+                    Some(t) if t.due() => "due".fg(theme::gold()).bold(),
                     Some(t) => match (t.repeat, t.due_ms) {
-                        (Some(r), Some(at)) => format!("↻ {} · next {}", r.describe(), tasks::when_label(at, Local::now())).fg(MUTED),
-                        (None, Some(at)) => format!("snoozed until {}", clock(at)).fg(MUTED),
-                        _ => "on your todo list".fg(MUTED),
+                        (Some(r), Some(at)) => format!("↻ {} · next {}", r.describe(), tasks::when_label(at, Local::now())).fg(theme::muted()),
+                        (None, Some(at)) => format!("snoozed until {}", clock(at)).fg(theme::muted()),
+                        _ => "on your todo list".fg(theme::muted()),
                     },
                 };
                 let mut detail = vec![gutter(), " ".into(), state];
                 if let Some(from) = from {
-                    detail.push(format!("  ·  set in {}", clip(from, NAME_ROOM)).fg(FAINT));
+                    detail.push(format!("  ·  set in {}", clip(from, NAME_ROOM)).fg(theme::faint()));
                 }
                 let hint = match self.tasks.get(task) {
                     Some(t) if t.due() => "  ·  click, then x done · s snooze",
@@ -769,7 +768,7 @@ impl App {
                 };
                 let used: usize = detail.iter().map(Span::width).sum();
                 if used + hint.width() <= width {
-                    detail.push(hint.fg(FAINT));
+                    detail.push(hint.fg(theme::faint()));
                 }
                 out.push(Line::from(detail));
             }
@@ -797,24 +796,24 @@ impl App {
 
     fn draw_composer(&self, frame: &mut Frame, area: Rect) {
         let focused = matches!(self.mode, Mode::Normal);
-        let edge = if focused { theme::dim(IRIS) } else { theme::mix(FAINT, BG, 0.3) };
+        let edge = if focused { theme::dim(theme::iris()) } else { theme::mix(theme::faint(), theme::bg(), 0.3) };
         // The name gets what the corners, " to " and the send hint leave.
-        let send_hint = Line::from(vec![" enter ".fg(MUTED), "to send ".fg(FAINT)]);
+        let send_hint = Line::from(vec![" enter ".fg(theme::muted()), "to send ".fg(theme::faint())]);
         let name_room = (area.width as usize).saturating_sub(2 + 4 + 1 + send_hint.width() + 2);
         let to = match self.current() {
-            Some(c) if c.data.address == LOBBY => vec!["everyone nearby".fg(FOAM)],
-            Some(c) if c.data.address == ME => vec!["yourself".fg(IRIS)],
-            Some(c) if c.data.group => vec![clip(&format!("#{}", c.data.nick), name_room).fg(ROSE)],
+            Some(c) if c.data.address == LOBBY => vec!["everyone nearby".fg(theme::foam())],
+            Some(c) if c.data.address == ME => vec!["yourself".fg(theme::iris())],
+            Some(c) if c.data.group => vec![clip(&format!("#{}", c.data.nick), name_room).fg(theme::rose())],
             Some(c) => vec![clip(&c.data.nick, name_room).fg(theme::person(&c.data.address))],
-            None => vec!["nobody yet".fg(MUTED)],
+            None => vec!["nobody yet".fg(theme::muted())],
         };
-        let mut title = vec![" to ".fg(FAINT)];
+        let mut title = vec![" to ".fg(theme::faint())];
         title.extend(to);
         title.push(" ".into());
         let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(edge))
-            .style(Style::new().bg(PANEL))
+            .style(Style::new().bg(theme::panel()))
             .padding(Padding::horizontal(1))
             .title(Line::from(title));
         if name_room > 0 {
@@ -837,10 +836,10 @@ impl App {
             let cancel = if fixed + 8 + cancel.width() <= room { cancel } else { "" };
             let text = clip(&entry_summary(target).replace('\n', " "), room.saturating_sub(fixed + cancel.width()));
             lines.push(Line::from(vec![
-                "↳ replying to ".fg(FAINT),
-                who.fg(IRIS),
-                format!("  {text}").fg(MUTED),
-                cancel.fg(FAINT),
+                "↳ replying to ".fg(theme::faint()),
+                who.fg(theme::iris()),
+                format!("  {text}").fg(theme::muted()),
+                cancel.fg(theme::faint()),
             ]));
         }
         if !self.attachments.is_empty() {
@@ -856,16 +855,16 @@ impl App {
                 let left = self.attachments.len() - i - 1;
                 let more = if left > 0 { format!("+{left} more  ").width() } else { 0 };
                 if i > 0 && used + chip.width() + 1 + more.max(removes.width()) > room {
-                    spans.push(format!("+{} more  ", left + 1).fg(MUTED));
+                    spans.push(format!("+{} more  ", left + 1).fg(theme::muted()));
                     break;
                 }
                 used += chip.width() + 1;
-                spans.push(chip.fg(TEXT).bg(RAISED));
+                spans.push(chip.fg(theme::text()).bg(theme::raised()));
                 spans.push(" ".into());
             }
             let used: usize = spans.iter().map(Span::width).sum();
             if used + removes.width() <= room {
-                spans.push(removes.fg(FAINT));
+                spans.push(removes.fg(theme::faint()));
             }
             lines.push(Line::from(spans));
         }
@@ -874,7 +873,7 @@ impl App {
         let (rows, (cx, cy)) = self.editor.layout(text_width);
         let first_row = cy.saturating_sub(7);
         let top = lines.len() as u16;
-        let prompt = || "› ".fg(if focused { IRIS } else { FAINT });
+        let prompt = || "› ".fg(if focused { theme::iris() } else { theme::faint() });
         if self.editor.is_empty() {
             let hint = match self.current() {
                 _ if !self.attachments.is_empty() => "add a message, or just press Enter to send".to_string(),
@@ -892,8 +891,8 @@ impl App {
             };
             // Whole hints only: the tail ones drop off when it's narrow.
             let mut parts = hint.split("  ·  ");
-            let first = clip(parts.next().unwrap_or_default(), text_width).fg(FAINT);
-            let rest: Vec<Vec<Span>> = parts.map(|p| vec![format!("  ·  {p}").fg(FAINT)]).collect();
+            let first = clip(parts.next().unwrap_or_default(), text_width).fg(theme::faint());
+            let rest: Vec<Vec<Span>> = parts.map(|p| vec![format!("  ·  {p}").fg(theme::faint())]).collect();
             let mut spans = vec![prompt(), first];
             let used: usize = spans.iter().map(Span::width).sum();
             spans.extend(fitting(rest, (inner.width as usize).saturating_sub(used)));
@@ -903,7 +902,7 @@ impl App {
                 let lead = if i == 0 { prompt() } else { "  ".into() };
                 let mut spans = vec![lead];
                 if self.editor.text().starts_with('/') && i == 0 {
-                    spans.push(Span::raw(row.clone()).fg(IRIS));
+                    spans.push(Span::raw(row.clone()).fg(theme::iris()));
                 } else {
                     spans.extend(rich(row));
                 }
@@ -940,13 +939,13 @@ impl App {
                 .enumerate()
                 .map(|(i, (name, help))| {
                     let line = Line::from(vec![
-                        format!(" {name:<12}").fg(IRIS),
-                        clip(help, help_width).fg(MUTED),
+                        format!(" {name:<12}").fg(theme::iris()),
+                        clip(help, help_width).fg(theme::muted()),
                     ]);
-                    if i == 0 { line.style(Style::new().bg(RAISED)) } else { line }
+                    if i == 0 { line.style(Style::new().bg(theme::raised())) } else { line }
                 })
                 .collect();
-            let inner = float(frame, popup, panel_block("").title(title.fg(FAINT)));
+            let inner = float(frame, popup, panel_block("").title(title.fg(theme::faint())));
             frame.render_widget(Paragraph::new(lines), inner);
         }
     }
@@ -955,13 +954,13 @@ impl App {
         let block = Block::new()
             .borders(Borders::LEFT)
             .border_style(Style::new().fg(theme::line()))
-            .style(Style::new().bg(PANEL));
+            .style(Style::new().bg(theme::panel()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         // A header like the chat's, on the same line.
         let [title, rule, inner] =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).areas(inner);
-        frame.render_widget(Line::from(vec![" protocol".fg(MUTED), "  events as they happen".fg(FAINT)]), title);
+        frame.render_widget(Line::from(vec![" protocol".fg(theme::muted()), "  events as they happen".fg(theme::faint())]), title);
         frame.render_widget(theme::rule(rule.width as usize), rule);
         junction(frame, area.x, rule.y, "┼");
         let height = inner.height as usize;
@@ -973,7 +972,7 @@ impl App {
 
     /// The keys that work right now, as buttons: each can be clicked too.
     fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(Block::new().style(Style::new().bg(PANEL)), area);
+        frame.render_widget(Block::new().style(Style::new().bg(theme::panel())), area);
         let ctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         let press = |code: KeyCode| Some(KeyEvent::from(code));
         let on_reminder = match self.mode {
@@ -1069,22 +1068,22 @@ impl App {
         // Right side: what's happening. It wins the room over the keys.
         let mut right: Vec<Span> = Vec::new();
         if let Some((text, error)) = self.flash_text() {
-            let (mark, tone) = if error { ("✗ ", ERR) } else { ("✓ ", SAGE) };
+            let (mark, tone) = if error { ("✗ ", err()) } else { ("✓ ", theme::sage()) };
             right.push(mark.fg(tone));
             // Never more than half the strip: the keys keep the rest.
             let room = 60.min((area.width as usize / 2).saturating_sub(4));
-            right.push(clip(text, room).fg(if error { ERR } else { TEXT }));
+            right.push(clip(text, room).fg(if error { err() } else { theme::text() }));
             right.push("  ".into());
         }
         for incoming in self.incoming.values().take(2) {
             let pct = (incoming.done * 100).checked_div(incoming.total).unwrap_or(0);
             right.push(
                 format!("⇣ {} {}% of {}  ", clip_middle(&incoming.name, 18), pct, human_size(incoming.size))
-                    .fg(FOAM),
+                    .fg(theme::foam()),
             );
         }
         if !self.show_log && right.is_empty() && matches!(self.mode, Mode::Normal) {
-            right.push("Ctrl-E log ".fg(FAINT));
+            right.push("Ctrl-E log ".fg(theme::faint()));
         }
         let right = Line::from(right).alignment(Alignment::Right);
         let right_width = (right.width() as u16).min(area.width);
@@ -1103,8 +1102,8 @@ impl App {
             if let Some(event) = event {
                 self.footer_hits.push((Rect::new(x, area.y, w - 2, 1), event));
             }
-            spans.push(cap.fg(KEY).bg(RAISED));
-            spans.push(label.fg(FAINT));
+            spans.push(cap.fg(key_color()).bg(theme::raised()));
+            spans.push(label.fg(theme::faint()));
             x += w;
         }
         frame.render_widget(Line::from(spans), area);
@@ -1120,9 +1119,9 @@ fn rich(row: &str) -> Vec<Span<'static>> {
         let bare = word.trim_end();
         let gap = &word[bare.len()..];
         let styled = if bare.len() > 1 && bare.starts_with('@') {
-            bare.to_string().fg(GOLD)
+            bare.to_string().fg(theme::gold())
         } else if bare.starts_with("http://") || bare.starts_with("https://") {
-            bare.to_string().fg(FOAM).underlined()
+            bare.to_string().fg(theme::foam()).underlined()
         } else {
             Span::raw(bare.to_string())
         };
@@ -1143,12 +1142,12 @@ fn dots() -> &'static str {
 fn panel_block(title: &str) -> Block<'static> {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme::dim(IRIS)))
-        .style(Style::new().bg(PANEL).fg(TEXT));
+        .border_style(Style::new().fg(theme::dim(theme::iris())))
+        .style(Style::new().bg(theme::panel()).fg(theme::text()));
     if title.is_empty() {
         return block;
     }
-    block.title(Line::from(format!(" {title} ").fg(TEXT).bold()))
+    block.title(Line::from(format!(" {title} ").fg(theme::text()).bold()))
 }
 
 /// Draws `block` floating over whatever is under `area`, with a shadow,
@@ -1160,8 +1159,8 @@ fn float(frame: &mut Frame, area: Rect, block: Block) -> Rect {
     let bottom = area.bottom();
     let mut shade = |x: u16, y: u16| {
         if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_bg(theme::SHADOW);
-            cell.set_fg(theme::mix(FAINT, theme::SHADOW, 0.6));
+            cell.set_bg(theme::shadow());
+            cell.set_fg(theme::mix(theme::faint(), theme::shadow(), 0.6));
         }
     };
     if right < screen.right() {
@@ -1205,13 +1204,13 @@ impl App {
         let added = view.devices.iter().filter(|d| d.added).count();
         for (i, d) in view.devices.iter().enumerate() {
             if i == 0 && d.added {
-                lines.push(Line::from(" Your devices".fg(MUTED).bold()));
+                lines.push(Line::from(" Your devices".fg(theme::muted()).bold()));
             }
             if i == added {
                 if added > 0 {
                     lines.push(Line::from(""));
                 }
-                lines.push(Line::from(" Found on this network".fg(MUTED).bold()));
+                lines.push(Line::from(" Found on this network".fg(theme::muted()).bold()));
             }
             if i == selected {
                 selected_row = lines.len();
@@ -1221,32 +1220,32 @@ impl App {
         if view.devices.is_empty() {
             lines.push(Line::from(""));
             if view.scanning {
-                lines.push(Line::from(format!("  {} Looking for Wiz lights and LG TVs on this network…", spinner()).fg(MUTED)));
+                lines.push(Line::from(format!("  {} Looking for Wiz lights and LG TVs on this network…", spinner()).fg(theme::muted())));
             } else {
-                lines.push(Line::from("  Nothing found.".fg(MUTED)));
+                lines.push(Line::from("  Nothing found.".fg(theme::muted())));
                 lines.push(Line::from(""));
-                lines.push(Line::from("  Devices have to be on the same network as this machine, and switched on.".fg(FAINT)));
-                lines.push(Line::from("  r scans again · /home add IP adds one by its address".fg(FAINT)));
+                lines.push(Line::from("  Devices have to be on the same network as this machine, and switched on.".fg(theme::faint())));
+                lines.push(Line::from("  r scans again · /home add IP adds one by its address".fg(theme::faint())));
             }
         } else if view.scanning && !view.devices.iter().any(|d| !d.added) {
             lines.push(Line::from(""));
-            lines.push(Line::from(format!("  {} looking for more…", spinner()).fg(FAINT)));
+            lines.push(Line::from(format!("  {} looking for more…", spinner()).fg(theme::faint())));
         }
         if !view.scanning && !view.devices.iter().any(|d| d.kind == home::Kind::Tv) {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                "  📺 No TV? ".fg(MUTED),
-                "A TV only shows up while it's switched on. Turn it on, then ".fg(FAINT),
-                "r".fg(KEY).bold(),
-                ".".fg(FAINT),
+                "  📺 No TV? ".fg(theme::muted()),
+                "A TV only shows up while it's switched on. Turn it on, then ".fg(theme::faint()),
+                "r".fg(key_color()).bold(),
+                ".".fg(theme::faint()),
             ]));
         }
         // Tall enough for what's listed, up to most of the screen.
         let area = fit(screen, 96, lines.len() as u16 + 3 + 4 + 2);
         let status = if view.scanning {
-            format!(" {} scanning ", spinner()).fg(FOAM)
+            format!(" {} scanning ", spinner()).fg(theme::foam())
         } else {
-            " r rescans ".fg(MUTED)
+            " r rescans ".fg(theme::muted())
         };
         let block = panel_block("Devices").title(Line::from(status).alignment(Alignment::Right));
         let inner = float(frame, area, block);
@@ -1270,106 +1269,106 @@ impl App {
 
     fn devices_footer(&self, width: usize) -> Vec<Line<'static>> {
         let view = &self.home_view;
-        let rule = Line::from("─".repeat(width).fg(FAINT));
+        let rule = Line::from("─".repeat(width).fg(theme::faint()));
         let model = match view.model_state {
-            ModelState::Ready => vec!["● ".fg(OK), clip(&view.model, 32).bold(), " ready".fg(MUTED)],
+            ModelState::Ready => vec!["● ".fg(ok()), clip(&view.model, 32).bold(), " ready".fg(theme::muted())],
             // The command is what matters, and is only any use whole.
             ModelState::Missing => vec![
-                "◐ ".fg(WARN),
-                "not downloaded · ".fg(WARN),
-                format!("ollama pull {}", view.model).fg(ACCENT),
+                "◐ ".fg(warn()),
+                "not downloaded · ".fg(warn()),
+                format!("ollama pull {}", view.model).fg(accent()),
             ],
             ModelState::NoServer => vec![
-                "○ ".fg(ERR),
-                "Ollama isn't running · start it with ".fg(WARN),
-                "ollama serve".fg(ACCENT),
+                "○ ".fg(err()),
+                "Ollama isn't running · start it with ".fg(warn()),
+                "ollama serve".fg(accent()),
             ],
-            ModelState::Unknown => vec![format!("{} ", spinner()).fg(MUTED), "checking…".fg(MUTED)],
+            ModelState::Unknown => vec![format!("{} ", spinner()).fg(theme::muted()), "checking…".fg(theme::muted())],
         };
-        let mut model_line = vec!["  Model   ".fg(MUTED)];
+        let mut model_line = vec!["  Model   ".fg(theme::muted())];
         model_line.extend(model);
         // Without a model here, home thinks with a group member's.
         if view.model_state != ModelState::Ready && !view.lenders.is_empty() {
             model_line = vec![
-                "  Model   ".fg(MUTED),
-                "● ".fg(OK),
-                "borrowing ".fg(MUTED),
+                "  Model   ".fg(theme::muted()),
+                "● ".fg(ok()),
+                "borrowing ".fg(theme::muted()),
                 clip(&view.lenders.join(", "), width.saturating_sub(24)).bold(),
             ];
         } else if view.model_state == ModelState::Ready && view.share {
-            model_line.push("  · lent to the group".fg(FAINT));
+            model_line.push("  · lent to the group".fg(theme::faint()));
         }
         let access = match self.home_here() {
-            None if self.in_me() => vec!["◇ ".fg(IRIS), "Me".bold(), ": always yours".fg(MUTED)],
+            None if self.in_me() => vec!["◇ ".fg(theme::iris()), "Me".bold(), ": always yours".fg(theme::muted())],
             Some((id, name, true)) if id == LOBBY => vec![
-                "# ".fg(ACCENT),
+                "# ".fg(accent()),
                 clip(&name, NAME_ROOM).bold(),
-                ": everyone nearby can use them".fg(OK),
-                "  · g lets only you".fg(FAINT),
+                ": everyone nearby can use them".fg(ok()),
+                "  · g lets only you".fg(theme::faint()),
             ],
             Some((id, name, false)) if id == LOBBY => vec![
-                "# ".fg(ACCENT),
+                "# ".fg(accent()),
                 clip(&name, NAME_ROOM).bold(),
-                ": only you can use them".fg(MUTED),
-                "  · g lets everyone nearby in".fg(ACCENT),
+                ": only you can use them".fg(theme::muted()),
+                "  · g lets everyone nearby in".fg(accent()),
             ],
             Some((_, name, true)) => vec![
-                "# ".fg(ACCENT),
+                "# ".fg(accent()),
                 clip(&name, NAME_ROOM).bold(),
-                " can use them".fg(OK),
-                "  · g switches off".fg(FAINT),
+                " can use them".fg(ok()),
+                "  · g switches off".fg(theme::faint()),
             ],
             Some((_, name, false)) => vec![
-                "# ".fg(FAINT),
+                "# ".fg(theme::faint()),
                 clip(&name, NAME_ROOM).bold(),
-                " can't use them".fg(MUTED),
-                "  · g lets this group in".fg(ACCENT),
+                " can't use them".fg(theme::muted()),
+                "  · g lets this group in".fg(accent()),
             ],
             None => {
                 let n = view.groups.len();
                 vec![
-                    format!("on in {n} group{}", if n == 1 { "" } else { "s" }).fg(MUTED),
-                    "  · open a group, then g to let it in".fg(FAINT),
+                    format!("on in {n} group{}", if n == 1 { "" } else { "s" }).fg(theme::muted()),
+                    "  · open a group, then g to let it in".fg(theme::faint()),
                 ]
             }
         };
-        let mut access_line = vec!["  Access  ".fg(MUTED)];
+        let mut access_line = vec!["  Access  ".fg(theme::muted())];
         access_line.extend(access);
         let ai = match self.ai_here() {
-            None if self.in_me() => vec!["◇ ".fg(IRIS), "Me".bold(), ": always answers you".fg(MUTED)],
+            None if self.in_me() => vec!["◇ ".fg(theme::iris()), "Me".bold(), ": always answers you".fg(theme::muted())],
             Some((id, name, true)) if id == LOBBY => vec![
-                "# ".fg(ACCENT),
+                "# ".fg(accent()),
                 clip(&name, NAME_ROOM).bold(),
-                ": everyone nearby can ask the model".fg(OK),
-                "  · i lets only you".fg(FAINT),
+                ": everyone nearby can ask the model".fg(ok()),
+                "  · i lets only you".fg(theme::faint()),
             ],
             Some((id, name, false)) if id == LOBBY => vec![
-                "# ".fg(ACCENT),
+                "# ".fg(accent()),
                 clip(&name, NAME_ROOM).bold(),
-                ": only you can ask the model".fg(MUTED),
-                "  · i lets everyone nearby ask".fg(ACCENT),
+                ": only you can ask the model".fg(theme::muted()),
+                "  · i lets everyone nearby ask".fg(accent()),
             ],
             Some((_, name, true)) => vec![
-                "# ".fg(ACCENT),
+                "# ".fg(accent()),
                 clip(&name, NAME_ROOM).bold(),
-                " can ask the model with @ai".fg(OK),
-                "  · i switches off".fg(FAINT),
+                " can ask the model with @ai".fg(ok()),
+                "  · i switches off".fg(theme::faint()),
             ],
             Some((_, name, false)) => vec![
-                "# ".fg(FAINT),
+                "# ".fg(theme::faint()),
                 clip(&name, NAME_ROOM).bold(),
-                " can't ask the model".fg(MUTED),
-                "  · i lets it ask with @ai".fg(ACCENT),
+                " can't ask the model".fg(theme::muted()),
+                "  · i lets it ask with @ai".fg(accent()),
             ],
             None => {
                 let n = view.ai_groups.len();
                 vec![
-                    format!("on in {n} group{}", if n == 1 { "" } else { "s" }).fg(MUTED),
-                    "  · open a group, then i to let it ask the model".fg(FAINT),
+                    format!("on in {n} group{}", if n == 1 { "" } else { "s" }).fg(theme::muted()),
+                    "  · open a group, then i to let it ask the model".fg(theme::faint()),
                 ]
             }
         };
-        let mut ai_line = vec!["  @ai     ".fg(MUTED)];
+        let mut ai_line = vec!["  @ai     ".fg(theme::muted())];
         ai_line.extend(ai);
         vec![
             rule,
@@ -1393,9 +1392,9 @@ impl App {
         };
         let picked = people.iter().filter(|p| panel.is_picked(&p.address)).count();
         let count = if picked == 0 {
-            " Space picks people ".fg(MUTED)
+            " Space picks people ".fg(theme::muted())
         } else {
-            format!(" {picked} picked ").fg(BG).bg(SAGE).bold()
+            format!(" {picked} picked ").fg(theme::bg()).bg(theme::sage()).bold()
         };
         let block = panel_block(&title).title(Line::from(count).alignment(Alignment::Right));
         let inner = float(frame, area, block);
@@ -1412,14 +1411,14 @@ impl App {
             let room = (name.width as usize).saturating_sub(12);
             let shown = if naming { clip_start(&panel.name, room) } else { clip(&panel.name, room) };
             let field = if panel.name.is_empty() && !naming {
-                "untitled".fg(FAINT)
+                "untitled".fg(theme::faint())
             } else if panel.name.is_empty() {
-                "e.g. house, weekend trip".fg(FAINT)
+                "e.g. house, weekend trip".fg(theme::faint())
             } else {
                 Span::raw(shown.clone()).bold()
             };
-            let label = if naming { " Name  › ".fg(ACCENT).bold() } else { " Name  › ".fg(MUTED) };
-            frame.render_widget(Line::from(vec![label, "#".fg(ACCENT), field]), name);
+            let label = if naming { " Name  › ".fg(accent()).bold() } else { " Name  › ".fg(theme::muted()) };
+            frame.render_widget(Line::from(vec![label, "#".fg(accent()), field]), name);
             if naming {
                 let x = name.x + 10 + shown.width() as u16;
                 frame.set_cursor_position(Position::new(x.min(name.right().saturating_sub(1)), name.y));
@@ -1427,23 +1426,23 @@ impl App {
         }
 
         let width = list.width as usize;
-        let mut lines = vec![Line::from(" People".fg(MUTED).bold())];
+        let mut lines = vec![Line::from(" People".fg(theme::muted()).bold())];
         let in_list = panel.focus == Focus::People;
         for (i, person) in people.iter().enumerate() {
             lines.push(candidate_line(person, panel, in_list && i == panel.cursor, width));
         }
         if people.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::from("  Nobody nearby yet.".fg(MUTED)));
-            lines.push(Line::from("  You can still create it now and add people later with /invite.".fg(FAINT)));
+            lines.push(Line::from("  Nobody nearby yet.".fg(theme::muted())));
+            lines.push(Line::from("  You can still create it now and add people later with /invite.".fg(theme::faint())));
         }
         let height = list.height as usize;
         let skip = (panel.cursor + 3).saturating_sub(height);
         let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
         frame.render_widget(Paragraph::new(lines), list);
 
-        let key = |k: &str| k.to_string().fg(KEY).bold();
-        let say = |t: &str| t.to_string().fg(MUTED);
+        let key = |k: &str| k.to_string().fg(key_color()).bold();
+        let say = |t: &str| t.to_string().fg(theme::muted());
         let names: Vec<String> = people
             .iter()
             .filter(|p| panel.is_picked(&p.address))
@@ -1451,14 +1450,14 @@ impl App {
             .collect();
         let who = if names.is_empty() { "just you".to_string() } else { format!("you, {}", names.join(", ")) };
         let first = match (panel.warning, &panel.target) {
-            (Some(warning), _) => Line::from(vec!["  ".into(), warning.fg(WARN)]),
+            (Some(warning), _) => Line::from(vec!["  ".into(), warning.fg(warn())]),
             (None, Some(_)) => Line::from(vec!["  ".into(), key("Space"), say(" picks someone · "), key("Enter"), say(" invites them")]),
             (None, None) if panel.focus == Focus::Name => Line::from(vec!["  ".into(), say("Name it, then "), key("↓"), say(" to pick people · "), key("Enter"), say(" creates it")]),
             (None, None) => Line::from(vec!["  ".into(), key("Space"), say(" picks · "), key("↑"), say(" back to the name · "), key("Enter"), say(" creates it")]),
         };
         let second = match &panel.target {
-            Some(_) => Line::from(vec!["  ".into(), clip(&format!("Adding: {}", if names.is_empty() { "nobody yet".into() } else { names.join(", ") }), width.saturating_sub(4)).fg(FAINT)]),
-            None => Line::from(vec!["  ".into(), clip(&format!("In it: {who}"), width.saturating_sub(4)).fg(FAINT)]),
+            Some(_) => Line::from(vec!["  ".into(), clip(&format!("Adding: {}", if names.is_empty() { "nobody yet".into() } else { names.join(", ") }), width.saturating_sub(4)).fg(theme::faint())]),
+            None => Line::from(vec!["  ".into(), clip(&format!("In it: {who}"), width.saturating_sub(4)).fg(theme::faint())]),
         };
         frame.render_widget(Paragraph::new(vec![Line::from(""), first, second]), help);
     }
@@ -1479,9 +1478,9 @@ impl App {
         let due = self.tasks.due_count();
         let open = self.tasks.open_count();
         let count = match (due, open) {
-            (0, 0) => " nothing to do ".fg(MUTED),
-            (0, n) => format!(" {n} open ").fg(MUTED),
-            (d, _) => format!(" {d} due ").fg(BG).bg(GOLD).bold(),
+            (0, 0) => " nothing to do ".fg(theme::muted()),
+            (0, n) => format!(" {n} open ").fg(theme::muted()),
+            (d, _) => format!(" {d} due ").fg(theme::bg()).bg(theme::gold()).bold(),
         };
         let block = panel_block("Todos & reminders").title(Line::from(count).alignment(Alignment::Right));
         let inner = float(frame, area, block);
@@ -1498,7 +1497,7 @@ impl App {
         // The line to type into.
         let typing = panel.focus == task_panel::Focus::Input;
         let label = if panel.editing.is_some() { " Edit › " } else { " Add  › " };
-        let label = if typing { label.fg(ACCENT).bold() } else { label.fg(MUTED) };
+        let label = if typing { label.fg(accent()).bold() } else { label.fg(theme::muted()) };
         let lead = label.width();
         let room = (field.width as usize).saturating_sub(lead + 1).max(1);
         let text = panel.input.text();
@@ -1524,7 +1523,7 @@ impl App {
             out
         };
         let value = if text.is_empty() {
-            if typing { "buy milk · call mom at 5pm · stretch in 20m".fg(FAINT) } else { "".into() }
+            if typing { "buy milk · call mom at 5pm · stretch in 20m".fg(theme::faint()) } else { "".into() }
         } else {
             Span::raw(shown)
         };
@@ -1538,29 +1537,29 @@ impl App {
         let pad = " ".repeat(lead);
         let width = reads.width as usize;
         let reading = match panel.warning {
-            Some(warning) => Line::from(vec![pad.into(), warning.fg(WARN)]),
+            Some(warning) => Line::from(vec![pad.into(), warning.fg(warn())]),
             None if text.trim().is_empty() => Line::from(vec![
                 pad.into(),
-                clip("a time makes it a reminder: tomorrow 9am, every weekday at 9:30", width.saturating_sub(lead)).fg(FAINT),
+                clip("a time makes it a reminder: tomorrow 9am, every weekday at 9:30", width.saturating_sub(lead)).fg(theme::faint()),
             ]),
             None => {
                 let draft = panel.draft();
                 let now = Local::now();
                 let mut spans: Vec<Span> = vec![pad.into()];
                 match draft.due {
-                    Some(due) if due <= now => spans.push("that time has already passed".fg(WARN)),
+                    Some(due) if due <= now => spans.push("that time has already passed".fg(warn())),
                     Some(due) => {
                         let ms = due.timestamp_millis();
-                        spans.push("◷ reminder ".fg(FOAM).bold());
-                        spans.push(tasks::when_label(ms, now).fg(TEXT));
-                        spans.push(format!(" · {}", tasks::until(ms, now.timestamp_millis())).fg(MUTED));
+                        spans.push("◷ reminder ".fg(theme::foam()).bold());
+                        spans.push(tasks::when_label(ms, now).fg(theme::text()));
+                        spans.push(format!(" · {}", tasks::until(ms, now.timestamp_millis())).fg(theme::muted()));
                         if let Some(r) = draft.repeat {
-                            spans.push(format!(" · ↻ {}", r.describe()).fg(MUTED));
+                            spans.push(format!(" · ↻ {}", r.describe()).fg(theme::muted()));
                         }
                     }
                     None => {
-                        spans.push("☐ todo".fg(SAGE).bold());
-                        spans.push("  add a time to be reminded".fg(FAINT));
+                        spans.push("☐ todo".fg(theme::sage()).bold());
+                        spans.push("  add a time to be reminded".fg(theme::faint()));
                     }
                 }
                 Line::from(fitting(spans.into_iter().map(|s| vec![s]).collect(), width))
@@ -1579,10 +1578,10 @@ impl App {
             let section = Section::of(task);
             if last != Some(section) {
                 let n = list.iter().filter(|t| Section::of(t) == section).count();
-                let tone = if section == Section::Due { GOLD } else { MUTED };
+                let tone = if section == Section::Due { theme::gold() } else { theme::muted() };
                 let mut heading = vec![format!(" {}", section.title()).fg(tone).bold()];
                 if section == Section::Done {
-                    heading.push(format!(" · {n}").fg(FAINT));
+                    heading.push(format!(" · {n}").fg(theme::faint()));
                 }
                 lines.push(Line::from(heading));
                 last = Some(section);
@@ -1594,16 +1593,16 @@ impl App {
         }
         if list.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::from("  Nothing yet. Type above, then Enter.".fg(MUTED)));
-            lines.push(Line::from("  Or press t on any message to keep it here.".fg(FAINT)));
+            lines.push(Line::from("  Nothing yet. Type above, then Enter.".fg(theme::muted())));
+            lines.push(Line::from("  Or press t on any message to keep it here.".fg(theme::faint())));
         }
         let height = body.height as usize;
         let skip = (cursor_row + 2).saturating_sub(height);
         let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
         frame.render_widget(Paragraph::new(lines), body);
 
-        let key = |k: &str| k.to_string().fg(KEY).bold();
-        let say = |t: &str| t.to_string().fg(MUTED);
+        let key = |k: &str| k.to_string().fg(key_color()).bold();
+        let say = |t: &str| t.to_string().fg(theme::muted());
         let current = panel.current(&self.tasks);
         let first = match (typing, current) {
             (true, _) if panel.editing.is_some() => Line::from(vec!["  ".into(), key("Enter"), say(" saves · "), key("Esc"), say(" stops editing")]),
@@ -1614,37 +1613,37 @@ impl App {
         let second = match current.and_then(|t| t.origin.as_ref()) {
             Some(origin) if !typing => Line::from(vec![
                 "  ".into(),
-                clip(&format!("set in {}", origin.name), width.saturating_sub(20)).fg(FAINT),
+                clip(&format!("set in {}", origin.name), width.saturating_sub(20)).fg(theme::faint()),
                 "  ".into(),
                 key("o"),
                 say(" goes there"),
             ]),
             _ if !typing && self.tasks.items.iter().any(Task::done) => Line::from(vec!["  ".into(), key("c"), say(" clears what's done")]),
-            _ => Line::from(vec!["  ".into(), "Reminders ring in Me, even from another chat.".fg(FAINT)]),
+            _ => Line::from(vec!["  ".into(), "Reminders ring in Me, even from another chat.".fg(theme::faint())]),
         };
         frame.render_widget(Paragraph::new(vec![Line::from(""), first, second]), help);
     }
 }
 
 fn task_line(task: &Task, selected: bool, width: usize) -> Line<'static> {
-    let marker = if selected { "▎".fg(ACCENT) } else { " ".into() };
+    let marker = if selected { "▎".fg(accent()) } else { " ".into() };
     let now = Local::now();
     let now_ms = now.timestamp_millis();
     let check = match Section::of(task) {
-        Section::Done => "[✓]".fg(OK),
-        Section::Due => "[!]".fg(GOLD).bold(),
-        _ => "[ ]".fg(MUTED),
+        Section::Done => "[✓]".fg(ok()),
+        Section::Due => "[!]".fg(theme::gold()).bold(),
+        _ => "[ ]".fg(theme::muted()),
     };
     // On the right: when, and how it repeats; where it came from if room.
     let mut meta: Vec<Span<'static>> = Vec::new();
     match (Section::of(task), task.due_ms) {
-        (Section::Due, Some(at)) => meta.push(format!("due {}", tasks::until(at, now_ms)).fg(GOLD)),
+        (Section::Due, Some(at)) => meta.push(format!("due {}", tasks::until(at, now_ms)).fg(theme::gold())),
         (Section::Upcoming, Some(at)) => {
             if let Some(r) = task.repeat {
-                meta.push(format!("↻ {} · ", r.describe()).fg(FAINT));
+                meta.push(format!("↻ {} · ", r.describe()).fg(theme::faint()));
             }
-            meta.push(tasks::when_label(at, now).fg(FOAM));
-            meta.push(format!(" · {}", tasks::until(at, now_ms)).fg(MUTED));
+            meta.push(tasks::when_label(at, now).fg(theme::foam()));
+            meta.push(format!(" · {}", tasks::until(at, now_ms)).fg(theme::muted()));
         }
         (Section::Done, _) => {}
         _ => {}
@@ -1662,33 +1661,33 @@ fn task_line(task: &Task, selected: bool, width: usize) -> Line<'static> {
     let text = clip(&task.text, room);
     let pad = room.saturating_sub(text.width());
     let text = match () {
-        _ if task.done() => text.fg(FAINT).crossed_out(),
-        _ if selected => text.fg(TEXT).bold(),
-        _ => text.fg(TEXT),
+        _ if task.done() => text.fg(theme::faint()).crossed_out(),
+        _ if selected => text.fg(theme::text()).bold(),
+        _ => text.fg(theme::text()),
     };
     let mut spans = vec![marker, " ".into(), check, " ".into(), text, " ".repeat(pad + 1).into()];
     if show_origin {
-        spans.push(origin.fg(FAINT));
+        spans.push(origin.fg(theme::faint()));
     }
     spans.extend(meta);
     let line = Line::from(spans);
-    if selected { line.style(Style::new().bg(SELECTED_BG)) } else { line }
+    if selected { line.style(Style::new().bg(selected_bg())) } else { line }
 }
 
 fn candidate_line(person: &Candidate, panel: &GroupPanel, selected: bool, width: usize) -> Line<'static> {
-    let marker = if selected { "▎".fg(ACCENT) } else { " ".into() };
+    let marker = if selected { "▎".fg(accent()) } else { " ".into() };
     let pickable = person.pickable();
     let check = match () {
-        _ if person.member => "[✓]".fg(FAINT),
-        _ if panel.is_picked(&person.address) => "[✓]".fg(ACCENT).bold(),
-        _ if pickable => "[ ]".fg(MUTED),
-        _ => "[ ]".fg(FAINT),
+        _ if person.member => "[✓]".fg(theme::faint()),
+        _ if panel.is_picked(&person.address) => "[✓]".fg(accent()).bold(),
+        _ if pickable => "[ ]".fg(theme::muted()),
+        _ => "[ ]".fg(theme::faint()),
     };
     let (dot, state) = match (person.member, person.online, person.secure) {
-        (true, _, _) => ("●".fg(FAINT), "already in the group".fg(FAINT)),
-        (false, true, true) => ("●".fg(OK), "online".fg(MUTED)),
-        (false, true, false) => ("◐".fg(WARN), "connecting…".fg(WARN)),
-        (false, false, _) => ("○".fg(FAINT), "offline · can't be added now".fg(FAINT)),
+        (true, _, _) => ("●".fg(theme::faint()), "already in the group".fg(theme::faint())),
+        (false, true, true) => ("●".fg(ok()), "online".fg(theme::muted())),
+        (false, true, false) => ("◐".fg(warn()), "connecting…".fg(warn())),
+        (false, false, _) => ("○".fg(theme::faint()), "offline · can't be added now".fg(theme::faint())),
     };
     let name = clip(&person.nick, 20);
     let pad = 22usize.saturating_sub(name.width());
@@ -1697,7 +1696,7 @@ fn candidate_line(person: &Candidate, panel: &GroupPanel, selected: bool, width:
     let address = if 30 + state.width() + 2 + address.width() < width { address } else { String::new() };
     let state = Span::styled(clip(&state.content, width.saturating_sub(31)), state.style);
     let name = if !pickable {
-        name.fg(FAINT)
+        name.fg(theme::faint())
     } else if selected {
         name.bold()
     } else {
@@ -1714,9 +1713,9 @@ fn candidate_line(person: &Candidate, panel: &GroupPanel, selected: bool, width:
         " ".repeat(pad).into(),
         state,
         "  ".into(),
-        address.fg(FAINT),
+        address.fg(theme::faint()),
     ]);
-    if selected { line.style(Style::new().bg(SELECTED_BG)) } else { line }
+    if selected { line.style(Style::new().bg(selected_bg())) } else { line }
 }
 
 fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) -> Line<'static> {
@@ -1725,19 +1724,19 @@ fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) ->
         home::Kind::Tv => "📺",
     };
     let (dot, state) = match &d.state {
-        State::Ready => ("●".fg(OK), d.detail.clone().fg(TEXT)),
-        State::Offline => ("○".fg(FAINT), d.detail.clone().fg(MUTED)),
-        State::Checking => (spinner().fg(MUTED), "checking…".fg(MUTED)),
-        State::New => ("✦".fg(ACCENT), d.detail.clone().fg(MUTED)),
+        State::Ready => ("●".fg(ok()), d.detail.clone().fg(theme::text())),
+        State::Offline => ("○".fg(theme::faint()), d.detail.clone().fg(theme::muted())),
+        State::Checking => (spinner().fg(theme::muted()), "checking…".fg(theme::muted())),
+        State::New => ("✦".fg(accent()), d.detail.clone().fg(theme::muted())),
         State::Pairing { until } => {
             let left = until.saturating_duration_since(std::time::Instant::now()).as_secs();
-            (spinner().fg(WARN), format!("waiting for the TV · {left}s").fg(WARN))
+            (spinner().fg(warn()), format!("waiting for the TV · {left}s").fg(warn()))
         }
-        State::Failed(_) => ("✗".fg(ERR), "didn't work".fg(ERR)),
+        State::Failed(_) => ("✗".fg(err()), "didn't work".fg(err())),
     };
-    let marker = if selected { "▎".fg(ACCENT) } else { " ".into() };
+    let marker = if selected { "▎".fg(accent()) } else { " ".into() };
     let name = match &panel.renaming {
-        Some(typed) if selected => Span::from(format!("{}▏", clip_start(typed, 21))).fg(ACCENT).bold(),
+        Some(typed) if selected => Span::from(format!("{}▏", clip_start(typed, 21))).fg(accent()).bold(),
         _ if selected => Span::from(clip(&d.name, 22)).bold(),
         _ => Span::from(clip(&d.name, 22)),
     };
@@ -1751,33 +1750,33 @@ fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) ->
         format!("{icon} ").into(),
         name,
         " ".repeat(name_pad + 2).into(),
-        format!("{ip:<15}").fg(FAINT),
+        format!("{ip:<15}").fg(theme::faint()),
         "  ".into(),
         dot,
         " ".into(),
         state,
     ]);
-    if selected { line.style(Style::new().bg(SELECTED_BG)) } else { line }
+    if selected { line.style(Style::new().bg(selected_bg())) } else { line }
 }
 
 /// Two lines under the list saying what the selected device needs.
 fn device_help(d: Option<&DeviceView>, panel: &Devices, width: usize) -> Vec<Line<'static>> {
-    let key = |k: &str| k.to_string().fg(KEY).bold();
-    let say = |t: &str| t.to_string().fg(MUTED);
+    let key = |k: &str| k.to_string().fg(key_color()).bold();
+    let say = |t: &str| t.to_string().fg(theme::muted());
     let Some(d) = d else { return Vec::new() };
     if panel.renaming.is_some() {
         return vec![Line::from(""), Line::from(vec!["  ".into(), say("Type a name people will use, like "), "Desk lamp".bold(), say(". "), key("Enter"), say(" saves.")])];
     }
     if panel.confirm_forget {
-        return vec![Line::from(""), Line::from(vec!["  ".into(), format!("Forget {}? ", clip(&d.name, NAME_ROOM)).fg(WARN), key("x"), say(" again to forget, anything else keeps it.")])];
+        return vec![Line::from(""), Line::from(vec!["  ".into(), format!("Forget {}? ", clip(&d.name, NAME_ROOM)).fg(warn()), key("x"), say(" again to forget, anything else keeps it.")])];
     }
     let lines = match (&d.state, devices::primary(d)) {
         (State::Pairing { .. }, _) => vec![
-            Line::from(vec!["  ".into(), "Look at the TV: it's asking whether to allow hopchat.".fg(WARN).bold()]),
+            Line::from(vec!["  ".into(), "Look at the TV: it's asking whether to allow hopchat.".fg(warn()).bold()]),
             Line::from(vec!["  ".into(), say("Choose "), "Allow".bold(), say(" with the remote. Nothing to do here.")]),
         ],
         (State::Failed(why), _) => vec![
-            Line::from(vec!["  ".into(), clip(why, width.saturating_sub(4)).fg(ERR)]),
+            Line::from(vec!["  ".into(), clip(why, width.saturating_sub(4)).fg(err())]),
             Line::from(vec!["  ".into(), key("Enter"), say(" tries again")]),
         ],
         (_, Primary::Pair) => vec![
@@ -1802,7 +1801,7 @@ fn device_help(d: Option<&DeviceView>, panel: &Devices, width: usize) -> Vec<Lin
                 Line::from(vec!["  ".into(), say("In a group, people ask for it by name: "), match d.kind {
                     home::Kind::Light => format!("@home dim the {}", clip(&d.name.to_lowercase(), NAME_ROOM)),
                     home::Kind::Tv => format!("@home put netflix on the {}", clip(&d.name.to_lowercase(), NAME_ROOM)),
-                }.fg(THEIRS)]),
+                }.fg(theirs())]),
             ]
         }
     };
@@ -1821,7 +1820,7 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
         } else {
             format!(" {} marked · Enter sends them ", picker.marked.len())
         })
-        .fg(MUTED),
+        .fg(theme::muted()),
     );
     let inner = float(frame, area, block);
     let [path, filter, list] = Layout::vertical([
@@ -1839,19 +1838,19 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
         path,
     );
     let filter_line = if picker.filter.is_empty() {
-        Line::from(vec![" 🔍 ".into(), "type to filter · . shows hidden files".fg(FAINT)])
+        Line::from(vec![" 🔍 ".into(), "type to filter · . shows hidden files".fg(theme::faint())])
     } else {
-        Line::from(vec![" 🔍 ".into(), picker.filter.clone().fg(GOLD)])
+        Line::from(vec![" 🔍 ".into(), picker.filter.clone().fg(theme::gold())])
     };
     frame.render_widget(filter_line, filter);
 
     if let Some(error) = &picker.error {
-        frame.render_widget(Line::from(format!("  {error}").fg(ERR)), list);
+        frame.render_widget(Line::from(format!("  {error}").fg(err())), list);
         return;
     }
     let visible = picker.visible();
     if visible.is_empty() {
-        frame.render_widget(Line::from("  nothing here".fg(MUTED)), list);
+        frame.render_widget(Line::from("  nothing here".fg(theme::muted())), list);
         return;
     }
     let height = list.height as usize;
@@ -1863,7 +1862,7 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
         .skip(start)
         .take(height)
         .map(|(i, entry)| {
-            let mark = if picker.is_marked(entry) { "◆ ".fg(SAGE) } else { "  ".into() };
+            let mark = if picker.is_marked(entry) { "◆ ".fg(theme::sage()) } else { "  ".into() };
             let (icon, name, size) = if entry.dir {
                 ("📁".to_string(), format!("{}/", entry.name), String::new())
             } else {
@@ -1875,15 +1874,15 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
             let line = Line::from(vec![
                 mark,
                 format!("{icon} ").into(),
-                if entry.dir { name.fg(FOAM).bold() } else { name.into() },
+                if entry.dir { name.fg(theme::foam()).bold() } else { name.into() },
                 " ".repeat(pad).into(),
-                size.fg(MUTED),
+                size.fg(theme::muted()),
                 " ".into(),
             ]);
             if i == picker.selected {
                 let mut line = line;
-                line.spans[0] = if picker.is_marked(entry) { "◆ ".fg(SAGE) } else { "▎ ".fg(IRIS) };
-                line.style(Style::new().bg(SELECTED_BG))
+                line.spans[0] = if picker.is_marked(entry) { "◆ ".fg(theme::sage()) } else { "▎ ".fg(theme::iris()) };
+                line.style(Style::new().bg(selected_bg()))
             } else {
                 line
             }
@@ -1908,12 +1907,12 @@ fn draw_help(frame: &mut Frame, at: usize) -> usize {
             .enumerate()
             .map(|(i, row)| {
                 let k = if i == 0 { format!("  {k:<16} ") } else { " ".repeat(key_width) };
-                Line::from(vec![k.fg(KEY).bold(), row.fg(TEXT)])
+                Line::from(vec![k.fg(key_color()).bold(), row.fg(theme::text())])
             })
             .collect()
     };
     let section = |title: &str, rows: &[(&str, &str)], width: usize| -> Vec<Line<'static>> {
-        let mut out = vec![Line::from(vec!["  ".into(), title.to_string().fg(ROSE).bold()])];
+        let mut out = vec![Line::from(vec!["  ".into(), title.to_string().fg(theme::rose()).bold()])];
         for (k, what) in rows {
             out.extend(key(k, what, width));
         }
@@ -1967,7 +1966,7 @@ fn draw_help(frame: &mut Frame, at: usize) -> usize {
         out.extend(section("Elsewhere", elsewhere, width));
         out.extend(section("Commands  (type / to see them)", COMMANDS, width));
         out.extend(wrap_line(
-            Line::from("  To select text with the mouse, hold Shift (Option in iTerm/Terminal).".fg(FAINT)),
+            Line::from("  To select text with the mouse, hold Shift (Option in iTerm/Terminal).".fg(theme::faint())),
             width,
         ));
         out
@@ -1977,13 +1976,13 @@ fn draw_help(frame: &mut Frame, at: usize) -> usize {
     let width = inner.width as usize;
     let intro = wrap_line(
         Line::from(vec![
-            "  Everything is clickable too: ".fg(MUTED),
-            "chats".fg(TEXT).bold(),
-            " on the left, ".fg(MUTED),
-            "messages".fg(TEXT).bold(),
-            ", and the ".fg(MUTED),
-            "keys".fg(KEY).bold(),
-            " along the bottom.".fg(MUTED),
+            "  Everything is clickable too: ".fg(theme::muted()),
+            "chats".fg(theme::text()).bold(),
+            " on the left, ".fg(theme::muted()),
+            "messages".fg(theme::text()).bold(),
+            ", and the ".fg(theme::muted()),
+            "keys".fg(key_color()).bold(),
+            " along the bottom.".fg(theme::muted()),
         ]),
         width.saturating_sub(2),
     );
@@ -2002,15 +2001,15 @@ fn draw_help(frame: &mut Frame, at: usize) -> usize {
     let at = at.min(max);
 
     let mut block = panel_block("hopchat · help").title_bottom(Line::from(vec![
-        " ✓ on the wire · ".fg(MUTED),
-        "✓✓".fg(SAGE),
-        " delivered · ".fg(MUTED),
-        "✓✓".fg(READ),
-        " read ".fg(MUTED),
+        " ✓ on the wire · ".fg(theme::muted()),
+        "✓✓".fg(theme::sage()),
+        " delivered · ".fg(theme::muted()),
+        "✓✓".fg(read()),
+        " read ".fg(theme::muted()),
     ]));
     if max > 0 {
         let more = if at < max { " ↓ more " } else { " ↑ top " };
-        block = block.title_bottom(Line::from(more.fg(KEY)).alignment(Alignment::Right));
+        block = block.title_bottom(Line::from(more.fg(key_color())).alignment(Alignment::Right));
     }
     let inner = float(frame, area, block);
     let [top, body] =
@@ -2041,18 +2040,18 @@ fn lobby_hint(others: bool, open: bool) -> Vec<Line<'static>> {
     };
     let private = if others {
         Line::from(vec![
-            "Click someone on the left".fg(TEXT).bold(),
-            " (or Tab) for a private chat, end-to-end encrypted.".fg(MUTED),
+            "Click someone on the left".fg(theme::text()).bold(),
+            " (or Tab) for a private chat, end-to-end encrypted.".fg(theme::muted()),
         ])
     } else {
         Line::from("")
     };
     vec![
-        Line::from(who.fg(MUTED)).centered(),
+        Line::from(who.fg(theme::muted())).centered(),
         private.centered(),
         Line::from(""),
-        Line::from(vec!["@home".fg(GOLD).bold(), " turn the lights down".fg(MUTED)]).centered(),
-        Line::from(vec!["@ai".fg(GOLD).bold(), " ask your model anything".fg(MUTED)]).centered(),
+        Line::from(vec!["@home".fg(theme::gold()).bold(), " turn the lights down".fg(theme::muted())]).centered(),
+        Line::from(vec!["@ai".fg(theme::gold()).bold(), " ask your model anything".fg(theme::muted())]).centered(),
         Line::from(""),
         Line::from(
             if open {
@@ -2060,7 +2059,7 @@ fn lobby_hint(others: bool, open: bool) -> Vec<Line<'static>> {
             } else {
                 "Only you can use them here until you say otherwise (Ctrl-D)."
             }
-            .fg(FAINT),
+            .fg(theme::faint()),
         )
         .centered(),
     ]
@@ -2069,11 +2068,11 @@ fn lobby_hint(others: bool, open: bool) -> Vec<Line<'static>> {
 /// What an empty Me says: what it is, and what you can say to it.
 fn me_hint(view: &home::View) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from("◇".fg(IRIS)).centered(),
+        Line::from("◇".fg(theme::iris())).centered(),
         Line::from(""),
-        Line::from("A space that's only yours.".fg(TEXT)).centered(),
-        Line::from("Jot things down, talk to your devices, ask your model.".fg(MUTED)).centered(),
-        Line::from("Nothing written here leaves this machine.".fg(FAINT)).centered(),
+        Line::from("A space that's only yours.".fg(theme::text())).centered(),
+        Line::from("Jot things down, talk to your devices, ask your model.".fg(theme::muted())).centered(),
+        Line::from("Nothing written here leaves this machine.".fg(theme::faint())).centered(),
         Line::from(""),
     ];
     let names: Vec<&str> = view.devices.iter().filter(|d| d.added).map(|d| d.name.as_str()).collect();
@@ -2082,15 +2081,15 @@ fn me_hint(view: &home::View) -> Vec<Line<'static>> {
         Some(d) => format!(" dim the {} to 30%", d.name.to_lowercase()),
         None => " turn the lights down".to_string(),
     };
-    lines.push(Line::from(vec!["@home".fg(GOLD), example.fg(MUTED)]).centered());
-    lines.push(Line::from(vec!["@ai".fg(GOLD), " what should I cook tonight?".fg(MUTED)]).centered());
-    lines.push(Line::from(vec!["/remind".fg(GOLD), " stretch in 20m".fg(MUTED), "  ·  reminders ring here".fg(FAINT)]).centered());
+    lines.push(Line::from(vec!["@home".fg(theme::gold()), example.fg(theme::muted())]).centered());
+    lines.push(Line::from(vec!["@ai".fg(theme::gold()), " what should I cook tonight?".fg(theme::muted())]).centered());
+    lines.push(Line::from(vec!["/remind".fg(theme::gold()), " stretch in 20m".fg(theme::muted()), "  ·  reminders ring here".fg(theme::faint())]).centered());
     lines.push(Line::from(""));
     lines.push(
         if names.is_empty() {
-            Line::from(vec!["No devices yet: ".fg(FAINT), "Ctrl-D".fg(KEY), " finds them.".fg(FAINT)])
+            Line::from(vec!["No devices yet: ".fg(theme::faint()), "Ctrl-D".fg(key_color()), " finds them.".fg(theme::faint())])
         } else {
-            Line::from(format!("Your devices: {}", names.join(", ")).fg(FAINT))
+            Line::from(format!("Your devices: {}", names.join(", ")).fg(theme::faint()))
         }
         .centered(),
     );
@@ -2112,7 +2111,7 @@ fn fit(screen: Rect, max: u16, rows: u16) -> Rect {
 
 fn progress_bar(fraction: f64, width: usize) -> Vec<Span<'static>> {
     let filled = ((fraction.clamp(0.0, 1.0)) * width as f64).round() as usize;
-    vec!["━".repeat(filled).fg(IRIS), "─".repeat(width - filled).fg(FAINT)]
+    vec!["━".repeat(filled).fg(theme::iris()), "─".repeat(width - filled).fg(theme::faint())]
 }
 
 fn highlight_line(line: Line<'static>, width: usize) -> Line<'static> {
@@ -2121,20 +2120,20 @@ fn highlight_line(line: Line<'static>, width: usize) -> Line<'static> {
     if used < width {
         line.spans.push(" ".repeat(width - used).into());
     }
-    line.style(Style::new().bg(SELECTED_BG))
+    line.style(Style::new().bg(selected_bg()))
 }
 
 fn tick(status: &Status) -> Span<'static> {
     match status {
-        Status::Queued => "◷".fg(FAINT),
-        Status::Waiting(_) => "◷ waiting".fg(FAINT),
-        Status::Retrying(n) => format!("↻ retry {n}").fg(WARN),
-        Status::Sent => "✓".fg(MUTED),
-        Status::Delivered { hops, ms } if *hops > 1 => format!("✓✓ {hops} hops").fg(OK),
-        Status::Delivered { ms, .. } if *ms > 0 => format!("✓✓ {ms}ms").fg(OK),
-        Status::Delivered { .. } => "✓✓".fg(OK),
-        Status::Read => "✓✓ read".fg(READ),
-        Status::Failed(reason) => format!("✗ {}", clip(reason, 30)).fg(ERR),
+        Status::Queued => "◷".fg(theme::faint()),
+        Status::Waiting(_) => "◷ waiting".fg(theme::faint()),
+        Status::Retrying(n) => format!("↻ retry {n}").fg(warn()),
+        Status::Sent => "✓".fg(theme::muted()),
+        Status::Delivered { hops, ms } if *hops > 1 => format!("✓✓ {hops} hops").fg(ok()),
+        Status::Delivered { ms, .. } if *ms > 0 => format!("✓✓ {ms}ms").fg(ok()),
+        Status::Delivered { .. } => "✓✓".fg(ok()),
+        Status::Read => "✓✓ read".fg(read()),
+        Status::Failed(reason) => format!("✗ {}", clip(reason, 30)).fg(err()),
     }
 }
 
@@ -2209,7 +2208,7 @@ fn day_separator(ms: i64, width: usize) -> Line<'static> {
     let side = width.saturating_sub(label_width) / 2;
     Line::from(vec![
         "─".repeat(side).fg(theme::line()),
-        label.fg(MUTED),
+        label.fg(theme::muted()),
         "─".repeat(width.saturating_sub(side + label_width)).fg(theme::line()),
     ])
 }
@@ -2480,7 +2479,7 @@ pub fn short(address: &str) -> String {
 
 pub fn log_line(at: &str, color: Color, text: String) -> Line<'static> {
     Line::from(vec![
-        format!("{at} ").fg(FAINT),
+        format!("{at} ").fg(theme::faint()),
         Span::styled(text, Style::new().fg(color)),
     ])
 }
@@ -2496,7 +2495,7 @@ pub fn describe(event: &Event, nick: impl Fn(&str) -> String) -> Option<Line<'st
             encrypted,
             ..
         } => (
-            THEIRS,
+            theirs(),
             format!(
                 "recv       {} {}hop {transport}{}",
                 nick(sender),
@@ -2508,18 +2507,18 @@ pub fn describe(event: &Event, nick: impl Fn(&str) -> String) -> Option<Line<'st
             message_id,
             latency_ms,
             ..
-        } => (OK, format!("ack        {} {latency_ms}ms", id8(message_id))),
+        } => (ok(), format!("ack        {} {latency_ms}ms", id8(message_id))),
         Event::MessageDeferred { message_id, reason, .. } => {
-            (MUTED, format!("deferred   {} {reason}", id8(message_id)))
+            (theme::muted(), format!("deferred   {} {reason}", id8(message_id)))
         }
         Event::MessageRetrying {
             message_id,
             retry_count,
             ..
-        } => (WARN, format!("retry #{retry_count}   {}", id8(message_id))),
+        } => (warn(), format!("retry #{retry_count}   {}", id8(message_id))),
         Event::MessageFailed { message_id, reason, .. }
         | Event::MessageUndeliverable { message_id, reason, .. } => {
-            (ERR, format!("failed     {} {reason}", id8(message_id)))
+            (err(), format!("failed     {} {reason}", id8(message_id)))
         }
         Event::MessageRelayed {
             sender,
@@ -2531,10 +2530,10 @@ pub fn describe(event: &Event, nick: impl Fn(&str) -> String) -> Option<Line<'st
             format!("relay      {}→{} hop {hop_count}", nick(sender), nick(recipient)),
         ),
         Event::SecureSessionFailed { peer_id, reason } => {
-            (ERR, format!("mls failed {} {reason}", nick(peer_id)))
+            (err(), format!("mls failed {} {reason}", nick(peer_id)))
         }
         Event::SecurityWarning { peer_id, reason, .. } => {
-            (WARN, format!("warning    {} {reason}", nick(peer_id)))
+            (warn(), format!("warning    {} {reason}", nick(peer_id)))
         }
         _ => return None,
     };
