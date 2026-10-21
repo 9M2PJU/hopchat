@@ -315,14 +315,24 @@ pub fn open(
     ))
 }
 
+/// A key that exists but cannot be read is an error, never replaced: a new
+/// key would make every store and all history undecryptable.
 fn load_or_create_key(path: &Path) -> std::io::Result<[u8; 32]> {
-    if let Ok(bytes) = std::fs::read(path)
-        && let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) {
-            return Ok(key);
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            return <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                std::io::Error::other(format!("{} is damaged: expected 32 bytes, found {}", path.display(), bytes.len()))
+            });
         }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        Err(_) => {}
+    }
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).map_err(|e| std::io::Error::other(e.to_string()))?;
-    write_private(path, &key)?;
+    // Written aside and renamed, so a crash never leaves a short key behind.
+    let fresh = path.with_extension("new");
+    write_private(&fresh, &key)?;
+    std::fs::rename(&fresh, path)?;
     Ok(key)
 }
 
@@ -330,13 +340,14 @@ fn load_or_create_key(path: &Path) -> std::io::Result<[u8; 32]> {
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)?
-        .write_all(bytes)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 #[cfg(not(unix))]
