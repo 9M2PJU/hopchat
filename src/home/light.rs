@@ -40,8 +40,8 @@ impl Caps {
 pub trait LightDriver: Sync {
     fn caps(&self, d: &Device) -> Caps;
     /// The scenes it has built in, by the names people say.
-    fn scenes(&self) -> &'static [&'static str] {
-        &[]
+    fn scenes(&self, _d: &Device) -> Vec<String> {
+        Vec::new()
     }
     fn set(&self, d: &Device, pilot: &Pilot) -> Result<(), String>;
     /// A one-line description of what it is doing now.
@@ -60,11 +60,11 @@ impl Home {
     }
 
     /// Every scene some light here has.
-    pub(super) fn scenes(&self) -> Vec<&'static str> {
-        let mut scenes: Vec<&'static str> = Vec::new();
-        for (driver, _) in self.lights() {
-            for scene in driver.scenes() {
-                if !scenes.contains(scene) {
+    pub(super) fn scenes(&self) -> Vec<String> {
+        let mut scenes: Vec<String> = Vec::new();
+        for (driver, d) in self.lights() {
+            for scene in driver.scenes(&d) {
+                if !scenes.contains(&scene) {
                     scenes.push(scene);
                 }
             }
@@ -136,7 +136,7 @@ impl Home {
         let scene = text(args, "scene");
         if let Some(s) = &scene {
             let wanted = scene_key(s);
-            if !lights.iter().any(|(l, _)| l.scenes().iter().any(|n| scene_key(n) == wanted)) {
+            if !lights.iter().any(|(l, d)| l.scenes(d).iter().any(|n| scene_key(n) == wanted)) {
                 return Err(format!("no scene called {s}"));
             }
         }

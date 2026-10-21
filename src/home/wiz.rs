@@ -86,8 +86,8 @@ impl LightDriver for Wiz {
         caps_of(module(d))
     }
 
-    fn scenes(&self) -> &'static [&'static str] {
-        SCENE_NAMES
+    fn scenes(&self, _d: &Device) -> Vec<String> {
+        SCENE_NAMES.iter().map(|s| s.to_string()).collect()
     }
 
     fn set(&self, d: &Device, pilot: &Pilot) -> Result<(), String> {
