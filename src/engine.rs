@@ -208,6 +208,9 @@ pub struct Engine {
     events: Receiver<Event>,
     /// Files waiting for a session or a free slot, oldest first.
     outbox: VecDeque<PendingFile>,
+    /// When to try the outbox again after the SDK refused a transfer, so a
+    /// waiting file is not read from disk every tick.
+    files_due: Instant,
     downloads: PathBuf,
     /// Where group messages that mention `@home` or `@ai` go, when home is
     /// running.
@@ -301,6 +304,7 @@ pub fn open(
             updates,
             events,
             outbox: VecDeque::new(),
+            files_due: Instant::now(),
             downloads,
             home: None,
             nicks: HashMap::new(),
@@ -648,7 +652,7 @@ impl Engine {
     // ----- lending and borrowing models (see home::lend) -----------------
 
     fn send_hidden(&mut self, to: &str, wire: &home::lend::Wire) {
-        if let Err(e) = self.protocol.send_message_with(to, &wire.encode(), SendMessageOptions::default()) {
+        if let Err(e) = self.protocol.send_message_with(to, wire.encode(), SendMessageOptions::default()) {
             self.error(format!("model message to {}: {e}", self.nick_or_address(to)));
         }
     }
@@ -823,12 +827,14 @@ impl Engine {
             size,
         });
         self.outbox.push_back(PendingFile { to, path, file_id });
+        self.files_due = Instant::now();
     }
 
     /// Hands queued files to the SDK as sessions and transfer slots allow.
     /// A file that cannot start yet keeps its place; the rest still try.
     fn start_files(&mut self) {
         let mut waiting = VecDeque::new();
+        let mut refused = false;
         while let Some(file) = self.outbox.pop_front() {
             if !self.streams.contains_key(&file.to) || !self.session_ready(&file.to) {
                 waiting.push_back(file);
@@ -853,12 +859,16 @@ impl Engine {
             {
                 Ok(_) => {}
                 Err(ProtocolError::SessionNotReady(_) | ProtocolError::MediaTransferLimit(_)) => {
+                    refused = true;
                     waiting.push_back(file)
                 }
                 Err(e) => self.file_failed(file.file_id, e.to_string()),
             }
         }
         self.outbox = waiting;
+        if refused {
+            self.files_due = Instant::now() + Duration::from_secs(1);
+        }
     }
 
     fn file_failed(&self, file_id: String, reason: String) {
@@ -895,7 +905,7 @@ impl Engine {
 
     /// One turn of the engine: run timers, surface chat, flush the wire.
     fn pump(&mut self) {
-        if !self.outbox.is_empty() {
+        if !self.outbox.is_empty() && Instant::now() >= self.files_due {
             self.start_files();
         }
         if let Err(e) = self.protocol.process() {
