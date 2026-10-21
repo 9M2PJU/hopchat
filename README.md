@@ -40,7 +40,7 @@ It's also a remote control for the room you're in. Mention `@home` to dim the li
 ## Features
 
 **Chat**
-- **Serverless.** Peers on the same network discover each other over UDP multicast. Your identity is a key on your disk, so there are no accounts.
+- **Serverless.** Peers on the same network discover each other over UDP multicast and DNS-SD. Your identity is a key on your disk, so there are no accounts.
 - **End-to-end encrypted.** Direct messages, groups and the lobby all travel inside MLS (RFC 9420). History on disk is sealed with XChaCha20-Poly1305.
 - **Lobby.** A room everyone nearby is in by default, pinned at the top of the sidebar.
 - **Me.** A private space for notes and for talking to your own devices and model. Nothing in it goes on the network.
@@ -307,6 +307,7 @@ The SDK does no I/O itself, so hopchat supplies the platform bridge for its peer
 | Component | Where | Role |
 | --- | --- | --- |
 | Discovery | `src/net.rs` | UDP multicast beacon on `239.255.42.99:47999` announcing `address, tcp port, nick` every 2 s. The lower address dials. |
+| DNS-SD | `src/dnssd.rs` | Publishes and browses `_offlineprotocol._tcp` with TXT `txtvers=1`, `addr=<address>`, the record every Offline Protocol SDK app uses, so SDK apps on iOS, Android and Python find hopchat too. A record is a hint; the stream's preamble must prove `addr`. |
 | Streams | `src/net.rs` | One TCP connection per peer. The first frame each way is the SDK's signed identity assertion, checked with `verify_identity_assertion`. |
 | Engine | `src/engine.rs` | Owns `OfflineProtocol` on one thread. It feeds frames in, routes outgoing messages to streams, queues file transfers, and forwards events to the UI. |
 | Lobby | `src/lobby.rs` | Not an MLS group. Each message is a hidden one-to-one message to every peer with a session, sharing one id so replies line up. |

@@ -3,6 +3,7 @@
 //! Peers on the same network find each other with no server and no
 //! internet; every conversation is end-to-end encrypted with MLS.
 
+mod dnssd;
 mod engine;
 mod history;
 mod home;

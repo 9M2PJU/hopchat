@@ -1,5 +1,5 @@
-//! The LAN bridge: finds peers with a UDP multicast beacon and carries
-//! frames over one TCP stream per peer.
+//! The LAN bridge: finds peers with a UDP multicast beacon and with DNS-SD
+//! (see `dnssd`), and carries frames over one TCP stream per peer.
 //!
 //! The SDK performs no I/O, so this module is the "platform" half of its
 //! peer-stream (`wifi_direct`) slot. Every stream opens with the identity
@@ -16,12 +16,20 @@ use std::time::Duration;
 
 use offline_protocol_mls::verify_identity_assertion;
 use offline_protocol_transport::stream_framing::{frame, PeerStreamReader, StreamEvent};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+
+use crate::dnssd;
 
 const MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
 const DISCOVERY_PORT: u16 = 47_999;
 const BEACON_MAGIC: &str = "hopchat/1";
 const BEACON_INTERVAL: Duration = Duration::from_secs(2);
+/// TCP keepalive, matching the SDK's peer-stream managers: a phone that was
+/// suspended leaves a half-open stream, and a new one from it is refused
+/// until this one is noticed dead.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const KEEPALIVE_RETRIES: u32 = 3;
 
 /// What the network tells the engine.
 pub enum NetEvent {
@@ -45,7 +53,7 @@ pub struct LocalIdentity {
 
 /// Addresses with a live, announced stream. Shared so a second stream to the
 /// same peer can be refused instead of announced twice.
-type Announced = Arc<Mutex<HashSet<String>>>;
+pub type Announced = Arc<Mutex<HashSet<String>>>;
 
 pub fn start(me: LocalIdentity, events: Sender<NetEvent>) -> std::io::Result<u16> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
@@ -60,6 +68,9 @@ pub fn start(me: LocalIdentity, events: Sender<NetEvent>) -> std::io::Result<u16
             }
         });
     }
+
+    // Optional: without an mDNS responder the beacon still finds hopchats.
+    let _ = dnssd::start(me.clone(), tcp_port, events.clone(), announced.clone());
 
     let socket = discovery_socket()?;
     {
@@ -95,11 +106,7 @@ pub fn start(me: LocalIdentity, events: Sender<NetEvent>) -> std::io::Result<u16
             if me.address < address && !announced.lock().unwrap().contains(&address) {
                 let peer = SocketAddr::new(from.ip(), port);
                 let (me, events, announced) = (me.clone(), events.clone(), announced.clone());
-                thread::spawn(move || {
-                    if let Ok(stream) = TcpStream::connect_timeout(&peer, Duration::from_secs(3)) {
-                        spawn_stream(stream, Some(address), me, events, announced);
-                    }
-                });
+                thread::spawn(move || dial(&[peer], address, me, events, announced));
             }
         }
     });
@@ -130,10 +137,27 @@ fn parse_beacon(bytes: &[u8]) -> Option<(String, u16, String)> {
     Some((address, port, nick))
 }
 
+/// Connects to the first of `peers` that answers and runs the stream,
+/// expecting it to prove `address`.
+pub fn dial(
+    peers: &[SocketAddr],
+    address: String,
+    me: LocalIdentity,
+    events: Sender<NetEvent>,
+    announced: Announced,
+) {
+    for peer in peers {
+        if let Ok(stream) = TcpStream::connect_timeout(peer, Duration::from_secs(3)) {
+            spawn_stream(stream, Some(address), me, events, announced);
+            return;
+        }
+    }
+}
+
 /// Runs one stream: sends our preamble, then reads until it closes.
 ///
-/// `expecting` is the address a beacon claimed, for a stream we dialed; the
-/// reader refuses a preamble that proves anything else.
+/// `expecting` is the address a beacon or DNS-SD record claimed, for a stream
+/// we dialed; the reader refuses a preamble that proves anything else.
 fn spawn_stream(
     mut stream: TcpStream,
     expecting: Option<String>,
@@ -143,6 +167,11 @@ fn spawn_stream(
 ) {
     thread::spawn(move || {
         let _ = stream.set_nodelay(true);
+        let keepalive = TcpKeepalive::new()
+            .with_time(KEEPALIVE_IDLE)
+            .with_interval(KEEPALIVE_INTERVAL)
+            .with_retries(KEEPALIVE_RETRIES);
+        let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
         let Ok(preamble) = frame(&me.preamble) else {
             return;
         };
