@@ -305,7 +305,7 @@ fn headless(
                 from, text, hops, ..
             } => {
                 println!("message from {from} ({hops} hop): {text}");
-                if echo {
+                if echo && !text.starts_with("echo: ") {
                     send(Command::Send {
                         to: from,
                         text: format!("echo: {text}"),
