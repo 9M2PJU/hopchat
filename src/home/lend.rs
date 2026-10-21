@@ -26,6 +26,8 @@ use crate::engine::{Command, Input};
 pub const MARK: &str = "\u{1}hopchat-model\u{1}";
 /// How long to wait for a lender: its own turn may take two minutes.
 const WAIT: Duration = Duration::from_secs(150);
+/// A plain answer is written out whole, and the lender allows it five minutes.
+const WAIT_ANSWER: Duration = Duration::from_secs(330);
 /// Lenders to try before giving up on a turn.
 const TRIES: usize = 3;
 
@@ -128,7 +130,10 @@ impl Mind {
         if asked.is_err() {
             return Borrowed::Nobody;
         }
-        answer.recv_timeout(WAIT).unwrap_or(Borrowed::Nobody)
+        // The lender gives an empty tool list the plain answer's patience too.
+        let with_tools = tools.and_then(Value::as_array).is_some_and(|t| !t.is_empty());
+        let wait = if with_tools { WAIT } else { WAIT_ANSWER };
+        answer.recv_timeout(wait).unwrap_or(Borrowed::Nobody)
     }
 }
 
