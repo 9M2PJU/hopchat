@@ -17,10 +17,10 @@ use serde_json::Value;
 
 use super::light::LightDriver;
 use super::tv::TvDriver;
-use super::{webos, wiz, Device, State};
+use super::{ha, webos, wiz, Device, State};
 
 /// Every backend home knows, in the order an address is probed.
-pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs];
+pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs, &ha::HaLight];
 
 /// The backend a device was added with; `None` for one written by a newer
 /// hopchat that knows a backend this one doesn't.
@@ -105,6 +105,11 @@ pub trait Backend: Sync {
     /// on the device.
     fn probe(&self, ip: Ipv4Addr) -> Option<Found>;
 
+    /// What it calls itself, to name it by when found; `None` to name it
+    /// after its category.
+    fn name(&self, _d: &Device) -> Option<String> {
+        None
+    }
     /// A few words for the model about one, e.g. "white tones".
     fn about(&self, d: &Device) -> String;
     /// What the Devices panel says about one it found.

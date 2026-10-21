@@ -20,6 +20,7 @@ mod assistant;
 pub mod lend;
 mod discover;
 pub mod driver;
+pub mod ha;
 mod light;
 mod ollama;
 mod tv;
@@ -105,8 +106,12 @@ impl Device {
 
     fn same(&self, f: &driver::Found) -> bool {
         let (backend, ip, mac) = (f.backend, f.ip, f.mac.as_deref());
+        if self.unit.is_some() {
+            // A hub's entity is itself wherever the hub moves to.
+            return self.backend == backend && self.unit == f.unit;
+        }
         self.backend == backend
-            && self.unit == f.unit
+            && f.unit.is_none()
             && match (self.mac.as_deref(), mac) {
                 (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
                 _ => self.ip == ip,
@@ -148,6 +153,9 @@ pub struct Config {
     /// Whether group members may borrow this machine's model.
     #[serde(default = "yes")]
     pub share: bool,
+    /// The Home Assistant whose entities a scan lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ha: Option<ha::Hub>,
     // The single-bulb, single-TV settings of earlier versions, folded into
     // `devices` when read.
     #[serde(default, skip_serializing)]
@@ -203,6 +211,7 @@ impl Default for Config {
             model: default_model(),
             ollama: default_ollama(),
             share: true,
+            ha: None,
             bulb: None,
             tv: None,
             tv_mac: None,
@@ -307,6 +316,9 @@ pub enum Request {
     Found(driver::Found),
     ScanDone,
     Checked { id: String, state: State, detail: String },
+    /// `/home ha` reached a Home Assistant: the hub and what it has, or
+    /// why not.
+    HaConnected(Result<(ha::Hub, String, Vec<driver::Found>), String>),
     /// A pairing finished: the device with what it learned, and its detail.
     Paired { id: String, result: Result<(Box<Device>, String), String> },
     ModelChecked(ModelState),
@@ -316,6 +328,11 @@ pub enum Request {
     /// A group member wants this machine's model to think.
     Lend { to: String, who: String, id: String, messages: Vec<serde_json::Value>, tools: serde_json::Value },
     Answered { question: ai::Question, asked: serde_json::Value, answer: Result<String, String> },
+}
+
+/// A device name as it may be kept: one line, not too long.
+fn clean_name(name: &str) -> String {
+    name.trim().chars().filter(|c| !c.is_control()).take(MAX_NAME_CHARS).collect::<String>().trim().to_string()
 }
 
 /// Whether `text` addresses home, and the request with the mention removed.
@@ -510,7 +527,7 @@ impl Home {
             }
             Request::Test(id) => self.test(&id),
             Request::Rename(id, name) => {
-                let name: String = name.trim().chars().filter(|c| !c.is_control()).take(MAX_NAME_CHARS).collect();
+                let name = clean_name(&name);
                 if name.is_empty() {
                     return;
                 }
@@ -531,6 +548,7 @@ impl Home {
                 self.note(reply);
             }
             Request::Found(found) => self.on_found(found),
+            Request::HaConnected(result) => self.ha_connected(result),
             Request::ScanDone => self.scanning = false,
             Request::Checked { id, state, detail } => {
                 // A check finishing must not overwrite a pairing in progress.
@@ -562,6 +580,7 @@ impl Home {
         }
         let me = self.me.clone();
         let (url, model) = (self.config.ollama.clone(), self.config.model.clone());
+        let hub = self.config.ha.clone();
         thread::spawn(move || {
             let _ = me.send(Request::ModelChecked(ollama::check(&url, &model)));
             let each = {
@@ -570,7 +589,14 @@ impl Home {
                     let _ = me.send(Request::Found(found));
                 }
             };
+            let listing = hub.map(|hub| {
+                let each = each.clone();
+                thread::spawn(move || hub.entities().into_iter().flatten().for_each(each))
+            });
             discover::scan(each);
+            if let Some(listing) = listing {
+                let _ = listing.join();
+            }
             let _ = me.send(Request::ScanDone);
         });
     }
@@ -631,8 +657,9 @@ impl Home {
         if self.found.iter().any(|d| d.same(&f)) {
             return;
         }
-        let name = self.free_name(backend.category().noun());
-        let d = Device { unit: f.unit, ..Device::new(f.backend, name, f.ip, f.mac, f.data) };
+        let mut d = Device { unit: f.unit, ..Device::new(f.backend, String::new(), f.ip, f.mac, f.data) };
+        let called = backend.name(&d).map(|n| clean_name(&n)).filter(|n| !n.is_empty());
+        d.name = self.free_name(called.as_deref().unwrap_or(backend.category().noun()));
         self.live.insert(d.id(), (State::New, backend.found_detail(&d)));
         self.found.push(d);
     }
@@ -780,6 +807,20 @@ impl Home {
                 Ok(ip) => self.add_by_address(ip),
                 Err(_) => format!("{ip} isn't an IPv4 address"),
             },
+            ("ha", None) => match &self.config.ha {
+                Some(hub) => format!("home lists the devices of Home Assistant at {}", hub.url),
+                None => "connect Home Assistant with /home ha TOKEN, or /home ha URL TOKEN; \
+                         make the token under your HA profile, Security"
+                    .into(),
+            },
+            ("ha", Some(first)) => {
+                let (typed, token) = match words.next() {
+                    Some(token) => (Some(first.to_string()), token.to_string()),
+                    None => (None, first.to_string()),
+                };
+                self.connect_ha(typed, token);
+                "connecting to Home Assistant…".into()
+            }
             ("model", Some(model)) => {
                 self.config.model = model.to_string();
                 self.save();
@@ -801,6 +842,51 @@ impl Home {
                 if self.config.groups.len() == 1 { "" } else { "s" },
             ),
         }
+    }
+
+    /// Reaches a Home Assistant, at `typed` or wherever one announces
+    /// itself, and lists what it has.
+    fn connect_ha(&self, typed: Option<String>, token: String) {
+        let me = self.me.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                let url = match typed {
+                    Some(typed) => ha::url(&typed)?,
+                    None => ha::find().ok_or("no Home Assistant announces itself here; give its address: \
+                                              /home ha http://IP:8123 TOKEN")?,
+                };
+                let hub = ha::Hub { url, token };
+                let home = hub.check()?;
+                let found = hub.entities()?;
+                Ok((hub, home, found))
+            })();
+            let _ = me.send(Request::HaConnected(result));
+        });
+    }
+
+    fn ha_connected(&mut self, result: Result<(ha::Hub, String, Vec<driver::Found>), String>) {
+        let (hub, home, found) = match result {
+            Ok(connected) => connected,
+            Err(e) => return self.note(format!("home: {e}")),
+        };
+        // A new token or address reaches every device added from it.
+        for d in &mut self.config.devices {
+            if d.backend.starts_with("ha_") {
+                hub.stamp(&mut d.data);
+            }
+        }
+        let url = hub.url.clone();
+        self.config.ha = Some(hub);
+        self.save();
+        let before = self.found.len();
+        for f in found {
+            self.on_found(f);
+        }
+        let new = self.found.len() - before;
+        self.note(format!(
+            "connected to {home} at {url}: {new} new device{} to add in /devices",
+            if new == 1 { "" } else { "s" },
+        ));
     }
 
     // ----- the model: whether it is ready, and lending it -------------------
@@ -1239,6 +1325,28 @@ mod tests {
         let saved = serde_json::to_value(&home.found[0]).unwrap();
         assert_eq!(saved["unit"], "light.desk");
         assert!(serde_json::to_value(light("Desk", [10, 0, 0, 5], "m")).unwrap().get("unit").is_none());
+    }
+
+    #[test]
+    fn home_assistant_entities_are_named_and_keep_its_token() {
+        let mut home = home_with(Vec::new());
+        let hub = |token: &str| ha::Hub { url: "http://10.0.0.4:8123".into(), token: token.into() };
+        let strip = |hub: &ha::Hub| {
+            let mut data = json!({"name": "Kitchen strip", "colour": true, "white": false, "effects": []});
+            hub.stamp(&mut data);
+            driver::Found { backend: "ha_light", ip: [10, 0, 0, 4].into(), mac: None, unit: Some("light.strip".into()), data }
+        };
+        home.ha_connected(Ok((hub("old"), "Home".into(), vec![strip(&hub("old"))])));
+        assert_eq!(home.found[0].name, "Kitchen strip");
+        assert_eq!(home.found[0].id(), "10.0.0.4/light.strip");
+        let id = home.found[0].id();
+        home.add(&id);
+        assert!(home.tools().to_string().contains("\"color\""));
+        // A new token reaches the devices already added, and they aren't offered again.
+        home.ha_connected(Ok((hub("new"), "Home".into(), vec![strip(&hub("new"))])));
+        assert!(home.found.is_empty());
+        assert_eq!(home.config.devices[0].data["token"], "new");
+        assert_eq!(home.config.ha, Some(hub("new")));
     }
 
     #[test]

@@ -201,12 +201,15 @@ A local model turns the request into device actions, and home replies in the con
 
 If a device is on another subnet, add it with `/home add 192.168.1.40`. `/home scan` searches again, and a bare `/home` shows the current status.
 
+**Home Assistant.** If you run Home Assistant, hopchat can drive anything it has an integration for. Make a long-lived access token under your HA profile (Security tab), then type `/home ha TOKEN` (or `/home ha http://IP:8123 TOKEN` if HA doesn't announce itself over mDNS). Its devices show up in `/devices` under their HA names, to add like any other. Hidden, disabled and settings entities are left out, as are Wiz and LG TVs, which hopchat drives directly. hopchat talks to HA over the LAN with plain `http://`, but an HA integration may itself go through the cloud.
+
 **Supported devices**
 
 | Device | Protocol |
 | --- | --- |
 | Wiz bulbs | local UDP, port 38899 |
 | LG webOS TVs | WebSocket API on port 3001 over TLS (3000 on older sets) |
+| Home Assistant lights | HA's REST API, port 8123 by default |
 
 Devices are tracked by MAC address, so a new IP from the router doesn't lose them. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home says so.
 
@@ -286,6 +289,7 @@ Without `--to`, `--say` and `--file` go to the first peer whose secure session c
 | `/home on\|off` | let everyone here use your devices, or stop |
 | `/home add IP` | add a device by address |
 | `/home scan` | scan for devices again |
+| `/home ha [URL] TOKEN` | connect Home Assistant and list its devices |
 | `/home model NAME` | choose the Ollama model |
 | `/ai on\|off` | let everyone here ask your model, or stop |
 | `/ai forget` | clear this conversation's model memory |
