@@ -23,6 +23,7 @@ pub mod driver;
 pub mod ha;
 mod light;
 mod ollama;
+mod switch;
 mod tv;
 pub mod webos;
 pub mod wiz;
@@ -1347,6 +1348,25 @@ mod tests {
         assert!(home.found.is_empty());
         assert_eq!(home.config.devices[0].data["token"], "new");
         assert_eq!(home.config.ha, Some(hub("new")));
+    }
+
+    #[test]
+    fn switches_are_named_never_all() {
+        let plug = |name: &str, entity: &str| Device {
+            unit: Some(entity.into()),
+            ..Device::new("ha_switch", name.into(), [10, 0, 0, 4].into(), None, json!({}))
+        };
+        let mut home = home_with(vec![plug("Kettle", "switch.kettle"), plug("Fridge plug", "switch.fridge")]);
+        let tools = home.tools().to_string();
+        assert!(tools.contains("switch_set") && tools.contains("\"Kettle\"") && !tools.contains("\"all\""));
+        assert!(home.system_prompt().contains("- switch \"Kettle\" (on or off)"));
+        let pick = |home: &Home, which: Option<&str>| {
+            home.pick_switch(&json!({"switch": which})).map(|(_, d)| d.name)
+        };
+        assert_eq!(pick(&home, Some("kettle")).as_deref(), Ok("Kettle"));
+        assert_eq!(pick(&home, Some("fridge")).as_deref(), Ok("Fridge plug"));
+        assert_eq!(pick(&home, None), Err("say which switch".into()));
+        assert!(home.run_tool("switch_set", &json!({"switch": "kettle"})).unwrap_err().contains("on or off"));
     }
 
     #[test]

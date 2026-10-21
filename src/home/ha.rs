@@ -24,6 +24,7 @@ use tungstenite::Message;
 
 use super::driver::{Backend, Category, Found};
 use super::light::{scene_key, Caps, LightDriver, Pilot};
+use super::switch::SwitchDriver;
 use super::tv::TvDriver;
 use super::{Device, State};
 
@@ -280,6 +281,7 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
         "media_player" if attrs.get("device_class").and_then(Value::as_str) == Some("tv") => {
             Some(("ha_tv", json!({"name": name})))
         }
+        "switch" => Some(("ha_switch", json!({"name": name}))),
         _ => None,
     }
 }
@@ -610,6 +612,77 @@ fn describe_tv(state: &Value) -> String {
     parts.join(" · ")
 }
 
+// ----- switches -------------------------------------------------------------
+
+/// Plugs and switches Home Assistant drives.
+pub struct HaSwitch;
+
+impl Backend for HaSwitch {
+    fn id(&self) -> &'static str {
+        "ha_switch"
+    }
+
+    fn category(&self) -> Category {
+        Category::Switch
+    }
+
+    fn label(&self) -> &'static str {
+        "Home Assistant switches"
+    }
+
+    /// Listed by home from the hub it connected to, not found by looking.
+    fn discover(&self, _each: &dyn Fn(Found)) {}
+
+    fn probe(&self, _ip: Ipv4Addr) -> Option<Found> {
+        None
+    }
+
+    fn name(&self, d: &Device) -> Option<String> {
+        d.data.get("name").and_then(Value::as_str).map(str::to_string)
+    }
+
+    fn about(&self, _d: &Device) -> String {
+        "on or off".into()
+    }
+
+    fn found_detail(&self, _d: &Device) -> String {
+        "Home Assistant · switch".into()
+    }
+
+    fn check(&self, d: &Device) -> (State, String) {
+        check_entity(d, describe_switch)
+    }
+
+    /// Flipping an unknown plug to find it could switch off the fridge, so
+    /// this only says whether it is on.
+    fn test(&self, d: &mut Device) -> Result<String, String> {
+        SwitchDriver::status(self, d).map(|state| format!("{} is {state}", d.name))
+    }
+
+    fn test_help(&self) -> &'static str {
+        " shows whether it is on"
+    }
+
+    fn as_switch(&self) -> Option<&dyn SwitchDriver> {
+        Some(self)
+    }
+}
+
+impl SwitchDriver for HaSwitch {
+    fn set(&self, d: &Device, on: bool) -> Result<(), String> {
+        let service = if on { "switch.turn_on" } else { "switch.turn_off" };
+        Hub::of(d)?.call(service, entity(d)?, json!({}))
+    }
+
+    fn status(&self, d: &Device) -> Result<String, String> {
+        Ok(describe_switch(&Hub::of(d)?.state(entity(d)?)?))
+    }
+}
+
+fn describe_switch(state: &Value) -> String {
+    state.get("state").and_then(Value::as_str).unwrap_or("unknown").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +737,8 @@ mod tests {
         assert_eq!(describe("media_player.lounge", &tv), Some(("ha_tv", json!({"name": "Lounge TV"}))));
         let speaker = json!({"attributes": {"device_class": "speaker"}});
         assert!(describe("media_player.kitchen", &speaker).is_none());
+        let plug = json!({"attributes": {"friendly_name": "Kettle"}});
+        assert_eq!(describe("switch.kettle", &plug), Some(("ha_switch", json!({"name": "Kettle"}))));
     }
 
     #[test]

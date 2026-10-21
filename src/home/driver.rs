@@ -4,7 +4,7 @@
 //! of tools for every light, whoever made it, so a small model isn't handed
 //! a tool per brand. A [`Backend`] (Wiz, LG webOS) is how one brand is
 //! found, paired and driven, and it implements its category's trait
-//! ([`LightDriver`], [`TvDriver`]) to take part in that category's tools.
+//! ([`LightDriver`], [`TvDriver`], [`SwitchDriver`]) to take part in that category's tools.
 //!
 //! A new brand of light or TV is one file implementing [`Backend`] and the
 //! category trait, plus a line in [`BACKENDS`]. A new category is a module
@@ -16,11 +16,12 @@ use std::net::Ipv4Addr;
 use serde_json::Value;
 
 use super::light::LightDriver;
+use super::switch::SwitchDriver;
 use super::tv::TvDriver;
 use super::{ha, webos, wiz, Device, State};
 
 /// Every backend home knows, in the order an address is probed.
-pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs, &ha::HaLight, &ha::HaTv];
+pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs, &ha::HaLight, &ha::HaTv, &ha::HaSwitch];
 
 /// The backend a device was added with; `None` for one written by a newer
 /// hopchat that knows a backend this one doesn't.
@@ -36,6 +37,7 @@ pub fn backend(id: &str) -> Option<&'static dyn Backend> {
 pub enum Category {
     Light,
     Tv,
+    Switch,
 }
 
 impl Category {
@@ -44,6 +46,7 @@ impl Category {
         match self {
             Category::Light => "Light",
             Category::Tv => "TV",
+            Category::Switch => "Switch",
         }
     }
 
@@ -52,6 +55,7 @@ impl Category {
         match self {
             Category::Light => "light",
             Category::Tv => "TV",
+            Category::Switch => "switch",
         }
     }
 
@@ -59,6 +63,7 @@ impl Category {
         match self {
             Category::Light => "💡",
             Category::Tv => "📺",
+            Category::Switch => "🔌",
         }
     }
 
@@ -67,6 +72,7 @@ impl Category {
         match self {
             Category::Light => format!("dim the {name}"),
             Category::Tv => format!("put netflix on the {name}"),
+            Category::Switch => format!("turn on the {name}"),
         }
     }
 }
@@ -143,6 +149,9 @@ pub trait Backend: Sync {
         None
     }
     fn as_tv(&self) -> Option<&dyn TvDriver> {
+        None
+    }
+    fn as_switch(&self) -> Option<&dyn SwitchDriver> {
         None
     }
 }
