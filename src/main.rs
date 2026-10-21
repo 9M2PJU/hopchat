@@ -351,21 +351,6 @@ fn headless(
             Update::Read { from, ids } => println!("read by {from}: {}", ids.join(",")),
             Update::Group { id, name, members } => {
                 println!("group {name} ({id}): {} members", members.len());
-                if group_id.is_none() && group.as_ref() == Some(&name) {
-                    group_id = Some(id.clone());
-                    if home_on {
-                        let _ = home.send(home::Request::Configure {
-                            group: Some(id.clone()),
-                            args: "on".into(),
-                        });
-                    }
-                    if ai_on {
-                        let _ = home.send(home::Request::Configure {
-                            group: Some(id.clone()),
-                            args: "ai on".into(),
-                        });
-                    }
-                }
                 if group_id.as_ref() == Some(&id)
                     && members.len() > 1
                     && let Some(text) = say_group.take()
@@ -379,7 +364,24 @@ fn headless(
                 }
             }
             Update::GroupLeft { id } => println!("left group {id}"),
-            Update::GroupCreated { .. } => {}
+            // The group this run made, not an older one with the same name.
+            Update::GroupCreated { id } => {
+                if group_id.is_none() && group.is_some() {
+                    group_id = Some(id.clone());
+                    if home_on {
+                        let _ = home.send(home::Request::Configure {
+                            group: Some(id.clone()),
+                            args: "on".into(),
+                        });
+                    }
+                    if ai_on {
+                        let _ = home.send(home::Request::Configure {
+                            group: Some(id),
+                            args: "ai on".into(),
+                        });
+                    }
+                }
+            }
             Update::GroupQueued { group, id, text, .. } => {
                 println!("queued {id} to group {group}: {text}")
             }
