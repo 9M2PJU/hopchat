@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{Command, Input, Update};
 use crate::lobby::LOBBY;
+use crate::me::ME;
 
 /// The word that addresses the devices in a group.
 pub const MENTION: &str = "@home";
@@ -345,9 +346,9 @@ impl Home {
     }
 
     /// Whether home answers a request in `group`: where it is switched
-    /// on, and in the lobby for the person at this machine.
+    /// on, and in the lobby and Me for the person at this machine.
     fn answers(&self, group: &str, mine: bool) -> bool {
-        self.enabled(group) || (mine && group == LOBBY)
+        self.enabled(group) || (mine && (group == LOBBY || group == ME))
     }
 
     fn save(&self) {
@@ -1149,6 +1150,37 @@ mod tests {
         assert!(answer(&engine).is_none());
         home.handle(ask(LOBBY, true));
         assert!(answer(&engine).is_some());
+    }
+
+    #[test]
+    fn me_answers_only_its_owner() {
+        let (mut home, engine) = wired_home();
+        let answer = |engine: &std::sync::mpsc::Receiver<Input>| match engine.try_recv() {
+            Ok(Input::Ui(Command::SendGroup { group, text, .. })) => Some((group, text)),
+            _ => None,
+        };
+        let ask = |mine| Request::Ask { group: ME.into(), from: "me".into(), text: "lights off".into(), mine };
+        home.handle(ask(false));
+        assert!(answer(&engine).is_none(), "nobody else is ever in Me");
+        home.handle(ask(true));
+        let (group, text) = answer(&engine).expect("an answer in Me");
+        assert_eq!(group, ME);
+        assert!(text.starts_with(SIGNATURE), "{text}");
+
+        let answered = Request::Answered {
+            question: ai::Question {
+                group: ME.into(),
+                from: "me".into(),
+                id: "me_1".into(),
+                sender: "off1me".into(),
+                text: "hi".into(),
+                mine: true,
+            },
+            asked: json!({"role": "user", "content": "me: hi"}),
+            answer: Ok("hello".into()),
+        };
+        home.handle(answered);
+        assert_eq!(answer(&engine), Some((ME.to_string(), "🤖 hello".to_string())));
     }
 
     #[test]

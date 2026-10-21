@@ -28,6 +28,7 @@ use crate::engine::{self, Command, Input, Quote, Update};
 use crate::history::{self, Body, Conversation, Entry, Quoted, Status, Transfer};
 use crate::home;
 use crate::lobby::{self, LOBBY};
+use crate::me::{self, ME};
 use devices::Devices;
 use editor::Editor;
 use groups::{Candidate, GroupPanel};
@@ -42,6 +43,14 @@ const TYPING_REFRESH: Duration = Duration::from_secs(3);
 const TYPING_IDLE: Duration = Duration::from_secs(5);
 const SAVE_EVERY: Duration = Duration::from_secs(1);
 const FLASH_FOR: Duration = Duration::from_secs(4);
+/// What switching home or the model on or off in Me says.
+const ALWAYS_YOURS: &str = "Me is only you: your devices and model always answer you here";
+
+/// Whether `/home ARGS` or `/ai ARGS` switches it on or off somewhere,
+/// rather than asking about it, lending it or adding a device.
+fn switches(args: &str) -> bool {
+    matches!(args.split_whitespace().next(), Some("on" | "off"))
+}
 
 pub struct Convo {
     pub data: Conversation,
@@ -216,6 +225,14 @@ impl App {
         lobby.data.nick = lobby::NAME.into();
         lobby.online = true;
         lobby.secure = true;
+        // So is Me, just under it: only you, and your devices.
+        let me_address = app.me_address.clone();
+        let mine = app.convo_mut(ME);
+        mine.data.group = true;
+        mine.data.nick = me::NAME.into();
+        mine.data.members = vec![me_address];
+        mine.online = true;
+        mine.secure = true;
         app.refresh_lobby();
         app.selected = app.ordered().first().map(|c| c.data.address.clone());
         app
@@ -264,13 +281,14 @@ impl App {
 
     // ----- state -------------------------------------------------------
 
-    /// Conversations in display order: the lobby, then reachable ones,
-    /// then most recent.
+    /// Conversations in display order: the lobby, Me, then reachable
+    /// ones, then most recent.
     pub fn ordered(&self) -> Vec<&Convo> {
         let mut list: Vec<&Convo> = self.convos.iter().collect();
         list.sort_by(|a, b| {
             (b.data.address == LOBBY)
                 .cmp(&(a.data.address == LOBBY))
+                .then((b.data.address == ME).cmp(&(a.data.address == ME)))
                 .then(b.online.cmp(&a.online))
                 .then(b.active_ms.cmp(&a.active_ms))
                 .then_with(|| a.data.nick.cmp(&b.data.nick))
@@ -299,6 +317,10 @@ impl App {
 
     pub fn in_lobby(&self) -> bool {
         self.selected.as_deref() == Some(LOBBY)
+    }
+
+    pub fn in_me(&self) -> bool {
+        self.selected.as_deref() == Some(ME)
     }
 
     fn convo_mut(&mut self, address: &str) -> &mut Convo {
@@ -1294,7 +1316,11 @@ impl App {
         if self.in_group() {
             if !self.attachments.is_empty() {
                 self.attachments.clear();
-                self.flash_error("files can't go to a group yet; send them to one person");
+                if self.in_me() {
+                    self.flash_error("files can't be kept in Me yet; send them to one person");
+                } else {
+                    self.flash_error("files can't go to a group yet; send them to one person");
+                }
             }
             if !text.is_empty() {
                 let reply = self.reply_target().map(|e| Quote {
@@ -1393,6 +1419,10 @@ impl App {
                 });
             }
             "group" | "newgroup" => self.open_groups(""),
+            "invite" | "add" | "leave" if self.in_me() => {
+                self.flash_error("Me is just you and your devices; start a group with Ctrl-G to talk to people")
+            }
+            "home" | "ai" if self.in_me() && switches(arg) => self.flash_error(ALWAYS_YOURS),
             "invite" | "add" | "leave" if self.in_lobby() => {
                 self.flash_error("everyone nearby is in the lobby; there's no one to add and no leaving it")
             }
@@ -1504,7 +1534,7 @@ impl App {
 
     /// The open group, and whether home is on in it.
     pub fn home_here(&self) -> Option<(String, String, bool)> {
-        let convo = self.current().filter(|c| c.data.group && c.online)?;
+        let convo = self.current().filter(|c| c.data.group && c.online && c.data.address != ME)?;
         let on = self.home_view.groups.contains(&convo.data.address);
         Some((convo.data.address.clone(), convo.data.nick.clone(), on))
     }
@@ -1525,6 +1555,7 @@ impl App {
                     args: format!("ai {verb}"),
                 });
             }
+            None if self.in_me() => self.flash_error(ALWAYS_YOURS),
             None => self.flash_error("open a group first; i then lets that group ask your model"),
         }
     }
@@ -1534,6 +1565,7 @@ impl App {
             Some((group, _, on)) => {
                 let _ = self.home.send(home::Request::SetGroup { group, on: !on });
             }
+            None if self.in_me() => self.flash_error(ALWAYS_YOURS),
             None => self.flash_error("open a group first; g then lets that group use your devices"),
         }
     }
@@ -1941,6 +1973,43 @@ mod render_tests {
         }
         assert!(app.find_peer("BOB").is_some());
         assert!(app.find_peer("house").is_none(), "a group is not a person to invite");
+    }
+
+    #[test]
+    fn me_is_yours_alone() {
+        let mut app = test_app();
+        let commands = std::cell::RefCell::new(Vec::new());
+        let send = |c: Command| commands.borrow_mut().push(c);
+        let order: Vec<&str> = app.ordered().iter().map(|c| c.data.address.as_str()).collect();
+        assert_eq!(order[..2], [LOBBY, ME], "Me sits under the lobby");
+
+        app.selected = Some(ME.into());
+        let empty = screen(&mut app);
+        println!("{empty}");
+        for needle in ["◇ Me", "you and your devices", "only yours", "@home", "@ai", "to yourself", "Ctrl-D"] {
+            assert!(empty.contains(needle), "missing {needle:?}");
+        }
+
+        app.editor.set("@home lights off");
+        app.submit(&send);
+        match commands.borrow_mut().pop() {
+            Some(Command::SendGroup { group, text, from_home: false, .. }) => {
+                assert_eq!((group.as_str(), text.as_str()), (ME, "@home lights off"));
+            }
+            _ => panic!("expected a send to Me"),
+        }
+        app.apply(Update::GroupQueued { group: ME.into(), id: "me_1".into(), text: "buy milk".into(), reply: None }, &send);
+        let shown = screen(&mut app);
+        assert!(shown.contains("buy milk") && !shown.contains("◷"), "no receipt in Me: {shown}");
+
+        // Nobody to invite, and nothing to switch on.
+        for command in ["/invite bob", "/leave", "/home on", "/ai off"] {
+            app.editor.set(command);
+            app.submit(&send);
+            assert!(app.flash_text().is_some_and(|(_, error)| error), "{command} should be refused");
+        }
+        assert!(commands.borrow().is_empty(), "a refused command still went out");
+        assert!(super::switches("on") && !super::switches("share on") && !super::switches(""));
     }
 
     #[test]

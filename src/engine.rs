@@ -20,6 +20,7 @@ use offline_protocol_transport::{
 
 use crate::home;
 use crate::lobby::{self, LOBBY};
+use crate::me::{self, ME};
 use crate::net::{self, LocalIdentity, NetEvent};
 
 pub const APP_ID: &str = "dev.hopchat";
@@ -508,6 +509,9 @@ impl Engine {
         if group == LOBBY {
             return self.send_lobby(text, reply, from_home);
         }
+        if group == ME {
+            return self.send_me(text, reply, from_home);
+        }
         let reply_to = reply.as_ref().map(|q| q.id.clone());
         match self
             .protocol
@@ -557,6 +561,20 @@ impl Engine {
         }
     }
 
+    /// Keeps it here: nothing goes on the wire (see [`me`]).
+    fn send_me(&mut self, text: String, reply: Option<Quote>, from_home: bool) {
+        let id = me::new_id();
+        self.update(Update::GroupQueued {
+            group: ME.into(),
+            id: id.clone(),
+            text: text.clone(),
+            reply,
+        });
+        if !from_home {
+            self.to_home(ME, &self.address, &id, &text);
+        }
+    }
+
     /// Everyone else in the lobby: each peer connected with a secure
     /// session.
     fn lobby_members(&self) -> Vec<String> {
@@ -570,9 +588,10 @@ impl Engine {
         peers
     }
 
-    /// Whether `peer` is in `group` with us.
+    /// Whether `peer` is in `group` with us. Asked about someone's own
+    /// space, a model is lent on the lobby's terms: a secure session.
     fn shares(&self, group: &str, peer: &str) -> bool {
-        if group == LOBBY {
+        if group == LOBBY || group == ME {
             return self.streams.contains_key(peer) && self.session_ready(peer);
         }
         matches!(

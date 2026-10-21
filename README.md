@@ -50,13 +50,25 @@ Your own `@home` and `@ai` always work in the lobby, with nothing to set up beyo
 
 A lobby message goes, end-to-end encrypted, to each person who is connected when you send it. It's a room, not a mailbox: someone who joins later doesn't get what was said before, and there are no delivery ticks. For something that should wait for a person, write to them directly. The lobby can't be left, and files still go one-to-one.
 
+## Me
+
+Right under the lobby is **Me**: a conversation with nobody else in it. Jot notes to yourself, and talk to your own devices and model:
+
+```
+remember to call the landlord
+@home dim the desk lamp to 30%
+@ai what can I make with eggs, spinach and feta?
+```
+
+Nothing written in Me goes on the network. It stays on this machine, kept in history like any other conversation. `@home` and `@ai` always answer you here, with nothing to switch on, and nobody else can ever reach them through it. There is nobody to invite and no leaving it, and files still go one-to-one.
+
 ## Groups
 
 Press **Ctrl-G** (or click **+ New group** at the top of the sidebar, or type `/group`). Name the group, press ↓, tick people with Space, and press Enter. The group is created with everyone you picked invited, and it opens. Only people who are online can be picked, because an invite needs their key package. `/invite` in a group opens the same picker to add more people. The quick forms still work: `/group house` creates a group straight away, and `/invite bob` adds one person. Groups are MLS groups (RFC 9420) carried over the same peer-to-peer links, so they need no server either. Files still go one-to-one.
 
 ## Home: talk to your devices
 
-You can talk to the smart devices on your own machine in the [lobby](#the-lobby), and anyone in a group (or in the lobby, once you let them) can too. Mention `@home`:
+You can talk to the smart devices on your own machine in [Me](#me) or the [lobby](#the-lobby), and anyone in a group (or in the lobby, once you let them) can too. Mention `@home`:
 
 ```
 @home dim the lights to 20% and put on netflix

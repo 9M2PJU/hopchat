@@ -17,6 +17,7 @@ use super::devices::{self, Devices, Primary};
 use super::groups::{Candidate, Focus, GroupPanel};
 use super::theme::{self, BG, FOAM, SAGE, IRIS, PEACH, PANEL, RAISED, TEXT, ROSE, GOLD};
 use crate::lobby::LOBBY;
+use crate::me::ME;
 use super::picker::{self, Picker};
 use crate::home::{self, DeviceView, ModelState, State};
 use super::{App, Convo, Mode};
@@ -235,8 +236,9 @@ impl App {
 
         self.peer_rows.clear();
         let ordered: Vec<&Convo> = self.ordered();
-        // The lobby is always listed; with no one else, say how to get people.
-        let alone = ordered.iter().all(|c| c.data.address == LOBBY);
+        // The lobby and Me are always listed; with no one else, say how to
+        // get people.
+        let alone = ordered.iter().all(|c| c.data.address == LOBBY || c.data.address == ME);
 
         let list = Rect::new(list.x, list.y + 1, list.width, list.height.saturating_sub(1));
         let width = list.width as usize;
@@ -254,6 +256,7 @@ impl App {
             };
             let dot = match (convo.data.address == LOBBY, convo.data.group, convo.online, convo.secure) {
                 (true, ..) => "◎".fg(FOAM),
+                _ if convo.data.address == ME => "◇".fg(IRIS),
                 (_, true, true, _) => "#".fg(ROSE),
                 (_, true, false, _) => "#".fg(FAINT),
                 (_, false, true, true) => "●".fg(SAGE),
@@ -305,6 +308,7 @@ impl App {
                     })
                     .unwrap_or_else(|| match convo.data.address.as_str() {
                         LOBBY => "everyone nearby".into(),
+                        ME => "notes, @home, @ai".into(),
                         address => short(address),
                     });
                 clip(&text.replace('\n', " "), width.saturating_sub(4)).fg(if selected { MUTED } else { FAINT })
@@ -353,6 +357,7 @@ impl App {
         };
         let (icon, tint) = match (convo.online, convo.secure) {
             _ if convo.data.address == LOBBY => ("◎ ".fg(FOAM), TEXT),
+            _ if convo.data.address == ME => ("◇ ".fg(IRIS), TEXT),
             _ if convo.data.group => ("# ".fg(if convo.online { ROSE } else { FAINT }), TEXT),
             (true, true) => ("● ".fg(SAGE), theme::person(&convo.data.address)),
             (true, false) => ("◐ ".fg(PEACH), theme::person(&convo.data.address)),
@@ -366,6 +371,9 @@ impl App {
                     n => format!("you and {n} nearby"),
                 };
                 vec![here.fg(MUTED), "  ·  everyone on this network".fg(FAINT)]
+            }
+            _ if convo.data.address == ME => {
+                vec!["you and your devices".fg(MUTED), "  ·  never leaves this machine".fg(FAINT)]
             }
             _ if convo.data.group => {
                 let n = convo.data.members.len();
@@ -383,7 +391,7 @@ impl App {
         let mut spans = vec!["  ".into(), icon, convo.data.nick.clone().fg(tint).bold(), "   ".into()];
         spans.extend(state);
         frame.render_widget(Line::from(spans), top);
-        if convo.data.address != LOBBY {
+        if convo.data.address != LOBBY && convo.data.address != ME {
             frame.render_widget(
                 Line::from(format!("{}  ", short(&convo.data.address)).fg(FAINT))
                     .alignment(Alignment::Right),
@@ -454,7 +462,12 @@ impl App {
                     rows.push((line, None));
                 }
             }
-            let hint = if convo.data.address == LOBBY {
+            if convo.data.address == ME {
+                for line in me_hint(&self.home_view) {
+                    rows.push((line, None));
+                }
+            }
+            let hint = if convo.data.address == LOBBY || convo.data.address == ME {
                 ""
             } else if convo.data.group {
                 "A new group. /invite picks people to add; Ctrl-D, then g, lets them use your devices."
@@ -565,8 +578,10 @@ impl App {
             ]));
         }
 
-        // Lobby messages go to whoever is around; there is no one receipt to show.
-        let tick = (entry.mine && convo.data.address != LOBBY).then(|| tick(&entry.status));
+        // Lobby messages go to whoever is around and Me's go nowhere; there
+        // is no one receipt to show.
+        let tick = (entry.mine && convo.data.address != LOBBY && convo.data.address != ME)
+            .then(|| tick(&entry.status));
         match &entry.body {
             Body::Text(text) => {
                 let rows = wrap(text, width.saturating_sub(INDENT.len()));
@@ -680,6 +695,7 @@ impl App {
         let edge = if focused { theme::dim(IRIS) } else { theme::mix(FAINT, BG, 0.3) };
         let to = match self.current() {
             Some(c) if c.data.address == LOBBY => vec!["everyone nearby".fg(FOAM)],
+            Some(c) if c.data.address == ME => vec!["yourself".fg(IRIS)],
             Some(c) if c.data.group => vec![format!("#{}", c.data.nick).fg(ROSE)],
             Some(c) => vec![c.data.nick.clone().fg(theme::person(&c.data.address))],
             None => vec!["nobody yet".fg(MUTED)],
@@ -738,6 +754,9 @@ impl App {
                 Some(c) if c.data.address == LOBBY => {
                     "say something to everyone nearby  ·  @ai asks the model  ·  / commands".to_string()
                 }
+                Some(c) if c.data.address == ME => {
+                    "a note to yourself  ·  @home your devices  ·  @ai your model".to_string()
+                }
                 Some(c) if c.data.group => {
                     format!("message #{}  ·  @home @ai  ·  / commands", c.data.nick)
                 }
@@ -770,11 +789,12 @@ impl App {
             return;
         }
         let (matches, title) = if self.editor.text().starts_with('/') {
-            (command_matches(self.editor.text()), " Tab completes ")
+            (command_matches(self.editor.text()), " Tab completes ".to_string())
         } else if self.in_group() && self.editor.at_end() {
-            (mention_matches(self.editor.text()), " Tab completes · the host's model and devices answer ")
+            let who = if self.in_me() { "yours answer" } else { "the host's model and devices answer" };
+            (mention_matches(self.editor.text()), format!(" Tab completes · {who} "))
         } else {
-            (Vec::new(), "")
+            (Vec::new(), String::new())
         };
         if !matches.is_empty() {
             let h = matches.len() as u16 + 2;
@@ -1092,6 +1112,7 @@ impl App {
             model_line.push("  · lent to the group".fg(FAINT));
         }
         let access = match self.home_here() {
+            None if self.in_me() => vec!["◇ ".fg(IRIS), "Me".bold(), ": always yours".fg(MUTED)],
             Some((id, name, true)) if id == LOBBY => vec![
                 "# ".fg(ACCENT),
                 name.bold(),
@@ -1127,6 +1148,7 @@ impl App {
         let mut access_line = vec!["  Access  ".fg(MUTED)];
         access_line.extend(access);
         let ai = match self.ai_here() {
+            None if self.in_me() => vec!["◇ ".fg(IRIS), "Me".bold(), ": always answers you".fg(MUTED)],
             Some((id, name, true)) if id == LOBBY => vec![
                 "# ".fg(ACCENT),
                 name.bold(),
@@ -1498,6 +1520,7 @@ fn draw_help(frame: &mut Frame) {
         Line::from(""),
         head("Elsewhere"),
         key("Lobby", "everyone nearby, always at the top · @home your devices · @ai your model"),
+        key("Me", "just you: notes, and @home and @ai that never leave this machine"),
         key("Ctrl-G", "new group: name it, pick people, Enter"),
         key("Ctrl-D", "devices: find, pair and test them"),
         key("Ctrl-E", "protocol event log"),
@@ -1569,6 +1592,36 @@ fn lobby_hint(others: bool, open: bool) -> Vec<Line<'static>> {
         )
         .centered(),
     ]
+}
+
+/// What an empty Me says: what it is, and what you can say to it.
+fn me_hint(view: &home::View) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from("◇".fg(IRIS)).centered(),
+        Line::from(""),
+        Line::from("A space that's only yours.".fg(TEXT)).centered(),
+        Line::from("Jot things down, talk to your devices, ask your model.".fg(MUTED)).centered(),
+        Line::from("Nothing written here leaves this machine.".fg(FAINT)).centered(),
+        Line::from(""),
+    ];
+    let names: Vec<&str> = view.devices.iter().filter(|d| d.added).map(|d| d.name.as_str()).collect();
+    let example = match view.devices.iter().find(|d| d.added) {
+        Some(d) if d.kind == home::Kind::Tv => format!(" turn the {} down a bit", d.name.to_lowercase()),
+        Some(d) => format!(" dim the {} to 30%", d.name.to_lowercase()),
+        None => " turn the lights down".to_string(),
+    };
+    lines.push(Line::from(vec!["@home".fg(GOLD), example.fg(MUTED)]).centered());
+    lines.push(Line::from(vec!["@ai".fg(GOLD), " what should I cook tonight?".fg(MUTED)]).centered());
+    lines.push(Line::from(""));
+    lines.push(
+        if names.is_empty() {
+            Line::from(vec!["No devices yet: ".fg(FAINT), "Ctrl-D".fg(KEY), " finds them.".fg(FAINT)])
+        } else {
+            Line::from(format!("Your devices: {}", names.join(", ")).fg(FAINT))
+        }
+        .centered(),
+    );
+    lines
 }
 
 fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {

@@ -7,6 +7,7 @@ mod engine;
 mod history;
 mod home;
 mod lobby;
+mod me;
 mod net;
 mod ui;
 

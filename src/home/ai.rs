@@ -14,6 +14,7 @@ use super::ollama::{text_of, Ollama};
 use super::{Home, Request};
 use crate::engine::{Command, Input, Quote};
 use crate::lobby::LOBBY;
+use crate::me::ME;
 
 /// The word that addresses the model in a group.
 pub const MENTION: &str = "@ai";
@@ -42,10 +43,10 @@ impl Home {
         self.config.ai_groups.iter().any(|g| g == group)
     }
 
-    /// Where it is switched on, and in the lobby for the person at this
-    /// machine.
+    /// Where it is switched on, and in the lobby and Me for the person
+    /// at this machine.
     fn ai_answers(&self, q: &Question) -> bool {
-        self.ai_enabled(&q.group) || (q.mine && q.group == LOBBY)
+        self.ai_enabled(&q.group) || (q.mine && (q.group == LOBBY || q.group == ME))
     }
 
     pub(super) fn ai_ask(&mut self, q: Question) {
