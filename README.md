@@ -12,7 +12,7 @@ Two terminals on one machine work too. Each name gets its own identity under `~/
 
 ## What you get
 
-- **A neon terminal from a future without internet**: it boots with the name in lights (any key skips), a strip along the top shows how much mesh is around, and everyone gets their own colour, the same in the sidebar and their messages. While nobody is around, the lobby shows a sonar sweep.
+- **Quiet to look at**: soft pastels on a dusk background, no glow and no flicker. Everyone gets their own colour, the same in the sidebar and their messages, so you can tell who said what at a glance. It opens with a moment of the name fading in (any key skips it), and while nobody is around the lobby shows slow ripples instead of an empty page.
 - **Nothing to memorise**: the keys along the bottom are buttons, so click them. Click a chat on the left to open it. Click a message to reply, open, copy or retry it. Type `@` in a group or the lobby and it offers `@home` and `@ai`; Tab completes.
 
 - **Files**: press Ctrl-O to browse, drag files onto the window, or type `/file PATH`. Each transfer shows a live progress bar with rate and time left. Transfers are chunked and MLS-encrypted, up to 100 MB each. Received files are saved to `~/Downloads/hopchat` (override with `--downloads`), never overwriting anything and never escaping that folder.

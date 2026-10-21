@@ -1951,7 +1951,7 @@ mod render_tests {
         assert_eq!(app.selected.as_deref(), Some(LOBBY));
         let alone = screen(&mut app);
         println!("{alone}");
-        for needle in ["◈ Lobby", "everyone nearby", "just you so far", "0 nearby", "Looking for people", "@home", "@ai", "Only you can use them"] {
+        for needle in ["◎ Lobby", "everyone nearby", "just you so far", "0 nearby", "Looking for people", "@home", "@ai", "Only you can use them"] {
             assert!(alone.contains(needle), "missing {needle:?}");
         }
 
@@ -2002,7 +2002,7 @@ mod render_tests {
     fn boots_and_any_key_gets_past() {
         let mut app = test_app();
         let send = |_: Command| {};
-        app.boot = Some(Instant::now() - Duration::from_millis(2_000));
+        app.boot = Some(Instant::now() - Duration::from_millis(1_500));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -2010,14 +2010,14 @@ mod render_tests {
             .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>() + "\n")
             .collect();
         println!("{boot}");
-        for needle in ["██╗", "NO SERVER", "identity", "alice", "not needed"] {
+        for needle in ["h o p c h a t", "no internet needed", "alice"] {
             assert!(boot.contains(needle), "missing {needle:?}");
         }
         // The key that dismisses it is not typed.
         app.on_key(KeyEvent::from(KeyCode::Char('x')), &send);
         assert!(!app.booting());
         assert!(app.editor.is_empty());
-        assert!(screen(&mut app).contains("◈ Lobby"));
+        assert!(screen(&mut app).contains("◎ Lobby"));
     }
 
     #[test]
