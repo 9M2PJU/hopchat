@@ -31,7 +31,21 @@ Two terminals on one machine work too. Each name gets its own identity under `~/
 | F1 | help |
 | Ctrl-C / Ctrl-Q | quit |
 
-Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/quit`, for groups `/group`, `/invite`, `/members`, `/leave`, for devices `/devices`, `/home`, and for the model `/ai`.
+Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/quit`, for groups and the lobby `/group`, `/invite`, `/members`, `/leave`, for devices `/devices`, `/home`, and for the model `/ai`.
+
+## The lobby
+
+hopchat opens in the **Lobby**, pinned at the top of the sidebar. Everyone on your network who runs hopchat is in it by themselves: there's nothing to create and nobody to invite.
+
+```
+anyone up for lunch?
+@home turn the lights down
+@ai what's a good name for a sourdough starter?
+```
+
+Your own `@home` and `@ai` always work in the lobby, with nothing to set up beyond the devices and the model themselves. Only you can use them there until you say otherwise: `/home on` and `/ai on` in the lobby (or `g` and `i` in the Devices panel while it's open) let everyone nearby use your devices and ask your model. `off` makes them yours again.
+
+A lobby message goes, end-to-end encrypted, to each person who is connected when you send it. It's a room, not a mailbox: someone who joins later doesn't get what was said before, and there are no delivery ticks. For something that should wait for a person, write to them directly. The lobby can't be left, and files still go one-to-one.
 
 ## Groups
 
@@ -39,7 +53,7 @@ Press **Ctrl-G** (or click **+ New group** at the top of the sidebar, or type `/
 
 ## Home: talk to your devices
 
-Anyone in a group can talk to the smart devices on the machine that hosts them. Mention `@home`:
+You can talk to the smart devices on your own machine in the [lobby](#the-lobby), and anyone in a group (or in the lobby, once you let them) can too. Mention `@home`:
 
 ```
 @home dim the lights to 20% and put on netflix
@@ -48,7 +62,7 @@ Anyone in a group can talk to the smart devices on the machine that hosts them. 
 @home is the light on?
 ```
 
-A local model (via [Ollama](https://ollama.com)) turns the request into device actions, and home answers in the group with a 🏠. Nothing leaves your network.
+A local model (via [Ollama](https://ollama.com)) turns the request into device actions, and home answers in the conversation with a 🏠. Nothing leaves your network.
 
 Setup on the host:
 
@@ -57,13 +71,13 @@ Setup on the host:
    - **A light:** Enter adds it, `t` blinks it so you can tell which one it is, and `n` gives it a name people will use ("Desk lamp").
    - **A TV:** Enter pairs it. The TV asks whether to allow hopchat; choose *Allow* with the remote. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings. A TV only shows up while it's switched on.
    - The panel also shows whether the model is ready, and the exact command to run if it isn't.
-3. Open a group and press `g` in the panel (or type `/home on`) to let that group use the devices. `g` again, or `/home off`, revokes it.
+3. To try it yourself, open the lobby and mention `@home`. To let other people in, open a group (or the lobby) and press `g` in the panel (or type `/home on`). `g` again, or `/home off`, revokes it.
 
 If a device is on another subnet or the scan can't see it, `/home add 192.168.1.40` adds it by address.
 
 Devices are remembered by MAC address, so one that gets a new IP from the router is followed, not lost. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home tells people so.
 
-Being in the group is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. Home only answers while the host's hopchat is running. Settings are kept in `~/.hopchat/<name>/home.json`. That file holds each TV's client key and its pinned certificate: the TV's certificate is self-signed, so hopchat trusts the one it sees at pairing and refuses a different one later.
+Being in the group is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. In the lobby it's you, plus everyone with a secure session to you if you switched home on there. Home only answers while the host's hopchat is running. Settings are kept in `~/.hopchat/<name>/home.json`. That file holds each TV's client key and its pinned certificate: the TV's certificate is self-signed, so hopchat trusts the one it sees at pairing and refuses a different one later.
 
 Devices: Wiz bulbs (local UDP, port 38899) and LG webOS TVs (the WebSocket API on port 3001 over TLS, or 3000 on older sets). The code is in `src/home/`.
 
@@ -71,7 +85,7 @@ Devices: Wiz bulbs (local UDP, port 38899) and LG webOS TVs (the WebSocket API o
 
 Only one person in a group needs to run a model. Everyone else can use it.
 
-**Ask it anything.** In a group, the person whose machine runs the model types `/ai on` (or presses `i` in the Devices panel). After that, anyone in the group can mention `@ai`:
+**Ask it anything.** In the lobby you can ask your own model straight away. In a group, the person whose machine runs the model types `/ai on` (or presses `i` in the Devices panel). After that, anyone in the group can mention `@ai`:
 
 ```
 @ai what's a good name for a sourdough starter?
@@ -83,7 +97,7 @@ The answer comes back as a 🤖 reply to the question. Each group's recent quest
 
 **It thinks for `@home` too.** The machine with the devices doesn't need a model. If none is ready there, home sends each step to a model that someone in the group shares, and runs the device actions itself. The other machine only does the thinking and never touches the devices. The Devices panel shows `borrowing bob (qwen2.5:7b)`. `@ai` works the same way on a host whose own model is down.
 
-**Sharing.** A machine whose model is ready offers it to the people it is connected to. It answers only someone who is in a group with it, for that group's question, and at most two requests at a time. It shows a note when someone starts using it ("alice is using your qwen2.5:7b"). `/ai share off` stops lending, and `/ai share on` resumes it. A bare `/ai` shows the model, where it's on, and whose models you could borrow.
+**Sharing.** A machine whose model is ready offers it to the people it is connected to. It answers only someone who is in a group with it (the lobby counts, so anyone with a secure session to it), for that group's question, and at most two requests at a time. It shows a note when someone starts using it ("alice is using your qwen2.5:7b"). `/ai share off` stops lending, and `/ai share on` resumes it. A bare `/ai` shows the model, where it's on, and whose models you could borrow.
 
 The questions, and for `@home` the device names and states, go to the lender inside the same end-to-end encrypted one-to-one session as chat. They are never shown as messages. Nothing leaves your network.
 

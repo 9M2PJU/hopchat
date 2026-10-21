@@ -26,6 +26,7 @@ use ratatui::DefaultTerminal;
 use crate::engine::{self, Command, Input, Quote, Update};
 use crate::history::{self, Body, Conversation, Entry, Quoted, Status, Transfer};
 use crate::home;
+use crate::lobby::{self, LOBBY};
 use devices::Devices;
 use editor::Editor;
 use groups::{Candidate, GroupPanel};
@@ -197,6 +198,13 @@ impl App {
             home,
             home_view: home::View::default(),
         };
+        // The lobby is always there, and it is where hopchat opens.
+        let lobby = app.convo_mut(LOBBY);
+        lobby.data.group = true;
+        lobby.data.nick = lobby::NAME.into();
+        lobby.online = true;
+        lobby.secure = true;
+        app.refresh_lobby();
         app.selected = app.ordered().first().map(|c| c.data.address.clone());
         app
     }
@@ -243,16 +251,36 @@ impl App {
 
     // ----- state -------------------------------------------------------
 
-    /// Conversations in display order: reachable first, then most recent.
+    /// Conversations in display order: the lobby, then reachable ones,
+    /// then most recent.
     pub fn ordered(&self) -> Vec<&Convo> {
         let mut list: Vec<&Convo> = self.convos.iter().collect();
         list.sort_by(|a, b| {
-            b.online
-                .cmp(&a.online)
+            (b.data.address == LOBBY)
+                .cmp(&(a.data.address == LOBBY))
+                .then(b.online.cmp(&a.online))
                 .then(b.active_ms.cmp(&a.active_ms))
                 .then_with(|| a.data.nick.cmp(&b.data.nick))
         });
         list
+    }
+
+    /// The lobby's members: us, and everyone with a secure session now.
+    fn refresh_lobby(&mut self) {
+        let mut members = vec![self.me_address.clone()];
+        members.extend(
+            self.convos
+                .iter()
+                .filter(|c| !c.data.group && c.online && c.secure)
+                .map(|c| c.data.address.clone()),
+        );
+        if let Some(lobby) = self.convos.iter_mut().find(|c| c.data.address == LOBBY) {
+            lobby.data.members = members;
+        }
+    }
+
+    pub fn in_lobby(&self) -> bool {
+        self.selected.as_deref() == Some(LOBBY)
     }
 
     fn convo_mut(&mut self, address: &str) -> &mut Convo {
@@ -355,11 +383,13 @@ impl App {
                 convo.online = false;
                 convo.secure = false;
                 convo.typing_until = None;
+                self.refresh_lobby();
                 let who = self.nick_of(&address);
                 self.note(render::ERR, format!("link down  {who}"));
             }
             Update::SessionReady { address } => {
                 self.convo_mut(&address).secure = true;
+                self.refresh_lobby();
                 let who = self.nick_of(&address);
                 self.note(render::OK, format!("mls ready  {who}"));
             }
@@ -1294,6 +1324,9 @@ impl App {
                 });
             }
             "group" | "newgroup" => self.open_groups(""),
+            "invite" | "add" | "leave" if self.in_lobby() => {
+                self.flash_error("everyone nearby is in the lobby; there's no one to add and no leaving it")
+            }
             "invite" | "add" if arg.is_empty() => match self.current().filter(|c| c.data.group && c.online) {
                 Some(c) => {
                     let panel = GroupPanel::add_to(c.data.address.clone(), c.data.nick.clone());
@@ -1834,6 +1867,61 @@ mod render_tests {
         }
         assert!(app.find_peer("BOB").is_some());
         assert!(app.find_peer("house").is_none(), "a group is not a person to invite");
+    }
+
+    #[test]
+    fn opens_in_the_lobby_and_talks_there() {
+        let mut app = test_app();
+        let commands = std::cell::RefCell::new(Vec::new());
+        let send = |c: Command| commands.borrow_mut().push(c);
+        assert_eq!(app.selected.as_deref(), Some(LOBBY));
+        let alone = screen(&mut app);
+        println!("{alone}");
+        for needle in ["# Lobby", "everyone nearby", "just you so far", "0 nearby", "Looking for people", "@home", "@ai", "Only you can use them"] {
+            assert!(alone.contains(needle), "missing {needle:?}");
+        }
+
+        let bob = "off1bob00000000000000";
+        app.apply(Update::PeerSeen { address: bob.into(), nick: "bob".into() }, &send);
+        app.apply(Update::PeerUp { address: bob.into() }, &send);
+        app.apply(Update::SessionReady { address: bob.into() }, &send);
+        assert_eq!(app.ordered()[0].data.address, LOBBY, "the lobby stays on top");
+        app.apply(
+            Update::GroupIncoming { group: LOBBY.into(), from: bob.into(), id: "lb_1".into(), text: "anyone up for lunch?".into(), reply_to: None },
+            &send,
+        );
+        app.editor.set("@ai where should we eat?");
+        app.submit(&send);
+        match commands.borrow().last() {
+            Some(Command::SendGroup { group, text, from_home: false, .. }) => {
+                assert_eq!((group.as_str(), text.as_str()), (LOBBY, "@ai where should we eat?"));
+            }
+            _ => panic!("Enter should say it in the lobby"),
+        }
+        app.apply(
+            Update::GroupQueued { group: LOBBY.into(), id: "lb_2".into(), text: "@ai where should we eat?".into(), reply: None },
+            &send,
+        );
+        let shown = screen(&mut app);
+        println!("{shown}");
+        for needle in ["you and 1 nearby", "bob", "anyone up for lunch?", "@ai where should we eat?"] {
+            assert!(shown.contains(needle), "missing {needle:?}");
+        }
+        assert!(!shown.contains('◷'), "no delivery tick in the lobby");
+
+        app.apply(Update::PeerDown { address: bob.into() }, &send);
+        assert!(screen(&mut app).contains("just you so far"));
+        app.run_command("leave", &send);
+        assert!(app.flash_text().is_some_and(|(t, error)| error && t.contains("no leaving")));
+        assert!(!commands.borrow().iter().any(|c| matches!(c, Command::Leave { .. })));
+
+        app.mode = Mode::Devices(Devices::default());
+        let panel = screen(&mut app);
+        for needle in ["only you can use them", "g lets everyone nearby in", "i lets everyone nearby ask"] {
+            assert!(panel.contains(needle), "missing {needle:?}");
+        }
+        app.home_view.groups = vec![LOBBY.into()];
+        assert!(screen(&mut app).contains("everyone nearby can use them"));
     }
 
     #[test]

@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 /// The lobby's conversation id. Peers are `off1…` and MLS group ids are
 /// hex, so neither can be this.
 pub const LOBBY: &str = "lobby";
+/// What the lobby is called in the sidebar.
+pub const NAME: &str = "Lobby";
 /// What a hidden lobby message starts with; nobody types this.
 const MARK: &str = "\u{1}hopchat-lobby\u{1}";
 

@@ -12,6 +12,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::devices::{self, Devices, Primary};
 use super::groups::{Candidate, Focus, GroupPanel};
+use crate::lobby::LOBBY;
 use super::picker::{self, Picker};
 use crate::home::{self, DeviceView, ModelState, State};
 use super::{App, Convo, Mode};
@@ -40,8 +41,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/members", "list who is in this group"),
     ("/leave", "leave this group"),
     ("/devices", "find, pair and test your smart devices (also Ctrl-D)"),
-    ("/home", "/home on|off lets this group use your devices · /home add IP"),
-    ("/ai", "/ai on|off lets this group ask your model with @ai · /ai share on|off lends it"),
+    ("/home", "/home on|off lets this group (or the lobby) use your devices · /home add IP"),
+    ("/ai", "/ai on|off lets this group (or the lobby) ask your model · /ai share on|off lends it"),
     ("/me", "show and copy your own address"),
     ("/clear", "delete this conversation from this device"),
     ("/log", "show or hide the protocol event log"),
@@ -119,7 +120,7 @@ impl App {
             head,
         );
 
-        let online = self.convos.iter().filter(|c| c.online).count();
+        let online = self.convos.iter().filter(|c| c.online && !c.data.group).count();
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![
@@ -147,18 +148,8 @@ impl App {
 
         self.peer_rows.clear();
         let ordered: Vec<&Convo> = self.ordered();
-        if ordered.is_empty() {
-            let lines = vec![
-                Line::from(""),
-                Line::from(" Looking for people…".fg(MUTED)),
-                Line::from(""),
-                Line::from(" Run hopchat on another".fg(FAINT)),
-                Line::from(" device on this network.".fg(FAINT)),
-                Line::from(" No internet needed.".fg(FAINT)),
-            ];
-            frame.render_widget(Paragraph::new(lines), list);
-            return;
-        }
+        // The lobby is always listed; with no one else, say how to get people.
+        let alone = ordered.iter().all(|c| c.data.address == LOBBY);
 
         let width = list.width as usize;
         let mut y = list.y;
@@ -218,7 +209,10 @@ impl App {
                         };
                         format!("{who}{}", entry_summary(e))
                     })
-                    .unwrap_or_else(|| short(&convo.data.address));
+                    .unwrap_or_else(|| match convo.data.address.as_str() {
+                        LOBBY => "everyone nearby".into(),
+                        address => short(address),
+                    });
                 clip(&text.replace('\n', " "), width.saturating_sub(4)).fg(MUTED)
             };
             let bottom = Line::from(vec!["   ".into(), preview]);
@@ -229,6 +223,16 @@ impl App {
             y += 3;
         }
         self.peer_rows = rows;
+        if alone && y < list.y + list.height {
+            let lines = vec![
+                Line::from(" Looking for people…".fg(MUTED)),
+                Line::from(""),
+                Line::from(" Run hopchat on another".fg(FAINT)),
+                Line::from(" device on this network.".fg(FAINT)),
+                Line::from(" No internet needed.".fg(FAINT)),
+            ];
+            frame.render_widget(Paragraph::new(lines), Rect::new(list.x, y, list.width, list.y + list.height - y));
+        }
     }
 
     fn draw_main(&mut self, frame: &mut Frame, area: Rect) {
@@ -257,6 +261,14 @@ impl App {
             return;
         };
         let state = match (convo.online, convo.secure) {
+            _ if convo.data.address == LOBBY => {
+                let others = convo.data.members.len().saturating_sub(1);
+                let here = match others {
+                    0 => "just you so far".to_string(),
+                    n => format!("you and {n} nearby"),
+                };
+                vec!["# ".fg(ACCENT), here.fg(OK), "  🔒 everyone on this network".fg(MUTED)]
+            }
             _ if convo.data.group => {
                 let n = convo.data.members.len();
                 let members = format!("{n} member{}", if n == 1 { "" } else { "s" });
@@ -273,11 +285,13 @@ impl App {
         let mut spans = vec!["  ".into(), convo.data.nick.clone().bold(), "   ".into()];
         spans.extend(state);
         frame.render_widget(Line::from(spans), inner);
-        frame.render_widget(
-            Line::from(format!("{}  ", short(&convo.data.address)).fg(FAINT))
-                .alignment(Alignment::Right),
-            inner,
-        );
+        if convo.data.address != LOBBY {
+            frame.render_widget(
+                Line::from(format!("{}  ", short(&convo.data.address)).fg(FAINT))
+                    .alignment(Alignment::Right),
+                inner,
+            );
+        }
     }
 
     fn draw_history(&mut self, frame: &mut Frame, area: Rect) {
@@ -322,14 +336,25 @@ impl App {
         }
         if convo.data.entries.is_empty() {
             rows.push((Line::from(""), None));
-            let hint = if convo.data.group {
+            if convo.data.address == LOBBY {
+                let view = &self.home_view;
+                let open = view.groups.iter().chain(&view.ai_groups).any(|g| g == LOBBY);
+                for line in lobby_hint(convo.data.members.len() > 1, open) {
+                    rows.push((line, None));
+                }
+            }
+            let hint = if convo.data.address == LOBBY {
+                ""
+            } else if convo.data.group {
                 "A new group. /invite picks people to add; Ctrl-D, then g, lets them use your devices."
             } else if convo.secure {
                 "Say hello — or drop a file here."
             } else {
                 "Messages you write now are delivered when they're reachable."
             };
-            rows.push((Line::from(hint.fg(MUTED)).centered(), None));
+            if !hint.is_empty() {
+                rows.push((Line::from(hint.fg(MUTED)).centered(), None));
+            }
         }
 
         let height = area.height as usize;
@@ -418,7 +443,8 @@ impl App {
             ]));
         }
 
-        let tick = entry.mine.then(|| tick(&entry.status));
+        // Lobby messages go to whoever is around; there is no one receipt to show.
+        let tick = (entry.mine && convo.data.address != LOBBY).then(|| tick(&entry.status));
         match &entry.body {
             Body::Text(text) => {
                 let rows = wrap(text, width.saturating_sub(INDENT.len()));
@@ -844,6 +870,18 @@ impl App {
             model_line.push("  · lent to the group".fg(FAINT));
         }
         let access = match self.home_here() {
+            Some((id, name, true)) if id == LOBBY => vec![
+                "# ".fg(ACCENT),
+                name.bold(),
+                ": everyone nearby can use them".fg(OK),
+                "  · g lets only you".fg(FAINT),
+            ],
+            Some((id, name, false)) if id == LOBBY => vec![
+                "# ".fg(ACCENT),
+                name.bold(),
+                ": only you can use them".fg(MUTED),
+                "  · g lets everyone nearby in".fg(ACCENT),
+            ],
             Some((_, name, true)) => vec![
                 "# ".fg(ACCENT),
                 name.bold(),
@@ -867,6 +905,18 @@ impl App {
         let mut access_line = vec!["  Access  ".fg(MUTED)];
         access_line.extend(access);
         let ai = match self.ai_here() {
+            Some((id, name, true)) if id == LOBBY => vec![
+                "# ".fg(ACCENT),
+                name.bold(),
+                ": everyone nearby can ask the model".fg(OK),
+                "  · i lets only you".fg(FAINT),
+            ],
+            Some((id, name, false)) if id == LOBBY => vec![
+                "# ".fg(ACCENT),
+                name.bold(),
+                ": only you can ask the model".fg(MUTED),
+                "  · i lets everyone nearby ask".fg(ACCENT),
+            ],
             Some((_, name, true)) => vec![
                 "# ".fg(ACCENT),
                 name.bold(),
@@ -1225,6 +1275,7 @@ fn draw_help(frame: &mut Frame) {
         key("Alt-← · Alt-→", "move by word"),
         Line::from(""),
         head("Elsewhere"),
+        key("Lobby", "everyone nearby, always at the top · @home your devices · @ai your model"),
         key("Ctrl-G", "new group: name it, pick people, Enter"),
         key("Ctrl-D", "devices: find, pair and test them"),
         key("Ctrl-E", "protocol event log"),
@@ -1245,6 +1296,35 @@ fn draw_help(frame: &mut Frame) {
         .title(" hopchat · help ".fg(ACCENT).bold())
         .title_bottom(" ✓ on the wire · ✓✓ delivered · ✓✓ blue: read ".fg(MUTED));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// What an empty lobby says: who's here, and what you can say to it.
+fn lobby_hint(others: bool, open: bool) -> Vec<Line<'static>> {
+    let who = if others {
+        "Everyone on your network is here. Say hello."
+    } else {
+        "Just you so far. People on your network appear here by themselves."
+    };
+    vec![
+        Line::from(who.fg(MUTED)).centered(),
+        Line::from(""),
+        Line::from(vec![
+            "@home".fg(ACCENT).bold(),
+            " turn the lights down  ·  ".fg(FAINT),
+            "@ai".fg(ACCENT).bold(),
+            " ask your model anything".fg(FAINT),
+        ])
+        .centered(),
+        Line::from(
+            if open {
+                "You've let everyone here use them too (Ctrl-D to change)."
+            } else {
+                "Only you can use them here until you say otherwise (Ctrl-D)."
+            }
+            .fg(FAINT),
+        )
+        .centered(),
+    ]
 }
 
 fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
