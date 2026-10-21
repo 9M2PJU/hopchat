@@ -965,14 +965,20 @@ dependencies = [
 name = "hopchat"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "chacha20poly1305",
+ "chrono",
  "getrandom 0.4.3",
  "offline-protocol",
  "offline-protocol-core",
  "offline-protocol-mls",
  "offline-protocol-transport",
  "ratatui",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "socket2",
+ "unicode-width",
 ]
 
 [[package]]

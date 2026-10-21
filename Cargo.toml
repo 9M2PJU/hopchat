@@ -14,3 +14,9 @@ offline-protocol-transport = "0.30.0"
 ratatui = "0.30.2"
 serde_json = "1.0.154"
 socket2 = { version = "0.6.5", features = ["all"] }
+base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.10.9"
+unicode-width = "0.2.2"
