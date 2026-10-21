@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use offline_protocol::{
@@ -77,6 +77,23 @@ pub enum Command {
         reply: Option<Quote>,
         /// Written by home itself, so never handed back to it.
         from_home: bool,
+    },
+    /// The model this machine lends, or `None` to stop lending.
+    Offer(Option<String>),
+    /// Have a group member's model think about `messages`.
+    Borrow {
+        group: String,
+        messages: Vec<serde_json::Value>,
+        tools: serde_json::Value,
+        /// Lenders that already failed this turn.
+        skip: Vec<String>,
+        reply: Sender<home::lend::Borrowed>,
+    },
+    /// What this machine's model thought, for whoever borrowed it.
+    Lend {
+        to: String,
+        id: String,
+        result: Result<serde_json::Value, String>,
     },
 }
 
@@ -197,6 +214,19 @@ pub struct Engine {
     nicks: HashMap<String, String>,
     nick: String,
     address: String,
+    /// The model this machine lends, once it is ready.
+    offer: Option<String>,
+    /// Peers that lend their model, and which model.
+    lenders: HashMap<String, String>,
+    /// Borrowed turns waiting for their lender, by request id.
+    borrows: HashMap<String, Borrow>,
+}
+
+struct Borrow {
+    lender: String,
+    by: String,
+    reply: Sender<home::lend::Borrowed>,
+    since: Instant,
 }
 
 /// A fresh transfer id: our own, so the UI can track a file from the moment
@@ -274,6 +304,9 @@ pub fn open(
             nicks: HashMap::new(),
             nick: nick.to_string(),
             address,
+            offer: None,
+            lenders: HashMap::new(),
+            borrows: HashMap::new(),
         },
         me,
         store_key,
@@ -367,6 +400,7 @@ impl Engine {
                     address: address.clone(),
                 });
                 if restored {
+                    self.offer_to(&address);
                     self.update(Update::SessionReady { address });
                 }
             }
@@ -416,6 +450,27 @@ impl Engine {
                 reply,
                 from_home,
             }) => self.send_group(group, text, reply, from_home),
+            Input::Ui(Command::Offer(model)) => {
+                self.offer = model;
+                let peers: Vec<String> = self.streams.keys().cloned().collect();
+                for peer in peers {
+                    self.offer_to(&peer);
+                }
+            }
+            Input::Ui(Command::Borrow {
+                group,
+                messages,
+                tools,
+                skip,
+                reply,
+            }) => self.borrow(group, messages, tools, skip, reply),
+            Input::Ui(Command::Lend { to, id, result }) => {
+                let wire = match result {
+                    Ok(message) => home::lend::Wire::Turn { id, message },
+                    Err(error) => home::lend::Wire::Fail { id, error },
+                };
+                self.send_hidden(&to, &wire);
+            }
         }
     }
 
@@ -502,6 +557,129 @@ impl Engine {
                 sender: sender.to_string(),
                 text: question,
             }));
+        }
+    }
+
+    // ----- lending and borrowing models (see home::lend) -----------------
+
+    fn send_hidden(&mut self, to: &str, wire: &home::lend::Wire) {
+        if let Err(e) = self.protocol.send_message_with(to, &wire.encode(), SendMessageOptions::default()) {
+            self.error(format!("model message to {}: {e}", self.nick_or_address(to)));
+        }
+    }
+
+    /// Tells `peer` whether this machine lends its model.
+    fn offer_to(&mut self, peer: &str) {
+        if !self.session_ready(peer) {
+            return;
+        }
+        let wire = match &self.offer {
+            Some(model) => home::lend::Wire::Have { model: model.clone() },
+            None => home::lend::Wire::Gone,
+        };
+        self.send_hidden(peer, &wire);
+    }
+
+    fn nick_or_address(&self, address: &str) -> String {
+        self.nicks.get(address).cloned().unwrap_or_else(|| address.to_string())
+    }
+
+    fn tell_home_lenders(&self) {
+        if let Some(home) = &self.home {
+            let mut lenders: Vec<String> = self
+                .lenders
+                .iter()
+                .map(|(address, model)| format!("{} ({model})", self.nick_or_address(address)))
+                .collect();
+            lenders.sort();
+            let _ = home.send(home::Request::Lenders(lenders));
+        }
+    }
+
+    fn borrow(
+        &mut self,
+        group: String,
+        messages: Vec<serde_json::Value>,
+        tools: serde_json::Value,
+        skip: Vec<String>,
+        reply: Sender<home::lend::Borrowed>,
+    ) {
+        let members = match self.protocol.get_group_info(&group) {
+            Ok(Some(info)) => info.members,
+            _ => Vec::new(),
+        };
+        let mut candidates: Vec<(&String, &String)> = self
+            .lenders
+            .iter()
+            .filter(|(address, _)| {
+                members.contains(address)
+                    && **address != self.address
+                    && !skip.contains(address)
+                    && self.streams.contains_key(*address)
+            })
+            .collect();
+        candidates.sort();
+        let Some((lender, model)) = candidates.first().map(|(a, m)| (a.to_string(), m.to_string())) else {
+            let _ = reply.send(home::lend::Borrowed::Nobody);
+            return;
+        };
+        if !self.session_ready(&lender) {
+            let _ = reply.send(home::lend::Borrowed::Failed {
+                lender,
+                error: "no secure session yet".into(),
+            });
+            return;
+        }
+        let id = new_file_id();
+        let by = format!("{}'s {model}", self.nick_or_address(&lender));
+        self.send_hidden(
+            &lender,
+            &home::lend::Wire::Ask { id: id.clone(), group, messages, tools },
+        );
+        self.borrows.insert(id, Borrow { lender, by, reply, since: Instant::now() });
+    }
+
+    /// A hidden model message from `from`.
+    fn on_wire(&mut self, from: String, wire: home::lend::Wire) {
+        use home::lend::{Borrowed, Wire};
+        match wire {
+            Wire::Have { model } => {
+                self.lenders.insert(from, model);
+                self.tell_home_lenders();
+            }
+            Wire::Gone => {
+                if self.lenders.remove(&from).is_some() {
+                    self.tell_home_lenders();
+                }
+            }
+            Wire::Ask { id, group, messages, tools } => {
+                // Only for someone in a group we are both in.
+                let shared = matches!(
+                    self.protocol.get_group_info(&group),
+                    Ok(Some(info)) if info.members.contains(&from)
+                );
+                match &self.home {
+                    Some(home) if shared => {
+                        let who = self.nick_or_address(&from);
+                        let _ = home.send(home::Request::Lend { to: from, who, id, messages, tools });
+                    }
+                    _ => self.send_hidden(
+                        &from,
+                        &Wire::Fail { id, error: "we aren't in that group together".into() },
+                    ),
+                }
+            }
+            Wire::Turn { id, message } => {
+                if let Some(b) = self.borrows.remove(&id).filter(|b| b.lender == from) {
+                    let _ = b.reply.send(Borrowed::Answer { by: b.by, message });
+                }
+            }
+            Wire::Fail { id, error } => {
+                if let Some(b) = self.borrows.remove(&id).filter(|b| b.lender == from) {
+                    let error = format!("{}: {error}", b.by);
+                    let _ = b.reply.send(Borrowed::Failed { lender: b.lender, error });
+                }
+            }
         }
     }
 
@@ -606,6 +784,21 @@ impl Engine {
             lan.on_peer_disconnected(address);
         });
         self.protocol.on_neighbor_lost(address);
+        if self.lenders.remove(address).is_some() {
+            self.tell_home_lenders();
+        }
+        let gone: Vec<String> = self
+            .borrows
+            .iter()
+            .filter(|(_, b)| b.lender == address)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            if let Some(b) = self.borrows.remove(&id) {
+                let error = format!("{} went away", b.by);
+                let _ = b.reply.send(home::lend::Borrowed::Failed { lender: b.lender, error });
+            }
+        }
         self.update(Update::PeerDown {
             address: address.to_string(),
         });
@@ -619,7 +812,15 @@ impl Engine {
         if let Err(e) = self.protocol.process() {
             self.error(format!("process: {e}"));
         }
+        // Whoever borrowed stopped waiting long ago.
+        self.borrows.retain(|_, b| b.since.elapsed() < Duration::from_secs(300));
         while let Some(message) = self.protocol.receive_message() {
+            if let Some(wire) = home::lend::Wire::decode(&message.content) {
+                if let Some(wire) = wire {
+                    self.on_wire(message.sender.as_str().to_string(), wire);
+                }
+                continue;
+            }
             let reply = message.reply_context.as_ref().map(|r| Quote {
                 id: message
                     .reply_to_msg
@@ -672,6 +873,7 @@ impl Engine {
         match event {
             Event::SecureSessionEstablished { ref peer_id, .. } => {
                 let address = peer_id.clone();
+                self.offer_to(&address);
                 self.update(Update::SessionReady { address });
             }
             Event::GroupMessageReceived {

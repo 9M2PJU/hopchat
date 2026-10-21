@@ -10,7 +10,7 @@ use std::thread;
 
 use serde_json::{json, Value};
 
-use super::ollama::Ollama;
+use super::ollama::{text_of, Ollama};
 use super::{Home, Request};
 use crate::engine::{Command, Input, Quote};
 
@@ -51,10 +51,10 @@ impl Home {
         messages.extend(self.memory.get(&q.group).cloned().unwrap_or_default());
         let asked = json!({"role": "user", "content": format!("{}: {text}", q.from)});
         messages.push(asked.clone());
-        let model = Ollama::patient(self.config.ollama.clone(), self.config.model.clone());
+        let mind = self.mind(&q.group, Ollama::patient(self.config.ollama.clone(), self.config.model.clone()));
         let me = self.me.clone();
         thread::spawn(move || {
-            let answer = model.chat(&messages);
+            let answer = mind.think(&messages, None).map(|thought| text_of(&thought.message));
             let _ = me.send(Request::Answered { question: q, asked, answer });
         });
     }
@@ -96,7 +96,7 @@ impl Home {
     }
 
     /// `/ai on|off` in a group, and the bare `/ai` status.
-    pub(super) fn ai_configure(&mut self, group: Option<&str>, verb: &str) -> String {
+    pub(super) fn ai_configure(&mut self, group: Option<&str>, verb: &str, value: Option<&str>) -> String {
         match verb {
             "on" => {
                 let Some(group) = group else {
@@ -106,11 +106,12 @@ impl Home {
                     self.config.ai_groups.push(group.to_string());
                     self.save();
                 }
-                self.say_as(
-                    group,
-                    SIGNATURE,
-                    format!("{} is here. Mention {MENTION} to ask it anything.", self.config.model),
-                );
+                let hello = if self.model_state == super::ModelState::Ready {
+                    format!("{} is here. Mention {MENTION} to ask it anything.", self.config.model)
+                } else {
+                    format!("is listening. Mention {MENTION} to ask anything; a model someone here shares will answer.")
+                };
+                self.say_as(group, SIGNATURE, hello);
                 format!("this group can ask {} now", self.config.model)
             }
             "off" => {
@@ -120,6 +121,16 @@ impl Home {
                 self.save();
                 self.say_as(group, SIGNATURE, "has gone quiet.".into());
                 "this group can't ask your model any more".into()
+            }
+            "share" | "lend" => {
+                self.config.share = !matches!(value, Some("off" | "no"));
+                self.save();
+                self.offer();
+                if self.config.share {
+                    format!("group members can borrow your {} when theirs isn't running", self.config.model)
+                } else {
+                    "nobody can borrow your model now".into()
+                }
             }
             "forget" => {
                 let Some(group) = group else { return "open the group whose chat to forget".into() };
@@ -133,8 +144,14 @@ impl Home {
                     Some(_) => " · off here",
                     None => "",
                 };
+                let shared = if self.config.share { "shared" } else { "not shared" };
+                let borrow = if self.lenders.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · can borrow {}", self.lenders.join(", "))
+                };
                 format!(
-                    "ai: model {} · on in {n} group{}{here} · /ai on|off in a group",
+                    "ai: model {} ({shared}) · on in {n} group{}{here}{borrow} · /ai on|off in a group · /ai share on|off",
                     self.config.model,
                     if n == 1 { "" } else { "s" },
                 )

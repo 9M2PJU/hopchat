@@ -41,7 +41,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/leave", "leave this group"),
     ("/devices", "find, pair and test your smart devices (also Ctrl-D)"),
     ("/home", "/home on|off lets this group use your devices · /home add IP"),
-    ("/ai", "/ai on|off lets this group ask your model anything with @ai · /ai forget"),
+    ("/ai", "/ai on|off lets this group ask your model with @ai · /ai share on|off lends it"),
     ("/me", "show and copy your own address"),
     ("/clear", "delete this conversation from this device"),
     ("/log", "show or hide the protocol event log"),
@@ -832,6 +832,17 @@ impl App {
         };
         let mut model_line = vec!["  Model   ".fg(MUTED)];
         model_line.extend(model);
+        // Without a model here, home thinks with a group member's.
+        if view.model_state != ModelState::Ready && !view.lenders.is_empty() {
+            model_line = vec![
+                "  Model   ".fg(MUTED),
+                "● ".fg(OK),
+                "borrowing ".fg(MUTED),
+                view.lenders.join(", ").bold(),
+            ];
+        } else if view.model_state == ModelState::Ready && view.share {
+            model_line.push("  · lent to the group".fg(FAINT));
+        }
         let access = match self.home_here() {
             Some((_, name, true)) => vec![
                 "# ".fg(ACCENT),

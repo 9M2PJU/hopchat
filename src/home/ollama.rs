@@ -1,5 +1,5 @@
 //! A local model behind Ollama's `/api/chat`, with tool calling. Nothing
-//! leaves the machine.
+//! leaves the network: at most it is lent to a group member (see `lend`).
 
 use std::time::Duration;
 
@@ -46,51 +46,16 @@ pub struct Call {
     pub args: Value,
 }
 
+/// One model turn; `Act` carries the assistant message to append before
+/// the tool results.
 pub enum Turn {
     Say(String),
     Act(Vec<Call>, Value),
 }
 
-impl Ollama {
-    pub fn new(url: String, model: String) -> Self {
-        Self::with_timeout(url, model, TURN)
-    }
-
-    /// For [`Ollama::chat`], which writes whole answers.
-    pub fn patient(url: String, model: String) -> Self {
-        Self::with_timeout(url, model, ANSWER)
-    }
-
-    fn with_timeout(url: String, model: String, timeout: Duration) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .build()
-            .new_agent();
-        Self { url, model, agent }
-    }
-
-    /// A plain answer to `messages`, with no tools.
-    pub fn chat(&self, messages: &[Value]) -> Result<String, String> {
-        let message = self.post(&json!({
-            "model": self.model,
-            "messages": messages,
-            "stream": false,
-        }))?;
-        let text = message.get("content").and_then(Value::as_str).unwrap_or_default();
-        Ok(text.trim().to_string())
-    }
-
-    /// One model turn over `messages`; `Act` carries the assistant message
-    /// to append before the tool results.
-    pub fn turn(&self, messages: &[Value], tools: &Value) -> Result<Turn, String> {
-        let request = json!({
-            "model": self.model,
-            "messages": messages,
-            "tools": tools,
-            "stream": false,
-            "options": {"temperature": 0},
-        });
-        let message = self.post(&request)?;
+impl Turn {
+    /// Reads an assistant message, ours or one a lender sent.
+    pub fn from_message(message: Value) -> Turn {
         let calls: Vec<Call> = message
             .get("tool_calls")
             .and_then(Value::as_array)
@@ -110,11 +75,48 @@ impl Ollama {
             })
             .unwrap_or_default();
         if calls.is_empty() {
-            let text = message.get("content").and_then(Value::as_str).unwrap_or_default();
-            Ok(Turn::Say(text.trim().to_string()))
+            Turn::Say(text_of(&message))
         } else {
-            Ok(Turn::Act(calls, message))
+            Turn::Act(calls, message)
         }
+    }
+}
+
+pub fn text_of(message: &Value) -> String {
+    message.get("content").and_then(Value::as_str).unwrap_or_default().trim().to_string()
+}
+
+impl Ollama {
+    pub fn new(url: String, model: String) -> Self {
+        Self::with_timeout(url, model, TURN)
+    }
+
+    /// For plain answers, which are written out whole.
+    pub fn patient(url: String, model: String) -> Self {
+        Self::with_timeout(url, model, ANSWER)
+    }
+
+    fn with_timeout(url: String, model: String, timeout: Duration) -> Self {
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .build()
+            .new_agent();
+        Self { url, model, agent }
+    }
+
+    /// The assistant message the model writes for `messages`: with
+    /// `tools`, a deterministic turn that may call them.
+    pub fn raw(&self, messages: &[Value], tools: Option<&Value>) -> Result<Value, String> {
+        let mut request = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": false,
+        });
+        if let Some(tools) = tools {
+            request["tools"] = tools.clone();
+            request["options"] = json!({"temperature": 0});
+        }
+        self.post(&request)
     }
 
     /// Sends one `/api/chat` request and returns the assistant message.

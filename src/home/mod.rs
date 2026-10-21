@@ -7,10 +7,13 @@
 //! permission: anyone MLS admitted to that group may ask.
 //!
 //! The same model also answers `@ai`, for anything at all, in the groups
-//! the host has switched that on for (see [`ai`]).
+//! the host has switched that on for (see [`ai`]). The model needn't be on
+//! this machine: with none ready here, a group member's is borrowed (see
+//! [`lend`]), and this machine lends its own the same way.
 
 pub mod ai;
 mod assistant;
+pub mod lend;
 mod discover;
 mod ollama;
 pub mod webos;
@@ -19,7 +22,9 @@ pub mod wiz;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,6 +40,11 @@ const MAX_REQUEST_CHARS: usize = 500;
 const MAX_NAME_CHARS: usize = 32;
 /// How long the TV shows its "allow this device?" prompt.
 const PAIRING: Duration = Duration::from_secs(60);
+/// How often to look again at whether the model is ready, so one started
+/// later is used and offered.
+const MODEL_CHECK: Duration = Duration::from_secs(30);
+/// Turns lent out at once; the rest are turned away.
+const MAX_LENDING: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -95,6 +105,9 @@ pub struct Config {
     pub model: String,
     #[serde(default = "default_ollama")]
     pub ollama: String,
+    /// Whether group members may borrow this machine's model.
+    #[serde(default = "yes")]
+    pub share: bool,
     // The single-bulb, single-TV settings of earlier versions, folded into
     // `devices` when read.
     #[serde(default, skip_serializing)]
@@ -107,6 +120,10 @@ pub struct Config {
     tv_key: Option<String>,
     #[serde(default, skip_serializing)]
     tv_cert: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_model() -> String {
@@ -129,6 +146,7 @@ impl Default for Config {
             ai_groups: Vec::new(),
             model: default_model(),
             ollama: default_ollama(),
+            share: true,
             bulb: None,
             tv: None,
             tv_mac: None,
@@ -213,6 +231,9 @@ pub struct View {
     pub groups: Vec<String>,
     /// Groups that may ask the model with `@ai`.
     pub ai_groups: Vec<String>,
+    /// Peers who lend their model, as "bob (qwen2.5:7b)".
+    pub lenders: Vec<String>,
+    pub share: bool,
 }
 
 /// What the rest of hopchat asks of home.
@@ -237,6 +258,11 @@ pub enum Request {
     Checked { id: String, state: State, detail: String },
     Paired { id: String, result: Result<(webos::Learned, String), String> },
     ModelChecked(ModelState),
+    CheckModel,
+    /// The peers that currently lend their model, from the engine.
+    Lenders(Vec<String>),
+    /// A group member wants this machine's model to think.
+    Lend { to: String, who: String, id: String, messages: Vec<serde_json::Value>, tools: serde_json::Value },
     Answered { question: ai::Question, asked: serde_json::Value, answer: Result<String, String> },
 }
 
@@ -273,6 +299,13 @@ pub struct Home {
     model_state: ModelState,
     /// Each group's recent `@ai` chat, oldest first.
     memory: HashMap<String, Vec<serde_json::Value>>,
+    lenders: Vec<String>,
+    /// What the engine was last told this machine lends.
+    offered: Option<String>,
+    lending: Arc<AtomicUsize>,
+    /// Who was last told about borrowing this model, and when, so one
+    /// request doesn't note every turn.
+    lent_to: Option<(String, Instant)>,
 }
 
 impl Home {
@@ -294,6 +327,10 @@ impl Home {
             scanning: false,
             model_state: ModelState::Unknown,
             memory: HashMap::new(),
+            lenders: Vec::new(),
+            offered: None,
+            lending: Arc::new(AtomicUsize::new(0)),
+            lent_to: None,
         }
     }
 
@@ -363,6 +400,8 @@ impl Home {
             model_state: self.model_state.clone(),
             groups: self.config.groups.clone(),
             ai_groups: self.config.ai_groups.clone(),
+            lenders: self.lenders.clone(),
+            share: self.config.share,
         }
     }
 
@@ -382,6 +421,12 @@ impl Home {
     pub fn run(mut self, requests: Receiver<Request>) {
         self.publish();
         self.scan();
+        let me = self.me.clone();
+        thread::spawn(move || {
+            while me.send(Request::CheckModel).is_ok() {
+                thread::sleep(MODEL_CHECK);
+            }
+        });
         for request in requests {
             self.handle(request);
             self.publish();
@@ -393,7 +438,7 @@ impl Home {
             Request::Ask { group, from, text } => {
                 if self.enabled(&group) {
                     let text: String = text.chars().take(MAX_REQUEST_CHARS).collect();
-                    let answer = self.ask(&from, &text);
+                    let answer = self.ask(&group, &from, &text);
                     self.say(&group, answer);
                 }
             }
@@ -446,7 +491,13 @@ impl Home {
                 }
             }
             Request::Paired { id, result } => self.on_paired(&id, result),
-            Request::ModelChecked(state) => self.model_state = state,
+            Request::ModelChecked(state) => {
+                self.model_state = state;
+                self.offer();
+            }
+            Request::CheckModel => self.check_model(),
+            Request::Lenders(lenders) => self.lenders = lenders,
+            Request::Lend { to, who, id, messages, tools } => self.lend(to, who, id, messages, tools),
         }
     }
 
@@ -715,7 +766,7 @@ impl Home {
         let verb = words.next().unwrap_or("status");
         let value = words.next();
         match (verb, value) {
-            ("ai", verb) => self.ai_configure(group, verb.unwrap_or("status")),
+            ("ai", verb) => self.ai_configure(group, verb.unwrap_or("status"), words.next()),
             ("on", _) => {
                 let Some(group) = group else {
                     return "open a group first: /home on lets that group use your devices".into();
@@ -744,12 +795,8 @@ impl Home {
                 self.config.model = model.to_string();
                 self.save();
                 self.model_state = ModelState::Unknown;
-                let me = self.me.clone();
-                let url = self.config.ollama.clone();
-                let model = model.to_string();
-                thread::spawn(move || {
-                    let _ = me.send(Request::ModelChecked(ollama::check(&url, &model)));
-                });
+                self.offer();
+                self.check_model();
                 format!("home will use {}", self.config.model)
             }
             ("scan", _) => {
@@ -765,6 +812,68 @@ impl Home {
                 if self.config.groups.len() == 1 { "" } else { "s" },
             ),
         }
+    }
+
+    // ----- the model: whether it is ready, and lending it -------------------
+
+    fn check_model(&self) {
+        let me = self.me.clone();
+        let (url, model) = (self.config.ollama.clone(), self.config.model.clone());
+        thread::spawn(move || {
+            let _ = me.send(Request::ModelChecked(ollama::check(&url, &model)));
+        });
+    }
+
+    /// Where this machine's model turns get computed, for `group`.
+    fn mind(&self, group: &str, local: ollama::Ollama) -> lend::Mind {
+        lend::Mind {
+            local,
+            local_ready: self.model_state == ModelState::Ready,
+            engine: self.engine.clone(),
+            group: group.to_string(),
+        }
+    }
+
+    /// Tells the engine what this machine lends, when that changed.
+    fn offer(&mut self) {
+        let offer = (self.config.share && self.model_state == ModelState::Ready)
+            .then(|| self.config.model.clone());
+        if offer != self.offered {
+            self.offered = offer.clone();
+            let _ = self.engine.send(Input::Ui(Command::Offer(offer)));
+        }
+    }
+
+    fn lend(&mut self, to: String, who: String, id: String, messages: Vec<serde_json::Value>, tools: serde_json::Value) {
+        let refuse = |error: &str| {
+            let _ = self.engine.send(Input::Ui(Command::Lend { to: to.clone(), id: id.clone(), result: Err(error.into()) }));
+        };
+        if !self.config.share {
+            return refuse("isn't sharing its model");
+        }
+        if self.model_state != ModelState::Ready {
+            return refuse("its model isn't ready");
+        }
+        if self.lending.load(Ordering::SeqCst) >= MAX_LENDING {
+            return refuse("is busy; try again in a moment");
+        }
+        let fresh = !matches!(&self.lent_to, Some((w, at)) if *w == who && at.elapsed() < Duration::from_secs(60));
+        if fresh {
+            self.note(format!("{who} is using your {}", self.config.model));
+        }
+        self.lent_to = Some((who, Instant::now()));
+        // A plain answer is written out in full, so it gets longer.
+        let tools = tools.as_array().filter(|t| !t.is_empty()).map(|_| tools.clone());
+        let (url, model) = (self.config.ollama.clone(), self.config.model.clone());
+        let local = if tools.is_some() { ollama::Ollama::new(url, model) } else { ollama::Ollama::patient(url, model) };
+        let engine = self.engine.clone();
+        let lending = self.lending.clone();
+        lending.fetch_add(1, Ordering::SeqCst);
+        thread::spawn(move || {
+            let result = local.raw(&messages, tools.as_ref());
+            lending.fetch_sub(1, Ordering::SeqCst);
+            let _ = engine.send(Input::Ui(Command::Lend { to, id, result }));
+        });
     }
 
     /// For a device the scan can't see (another subnet, broadcasts
@@ -792,7 +901,7 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::assistant::{colour, flag, number, text};
-    use super::ollama::{Ollama, Turn};
+    use super::ollama::{self, Ollama, Turn};
     use super::*;
     use serde_json::json;
 
@@ -845,9 +954,97 @@ mod tests {
     }
 
     #[test]
-    fn older_settings_have_no_ai_groups() {
+    fn older_settings_share_the_model_and_have_no_ai_groups() {
         let config: Config = serde_json::from_value(json!({"groups": ["g"]})).unwrap();
+        assert!(config.share);
         assert!(config.ai_groups.is_empty());
+    }
+
+    #[test]
+    fn lends_only_a_ready_shared_model() {
+        let (mut home, engine) = wired_home();
+        let refused = |engine: &std::sync::mpsc::Receiver<Input>| match engine.try_recv() {
+            Ok(Input::Ui(Command::Lend { to, id, result: Err(e) })) => {
+                assert_eq!((to.as_str(), id.as_str()), ("bob", "7"));
+                e
+            }
+            _ => panic!("expected a refusal"),
+        };
+        let ask = || Request::Lend {
+            to: "bob".into(),
+            who: "bob".into(),
+            id: "7".into(),
+            messages: vec![json!({"role": "user", "content": "hi"})],
+            tools: serde_json::Value::Null,
+        };
+        home.handle(ask());
+        assert!(refused(&engine).contains("isn't ready"));
+        home.model_state = ModelState::Ready;
+        home.config.share = false;
+        home.handle(ask());
+        assert!(refused(&engine).contains("isn't sharing"));
+    }
+
+    #[test]
+    fn offers_the_model_only_when_it_changes() {
+        let (mut home, engine) = wired_home();
+        home.handle(Request::ModelChecked(ModelState::Ready));
+        assert!(matches!(engine.try_recv(), Ok(Input::Ui(Command::Offer(Some(m)))) if m == "qwen2.5:7b"));
+        home.handle(Request::ModelChecked(ModelState::Ready));
+        assert!(engine.try_recv().is_err(), "the same offer isn't sent again");
+        home.handle(Request::Configure { group: None, args: "ai share off".into() });
+        assert!(matches!(engine.try_recv(), Ok(Input::Ui(Command::Offer(None)))));
+    }
+
+    #[test]
+    fn without_a_model_here_a_members_is_borrowed() {
+        let (engine, requests) = std::sync::mpsc::channel();
+        // A stand-in engine with one lender in the group.
+        std::thread::spawn(move || {
+            for input in requests {
+                if let Input::Ui(Command::Borrow { group, skip, reply, .. }) = input {
+                    assert_eq!(group, "g");
+                    let _ = reply.send(if skip.is_empty() {
+                        lend::Borrowed::Answer {
+                            by: "bob's qwen2.5:7b".into(),
+                            message: json!({"role": "assistant", "content": "four"}),
+                        }
+                    } else {
+                        lend::Borrowed::Nobody
+                    });
+                }
+            }
+        });
+        // Nothing listens on the discard port.
+        let mind = lend::Mind {
+            local: Ollama::new("http://127.0.0.1:9".into(), "m".into()),
+            local_ready: false,
+            engine,
+            group: "g".into(),
+        };
+        let thought = mind.think(&[json!({"role": "user", "content": "2+2?"})], None).unwrap();
+        assert_eq!(thought.by.as_deref(), Some("bob's qwen2.5:7b"));
+        assert_eq!(ollama::text_of(&thought.message), "four");
+    }
+
+    #[test]
+    fn nobody_to_borrow_from_says_so() {
+        let (engine, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for input in requests {
+                if let Input::Ui(Command::Borrow { reply, .. }) = input {
+                    let _ = reply.send(lend::Borrowed::Nobody);
+                }
+            }
+        });
+        let mind = lend::Mind {
+            local: Ollama::new("http://127.0.0.1:9".into(), "m".into()),
+            local_ready: false,
+            engine,
+            group: "g".into(),
+        };
+        let e = mind.think(&[], None).err().unwrap();
+        assert!(e.contains("can't reach Ollama") && e.contains("nobody else in the group shares"), "{e}");
     }
 
     #[test]
@@ -964,7 +1161,7 @@ mod tests {
                 json!({"role": "system", "content": home.system_prompt()}),
                 json!({"role": "user", "content": format!("bob: {ask}")}),
             ];
-            let Turn::Act(calls, _) = model.turn(&messages, &home.tools()).unwrap() else {
+            let Turn::Act(calls, _) = Turn::from_message(model.raw(&messages, Some(&home.tools())).unwrap()) else {
                 panic!("{ask}: no tool call");
             };
             let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();

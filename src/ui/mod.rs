@@ -1753,6 +1753,11 @@ mod render_tests {
         ] {
             assert!(screen.contains(needle), "missing {needle:?}");
         }
+        // No model here, but a group member lends theirs.
+        app.home_view.lenders = vec!["bob (llama3.2)".into()];
+        let lent = self::screen(&mut app);
+        assert!(lent.contains("borrowing bob (llama3.2)"), "{lent}");
+        assert!(!lent.contains("ollama serve"));
     }
 
     #[test]

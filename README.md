@@ -52,7 +52,7 @@ A local model (via [Ollama](https://ollama.com)) turns the request into device a
 
 Setup on the host:
 
-1. `ollama serve`, with a tool-calling model pulled (`ollama pull qwen2.5:7b` is the default; `/home model NAME` picks another).
+1. `ollama serve`, with a tool-calling model pulled (`ollama pull qwen2.5:7b` is the default; `/home model NAME` picks another). The host can skip this if someone else in the group runs a model: see [One model for the whole group](#one-model-for-the-whole-group).
 2. Press **Ctrl-D** (or `/devices`). hopchat scans the network for Wiz lights and LG TVs and lists what it finds.
    - **A light:** Enter adds it, `t` blinks it so you can tell which one it is, and `n` gives it a name people will use ("Desk lamp").
    - **A TV:** Enter pairs it. The TV asks whether to allow hopchat; choose *Allow* with the remote. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings. A TV only shows up while it's switched on.
@@ -81,7 +81,11 @@ Only one person in a group needs to run a model. Everyone else can use it.
 
 The answer comes back as a 🤖 reply to the question. Each group's recent questions and answers are remembered, so follow-ups work. `/ai forget` clears that memory, and `/ai off` stops answering.
 
-Answers come from the model in step 1 of the setup above (or `/home model NAME`). Like `@home`, being in the group is the permission, and nothing leaves your network.
+**It thinks for `@home` too.** The machine with the devices doesn't need a model. If none is ready there, home sends each step to a model that someone in the group shares, and runs the device actions itself. The other machine only does the thinking and never touches the devices. The Devices panel shows `borrowing bob (qwen2.5:7b)`. `@ai` works the same way on a host whose own model is down.
+
+**Sharing.** A machine whose model is ready offers it to the people it is connected to. It answers only someone who is in a group with it, for that group's question, and at most two requests at a time. It shows a note when someone starts using it ("alice is using your qwen2.5:7b"). `/ai share off` stops lending, and `/ai share on` resumes it. A bare `/ai` shows the model, where it's on, and whose models you could borrow.
+
+The questions, and for `@home` the device names and states, go to the lender inside the same end-to-end encrypted one-to-one session as chat. They are never shown as messages. Nothing leaves your network.
 
 ## Headless modes
 

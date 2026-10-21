@@ -10,19 +10,28 @@ use super::{webos, wiz, Device, Home, Kind};
 const MAX_TURNS: usize = 4;
 
 impl Home {
-    pub(super) fn ask(&mut self, from: &str, text: &str) -> String {
+    pub(super) fn ask(&mut self, group: &str, from: &str, text: &str) -> String {
         if self.lights().is_empty() && self.tvs().is_empty() {
             return "no devices are set up yet; whoever hosts home can add them with /devices.".into();
         }
-        let model = Ollama::new(self.config.ollama.clone(), self.config.model.clone());
+        let mind = self.mind(group, Ollama::new(self.config.ollama.clone(), self.config.model.clone()));
         let tools = self.tools();
         let mut messages = vec![
             json!({"role": "system", "content": self.system_prompt()}),
             json!({"role": "user", "content": format!("{from}: {text}")}),
         ];
         let mut done = Vec::new();
+        // Whose model thought, when it wasn't this machine's.
+        let mut via = None;
         for _ in 0..MAX_TURNS {
-            match model.turn(&messages, &tools) {
+            let turn = mind.think(&messages, Some(&tools)).map(|thought| {
+                if thought.by.is_some() && via.is_none() {
+                    self.note(format!("home: thinking with {}", thought.by.as_deref().unwrap_or_default()));
+                    via = thought.by;
+                }
+                Turn::from_message(thought.message)
+            });
+            match turn {
                 Ok(Turn::Say(text)) if !text.is_empty() => return one_line(&text),
                 Ok(Turn::Say(_)) => break,
                 Ok(Turn::Act(calls, assistant)) => {
