@@ -11,6 +11,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::devices::{self, Devices, Primary};
+use super::groups::{Candidate, Focus, GroupPanel};
 use super::picker::{self, Picker};
 use crate::home::{self, DeviceView, ModelState, State};
 use super::{App, Convo, Mode};
@@ -34,8 +35,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/file", "attach and send files (path, or no path for the picker)"),
     ("/downloads", "open the folder received files are saved in"),
     ("/info", "show who this peer is and how they are connected"),
-    ("/group", "start a group: /group NAME"),
-    ("/invite", "add someone nearby to this group: /invite NICK"),
+    ("/group", "start a group and pick who's in it (also Ctrl-G) · /group NAME"),
+    ("/invite", "add people to this group · /invite NICK"),
     ("/members", "list who is in this group"),
     ("/leave", "leave this group"),
     ("/devices", "find, pair and test your smart devices (also Ctrl-D)"),
@@ -88,6 +89,7 @@ impl App {
         match &self.mode {
             Mode::Picker(picker) => draw_picker(frame, picker),
             Mode::Devices(panel) => self.draw_devices(frame, panel),
+            Mode::Groups(panel) => self.draw_groups(frame, panel),
             Mode::Help => draw_help(frame),
             _ => {}
         }
@@ -128,6 +130,19 @@ impl App {
             ]),
             me,
         );
+
+        let [new_group, list] =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(list);
+        let hover = matches!(self.mode, Mode::Groups(_));
+        let row = Rect::new(new_group.x, new_group.y, new_group.width, 1);
+        let label = Line::from(vec![
+            if hover { "▌".fg(ACCENT) } else { " ".into() },
+            "+ ".fg(ACCENT).bold(),
+            "New group".into(),
+        ]);
+        frame.render_widget(label, row);
+        frame.render_widget(Line::from("Ctrl-G ".fg(FAINT)).alignment(Alignment::Right), row);
+        self.new_group_row = row;
 
         self.peer_rows.clear();
         let ordered: Vec<&Convo> = self.ordered();
@@ -307,7 +322,7 @@ impl App {
         if convo.data.entries.is_empty() {
             rows.push((Line::from(""), None));
             let hint = if convo.data.group {
-                "A new group. /invite NICK adds people; Ctrl-D, then g, lets them use your devices."
+                "A new group. /invite picks people to add; Ctrl-D, then g, lets them use your devices."
             } else if convo.secure {
                 "Say hello — or drop a file here."
             } else {
@@ -648,6 +663,18 @@ impl App {
             Mode::Devices(ref panel) if panel.renaming.is_some() => {
                 &[("type", "a name"), ("Enter", "save"), ("Esc", "cancel")]
             }
+            Mode::Groups(ref panel) if panel.focus == Focus::Name => &[
+                ("type", "a name"),
+                ("↓", "pick people"),
+                ("Enter", "create"),
+                ("Esc", "cancel"),
+            ],
+            Mode::Groups(ref panel) => &[
+                ("↑↓", "move"),
+                ("Space", "pick"),
+                ("Enter", if panel.target.is_some() { "add them" } else { "create" }),
+                ("Esc", "cancel"),
+            ],
             Mode::Devices(_) => &[
                 ("↑↓", "move"),
                 ("Enter", "add/pair/test"),
@@ -660,6 +687,7 @@ impl App {
             Mode::Normal => &[
                 ("Enter", "send"),
                 ("Ctrl-O", "attach"),
+                ("Ctrl-G", "new group"),
                 ("Ctrl-D", "devices"),
                 ("Tab", "next chat"),
                 ("↑", "select"),
@@ -827,6 +855,133 @@ impl App {
         access_line.extend(access);
         vec![rule, Line::from(model_line), Line::from(access_line)]
     }
+}
+
+impl App {
+    fn draw_groups(&self, frame: &mut Frame, panel: &GroupPanel) {
+        let people = self.candidates(panel);
+        let area = centered(frame.area(), 60, 70);
+        frame.render_widget(Clear, area);
+        let title = match &panel.target {
+            Some((_, name)) => format!(" Add people to #{name} "),
+            None => " New group ".to_string(),
+        };
+        let picked = people.iter().filter(|p| panel.is_picked(&p.address)).count();
+        let count = if picked == 0 {
+            " Space picks people ".fg(MUTED)
+        } else {
+            format!(" {picked} picked ").fg(ACCENT)
+        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(ACCENT))
+            .title(title.fg(ACCENT).bold())
+            .title(Line::from(count).alignment(Alignment::Right));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let name_height = if panel.target.is_some() { 0 } else { 2 };
+        let [name, list, help] = Layout::vertical([
+            Constraint::Length(name_height),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .areas(inner);
+
+        if panel.target.is_none() {
+            let naming = panel.focus == Focus::Name;
+            let field = if panel.name.is_empty() && !naming {
+                "untitled".fg(FAINT)
+            } else if panel.name.is_empty() {
+                "e.g. house, weekend trip".fg(FAINT)
+            } else {
+                Span::raw(panel.name.clone()).bold()
+            };
+            let label = if naming { " Name  › ".fg(ACCENT).bold() } else { " Name  › ".fg(MUTED) };
+            frame.render_widget(Line::from(vec![label, "#".fg(ACCENT), field]), name);
+            if naming {
+                let x = name.x + 10 + panel.name.width() as u16;
+                frame.set_cursor_position(Position::new(x.min(name.right().saturating_sub(1)), name.y));
+            }
+        }
+
+        let width = list.width as usize;
+        let mut lines = vec![Line::from(" People".fg(MUTED).bold())];
+        let in_list = panel.focus == Focus::People;
+        for (i, person) in people.iter().enumerate() {
+            lines.push(candidate_line(person, panel, in_list && i == panel.cursor, width));
+        }
+        if people.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("  Nobody nearby yet.".fg(MUTED)));
+            lines.push(Line::from("  You can still create it now and add people later with /invite.".fg(FAINT)));
+        }
+        let height = list.height as usize;
+        let skip = (panel.cursor + 3).saturating_sub(height);
+        let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
+        frame.render_widget(Paragraph::new(lines), list);
+
+        let key = |k: &str| k.to_string().fg(ACCENT).bold();
+        let say = |t: &str| t.to_string().fg(MUTED);
+        let names: Vec<String> = people
+            .iter()
+            .filter(|p| panel.is_picked(&p.address))
+            .map(|p| p.nick.clone())
+            .collect();
+        let who = if names.is_empty() { "just you".to_string() } else { format!("you, {}", names.join(", ")) };
+        let first = match (panel.warning, &panel.target) {
+            (Some(warning), _) => Line::from(vec!["  ".into(), warning.fg(WARN)]),
+            (None, Some(_)) => Line::from(vec!["  ".into(), key("Space"), say(" picks someone · "), key("Enter"), say(" invites them")]),
+            (None, None) if panel.focus == Focus::Name => Line::from(vec!["  ".into(), say("Name it, then "), key("↓"), say(" to pick people · "), key("Enter"), say(" creates it")]),
+            (None, None) => Line::from(vec!["  ".into(), key("Space"), say(" picks · "), key("↑"), say(" back to the name · "), key("Enter"), say(" creates it")]),
+        };
+        let second = match &panel.target {
+            Some(_) => Line::from(vec!["  ".into(), clip(&format!("Adding: {}", if names.is_empty() { "nobody yet".into() } else { names.join(", ") }), width.saturating_sub(4)).fg(FAINT)]),
+            None => Line::from(vec!["  ".into(), clip(&format!("In it: {who}"), width.saturating_sub(4)).fg(FAINT)]),
+        };
+        frame.render_widget(Paragraph::new(vec![Line::from(""), first, second]), help);
+    }
+}
+
+fn candidate_line(person: &Candidate, panel: &GroupPanel, selected: bool, width: usize) -> Line<'static> {
+    let marker = if selected { "▌".fg(ACCENT) } else { " ".into() };
+    let pickable = person.pickable();
+    let check = match () {
+        _ if person.member => "[✓]".fg(FAINT),
+        _ if panel.is_picked(&person.address) => "[✓]".fg(ACCENT).bold(),
+        _ if pickable => "[ ]".fg(MUTED),
+        _ => "[ ]".fg(FAINT),
+    };
+    let (dot, state) = match (person.member, person.online, person.secure) {
+        (true, _, _) => ("●".fg(FAINT), "already in the group".fg(FAINT)),
+        (false, true, true) => ("●".fg(OK), "online".fg(MUTED)),
+        (false, true, false) => ("◐".fg(WARN), "connecting…".fg(WARN)),
+        (false, false, _) => ("○".fg(FAINT), "offline · can't be added now".fg(FAINT)),
+    };
+    let name = clip(&person.nick, 20);
+    let pad = 22usize.saturating_sub(name.width());
+    let name = if !pickable {
+        name.fg(FAINT)
+    } else if selected {
+        name.bold()
+    } else {
+        name.into()
+    };
+    // The address tells two people with one nick apart, when there's room.
+    let address = if width >= 66 { short(&person.address) } else { String::new() };
+    let line = Line::from(vec![
+        marker,
+        " ".into(),
+        check,
+        " ".into(),
+        dot,
+        " ".into(),
+        name,
+        " ".repeat(pad).into(),
+        state,
+        "  ".into(),
+        address.fg(FAINT),
+    ]);
+    if selected { line.style(Style::new().bg(SELECTED_BG)) } else { line }
 }
 
 fn device_line(d: &DeviceView, selected: bool, panel: &Devices, width: usize) -> Line<'static> {
@@ -1034,6 +1189,7 @@ fn draw_help(frame: &mut Frame) {
         key("Alt-← · Alt-→", "move by word"),
         Line::from(""),
         head("Elsewhere"),
+        key("Ctrl-G", "new group: name it, pick people, Enter"),
         key("Ctrl-D", "devices: find, pair and test them"),
         key("Ctrl-E", "protocol event log"),
         key("Ctrl-C · Ctrl-Q", "quit"),

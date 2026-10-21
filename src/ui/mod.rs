@@ -3,6 +3,7 @@
 
 mod devices;
 mod editor;
+mod groups;
 mod picker;
 mod render;
 
@@ -27,6 +28,7 @@ use crate::history::{self, Body, Conversation, Entry, Quoted, Status, Transfer};
 use crate::home;
 use devices::Devices;
 use editor::Editor;
+use groups::{Candidate, GroupPanel};
 use picker::{Outcome, Picker};
 
 const LOG_LINES: usize = 300;
@@ -94,6 +96,7 @@ pub enum Mode {
     Select(usize),
     Picker(Picker),
     Devices(Devices),
+    Groups(GroupPanel),
     Help,
 }
 
@@ -117,6 +120,7 @@ pub struct App {
     pub downloads: PathBuf,
     /// Areas from the last draw, for the mouse.
     pub peer_rows: Vec<(Rect, String)>,
+    pub new_group_row: Rect,
     pub chat_area: Rect,
     /// Message id or file id → the conversation it belongs to.
     owners: HashMap<String, String>,
@@ -180,6 +184,7 @@ impl App {
             flash: None,
             downloads,
             peer_rows: Vec::new(),
+            new_group_row: Rect::default(),
             chat_area: Rect::default(),
             owners,
             store,
@@ -546,6 +551,7 @@ impl App {
                 convo.secure = false;
                 convo.push(notice("you are no longer in this group".into()));
             }
+            Update::GroupCreated { id } => self.select(Some(id), send),
             Update::GroupQueued {
                 group,
                 id,
@@ -841,8 +847,29 @@ impl App {
                     self.mode = Mode::Devices(panel);
                 }
             },
+            Mode::Groups(mut panel) => {
+                let people = self.candidates(&panel);
+                match panel.key(key, &people) {
+                    groups::Action::Close => {}
+                    groups::Action::Stay => self.mode = Mode::Groups(panel),
+                    groups::Action::Create { name, members } => {
+                        self.flash(format!("starting #{name}{}", self.with_whom(&members)));
+                        send(Command::CreateGroup { name, members });
+                    }
+                    groups::Action::Invite { group, members } => {
+                        self.flash(format!("inviting{}…", self.with_whom(&members).trim_start_matches(" with")));
+                        for member in members {
+                            send(Command::Invite {
+                                group: group.clone(),
+                                member,
+                            });
+                        }
+                    }
+                }
+            }
             Mode::Select(at) => self.select_key(at, key, send),
             Mode::Normal if ctrl && key.code == KeyCode::Char('d') => self.open_devices(),
+            Mode::Normal if ctrl && key.code == KeyCode::Char('g') => self.open_groups(""),
             Mode::Normal => self.normal_key(key, ctrl, alt, send),
         }
     }
@@ -1054,6 +1081,7 @@ impl App {
                 }
                 return;
             }
+            Mode::Groups(panel) => return panel.type_str(text),
             Mode::Normal => {}
             _ => self.mode = Mode::Normal,
         }
@@ -1092,6 +1120,8 @@ impl App {
                     .map(|(_, a)| a.clone());
                 if hit.is_some() {
                     self.select(hit, &|_| {});
+                } else if inside(self.new_group_row) {
+                    self.open_groups("");
                 }
             }
             _ => {}
@@ -1254,9 +1284,19 @@ impl App {
                 self.flash(format!("{text} (address copied)"));
             }
             "group" | "newgroup" if !arg.is_empty() => {
-                send(Command::CreateGroup { name: arg.to_string() });
+                send(Command::CreateGroup {
+                    name: arg.to_string(),
+                    members: Vec::new(),
+                });
             }
-            "group" | "newgroup" => self.flash_error("name it: /group NAME"),
+            "group" | "newgroup" => self.open_groups(""),
+            "invite" | "add" if arg.is_empty() => match self.current().filter(|c| c.data.group && c.online) {
+                Some(c) => {
+                    let panel = GroupPanel::add_to(c.data.address.clone(), c.data.nick.clone());
+                    self.mode = Mode::Groups(panel);
+                }
+                None => self.open_groups(""),
+            },
             "invite" | "add" => {
                 let Some(group) = self.selected.clone().filter(|_| self.in_group()) else {
                     return self.flash_error("open a group first, then /invite NICK");
@@ -1300,6 +1340,50 @@ impl App {
 }
 
 impl App {
+    fn open_groups(&mut self, name: &str) {
+        self.mode = Mode::Groups(GroupPanel::new_group(name));
+    }
+
+    /// Everyone the group panel lists: people who are around first, then
+    /// the rest by name.
+    pub fn candidates(&self, panel: &GroupPanel) -> Vec<Candidate> {
+        let members = panel
+            .target
+            .as_ref()
+            .and_then(|(id, _)| self.convos.iter().find(|c| c.data.address == *id))
+            .map(|c| c.data.members.clone())
+            .unwrap_or_default();
+        let mut people: Vec<Candidate> = self
+            .convos
+            .iter()
+            .filter(|c| !c.data.group)
+            .map(|c| Candidate {
+                address: c.data.address.clone(),
+                nick: c.data.nick.clone(),
+                online: c.online,
+                secure: c.secure,
+                member: members.contains(&c.data.address),
+            })
+            .collect();
+        people.sort_by(|a, b| {
+            b.online
+                .cmp(&a.online)
+                .then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        people
+    }
+
+    /// " with bob and carol", or nothing for nobody.
+    fn with_whom(&self, members: &[String]) -> String {
+        let names: Vec<String> = members.iter().map(|m| self.nick_of(m)).collect();
+        match names.as_slice() {
+            [] => String::new(),
+            [one] => format!(" with {one}"),
+            [rest @ .., last] => format!(" with {} and {last}", rest.join(", ")),
+        }
+    }
+
     fn open_devices(&mut self) {
         self.mode = Mode::Devices(Devices::default());
         let _ = self.home.send(home::Request::Scan);
@@ -1637,6 +1721,45 @@ mod render_tests {
         ] {
             assert!(screen.contains(needle), "missing {needle:?}");
         }
+    }
+
+    #[test]
+    fn creates_a_group_from_the_panel() {
+        let mut app = test_app();
+        let commands = std::cell::RefCell::new(Vec::new());
+        let send = |c: Command| commands.borrow_mut().push(c);
+        app.apply(Update::PeerSeen { address: "off1bob00000000000000".into(), nick: "bob".into() }, &send);
+        app.apply(Update::PeerUp { address: "off1bob00000000000000".into() }, &send);
+        app.apply(Update::SessionReady { address: "off1bob00000000000000".into() }, &send);
+        app.apply(Update::PeerSeen { address: "off1dave0000000000000".into(), nick: "dave".into() }, &send);
+        app.selected = Some("off1bob00000000000000".into());
+
+        let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_g, &send);
+        for c in "house".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)), &send);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Down), &send);
+        app.on_key(KeyEvent::from(KeyCode::Char(' ')), &send);
+        let shown = screen(&mut app);
+        println!("{shown}");
+        for needle in ["+ New group", "New group", "#house", "1 picked", "bob", "online", "dave", "offline · can't be added now", "In it: you, bob"] {
+            assert!(shown.contains(needle), "missing {needle:?}");
+        }
+
+        app.on_key(KeyEvent::from(KeyCode::Enter), &send);
+        assert!(matches!(app.mode, Mode::Normal));
+        match commands.borrow().last() {
+            Some(Command::CreateGroup { name, members }) => {
+                assert_eq!(name, "house");
+                assert_eq!(members, &["off1bob00000000000000".to_string()]);
+            }
+            _ => panic!("Enter should create the group"),
+        }
+        // The new group opens once the engine has made it.
+        app.apply(Update::Group { id: "g1".into(), name: "house".into(), members: vec![] }, &send);
+        app.apply(Update::GroupCreated { id: "g1".into() }, &send);
+        assert_eq!(app.selected.as_deref(), Some("g1"));
     }
 
     #[test]

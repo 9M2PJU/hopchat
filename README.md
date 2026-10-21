@@ -25,6 +25,7 @@ Two terminals on one machine work too. Each name gets its own identity under `~/
 | Tab / Shift-Tab, Alt-1…9 | switch conversation |
 | ↑ on an empty line | select a message: `r` reply, `o` open, `f` show in folder, `y` copy, `R` retry |
 | PgUp / PgDn, mouse wheel | scroll |
+| Ctrl-G | new group: name it, pick people, Enter |
 | Ctrl-D | devices: find, pair and test them |
 | Ctrl-E | protocol event log |
 | F1 | help |
@@ -34,7 +35,7 @@ Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/qu
 
 ## Groups
 
-`/group house` starts a group; open it and `/invite bob` adds anyone nearby. Groups are MLS groups (RFC 9420) carried over the same peer-to-peer links, so they need no server either. Files still go one-to-one.
+Press **Ctrl-G** (or click **+ New group** at the top of the sidebar, or type `/group`). Name the group, press ↓, tick people with Space, and press Enter. The group is created with everyone you picked invited, and it opens. Only people who are online can be picked, because an invite needs their key package. `/invite` in a group opens the same picker to add more people. The quick forms still work: `/group house` creates a group straight away, and `/invite bob` adds one person. Groups are MLS groups (RFC 9420) carried over the same peer-to-peer links, so they need no server either. Files still go one-to-one.
 
 ## Home: talk to your devices
 

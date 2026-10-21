@@ -59,8 +59,10 @@ pub enum Command {
         to: String,
         ids: Vec<String>,
     },
+    /// Create a group and invite `members` into it.
     CreateGroup {
         name: String,
+        members: Vec<String>,
     },
     Invite {
         group: String,
@@ -143,6 +145,8 @@ pub enum Update {
         members: Vec<String>,
     },
     GroupLeft { id: String },
+    /// A group this UI asked for exists (after any `Group` for it).
+    GroupCreated { id: String },
     /// A group send was accepted locally under `id`.
     GroupQueued {
         group: String,
@@ -385,27 +389,20 @@ impl Engine {
                     let _ = self.protocol.send_read_receipt(&to, ids.to_vec());
                 }
             }
-            Input::Ui(Command::CreateGroup { name }) => match self.protocol.create_group(&name) {
-                Ok(info) => self.announce_group(info.group_id.as_str()),
-                Err(e) => self.error(format!("group not created: {e}")),
-            },
-            Input::Ui(Command::Invite { group, member }) => {
-                match self.protocol.invite_to_group(&group, &member) {
-                    Ok(()) => self.announce_group(&group),
-                    Err(ProtocolError::NoKeyPackage(_)) => {
-                        // Ask for a fresh one; the invite can be retried
-                        // once it arrives.
-                        if self.streams.contains_key(&member) {
-                            self.protocol.on_neighbor_discovered(&member);
+            Input::Ui(Command::CreateGroup { name, members }) => {
+                match self.protocol.create_group(&name) {
+                    Ok(info) => {
+                        let id = info.group_id.as_str().to_string();
+                        self.announce_group(&id);
+                        for member in members {
+                            self.invite(&id, &member);
                         }
-                        self.error(
-                            "invite failed: no key package from them yet, try again in a moment"
-                                .into(),
-                        );
+                        self.update(Update::GroupCreated { id });
                     }
-                    Err(e) => self.error(format!("invite failed: {e}")),
+                    Err(e) => self.error(format!("group not created: {e}")),
                 }
             }
+            Input::Ui(Command::Invite { group, member }) => self.invite(&group, &member),
             Input::Ui(Command::Leave { group }) => match self.protocol.leave_group(&group) {
                 Ok(()) => self.update(Update::GroupLeft { id: group }),
                 Err(e) => self.error(format!("leave failed: {e}")),
@@ -416,6 +413,24 @@ impl Engine {
                 reply,
                 from_home,
             }) => self.send_group(group, text, reply, from_home),
+        }
+    }
+
+    fn invite(&mut self, group: &str, member: &str) {
+        match self.protocol.invite_to_group(group, member) {
+            Ok(()) => self.announce_group(group),
+            Err(ProtocolError::NoKeyPackage(_)) => {
+                // Ask for a fresh one; the invite can be retried once it
+                // arrives.
+                if self.streams.contains_key(member) {
+                    self.protocol.on_neighbor_discovered(member);
+                }
+                let who = self.nicks.get(member).map_or(member, |n| n.as_str());
+                self.error(format!(
+                    "invite failed: no key package from {who} yet, try again in a moment"
+                ));
+            }
+            Err(e) => self.error(format!("invite failed: {e}")),
         }
     }
 

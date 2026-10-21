@@ -216,7 +216,10 @@ fn headless(
     let mut invited: HashSet<String> = HashSet::new();
     let mut say_group = if group.is_some() { say.take() } else { None };
     if let Some(name) = &group {
-        send(Command::CreateGroup { name: name.clone() });
+        send(Command::CreateGroup {
+            name: name.clone(),
+            members: Vec::new(),
+        });
     }
     // Sends once a ready peer is known to be the wanted one; the beacon
     // with its nick and its session can arrive in either order.
@@ -341,6 +344,7 @@ fn headless(
                 }
             }
             Update::GroupLeft { id } => println!("left group {id}"),
+            Update::GroupCreated { .. } => {}
             Update::GroupQueued { group, id, text, .. } => {
                 println!("queued {id} to group {group}: {text}")
             }
