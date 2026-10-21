@@ -1178,11 +1178,13 @@ impl App {
         match &mut self.mode {
             Mode::Picker(picker) => {
                 picker.filter.push_str(text.trim());
+                picker.selected = 0;
                 return;
             }
             Mode::Devices(panel) => {
                 if let Some(name) = &mut panel.renaming {
-                    name.extend(text.chars().filter(|c| !c.is_control()).take(32));
+                    let room = 32usize.saturating_sub(name.chars().count());
+                    name.extend(text.chars().filter(|c| !c.is_control()).take(room));
                 }
                 return;
             }

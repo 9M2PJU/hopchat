@@ -533,7 +533,7 @@ impl App {
         }
         frame.render_widget(Paragraph::new(visible), inner);
 
-        if self.scroll > 0 {
+        if self.scroll > 0 && area.height > 0 {
             let label = format!(" ↓ {} more · Esc to jump down ", self.scroll);
             let w = label.width() as u16;
             let at = Rect::new(area.x + area.width.saturating_sub(w + 1), area.y + area.height - 1, w, 1);
@@ -1065,7 +1065,7 @@ impl App {
     fn draw_devices(&self, frame: &mut Frame, panel: &Devices) {
         let view = &self.home_view;
         let screen = frame.area();
-        let width = fit_width(screen, 96) as usize - 2;
+        let width = (fit_width(screen, 96) as usize).saturating_sub(2);
         let selected = panel.selected.min(view.devices.len().saturating_sub(1));
         let mut lines: Vec<Line> = Vec::new();
         let mut selected_row = 0;
