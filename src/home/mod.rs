@@ -6,9 +6,9 @@
 //! its answer goes back into the group. Group membership is the
 //! permission: anyone MLS admitted to that group may ask.
 //!
-//! In the lobby (see [`crate::lobby`]) home always answers the person at
-//! this machine, with nothing to switch on; `/home on` there lets everyone
-//! nearby in too.
+//! Home always answers the person at this machine, in any group, the
+//! lobby (see [`crate::lobby`]) and Me, with nothing to switch on;
+//! `/home on` lets the others there in too.
 //!
 //! The same model also answers `@ai`, for anything at all, in the groups
 //! the host has switched that on for (see [`ai`]). The model needn't be on
@@ -36,7 +36,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{Command, Input, Update};
 use crate::lobby::LOBBY;
-use crate::me::ME;
 
 /// The word that addresses the devices in a group.
 pub const MENTION: &str = "@home";
@@ -345,10 +344,10 @@ impl Home {
         self.config.groups.iter().any(|g| g == group)
     }
 
-    /// Whether home answers a request in `group`: where it is switched
-    /// on, and in the lobby and Me for the person at this machine.
+    /// Whether home answers a request in `group`: always for the person
+    /// at this machine, and for everyone else where it is switched on.
     fn answers(&self, group: &str, mine: bool) -> bool {
-        self.enabled(group) || (mine && (group == LOBBY || group == ME))
+        mine || self.enabled(group)
     }
 
     fn save(&self) {
@@ -801,12 +800,11 @@ impl Home {
                 let Some(group) = group else { return "open the group to switch off".into() };
                 self.config.groups.retain(|g| g != group);
                 self.save();
+                self.say(group, "is only listening to its owner now.".into());
                 if group == LOBBY {
-                    self.say(group, "is only listening to its owner now.".into());
                     return "only you can use your devices in the lobby now".into();
                 }
-                self.say(group, "has stopped listening.".into());
-                "home is off in this group".into()
+                "only you can use your devices in this group now".into()
             }
             ("add" | "bulb" | "light" | "tv", Some(ip)) => match ip.parse::<Ipv4Addr>() {
                 Ok(ip) => self.add_by_address(ip),
@@ -924,6 +922,7 @@ mod tests {
     use super::assistant::{colour, flag, number, text};
     use super::ollama::{self, Ollama, Turn};
     use super::*;
+    use crate::me::ME;
     use serde_json::json;
 
     fn home_with(devices: Vec<Device>) -> Home {
@@ -1098,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn the_lobby_answers_its_owner_with_nothing_switched_on() {
+    fn the_owner_is_answered_anywhere_with_nothing_switched_on() {
         let (mut home, engine) = wired_home();
         let answer = |engine: &std::sync::mpsc::Receiver<Input>| match engine.try_recv() {
             Ok(Input::Ui(Command::SendGroup { group, text, .. })) => Some((group, text)),
@@ -1113,8 +1112,11 @@ mod tests {
         };
         home.handle(ask(LOBBY, false));
         assert!(answer(&engine).is_none(), "anyone else needs /home on");
+        home.handle(ask("g", false));
+        assert!(answer(&engine).is_none(), "the rest of a group needs /home on");
         home.handle(ask("g", true));
-        assert!(answer(&engine).is_none(), "a group still needs /home on");
+        let (group, _) = answer(&engine).expect("its owner is answered in any group");
+        assert_eq!(group, "g");
         home.handle(ask(LOBBY, true));
         let (group, text) = answer(&engine).expect("an answer in the lobby");
         assert_eq!(group, LOBBY);

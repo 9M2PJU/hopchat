@@ -68,7 +68,7 @@ Press **Ctrl-G** (or click **+ New group** at the top of the sidebar, or type `/
 
 ## Home: talk to your devices
 
-You can talk to the smart devices on your own machine in [Me](#me) or the [lobby](#the-lobby), and anyone in a group (or in the lobby, once you let them) can too. Mention `@home`:
+You can talk to the smart devices on your own machine anywhere: in [Me](#me), the [lobby](#the-lobby) and any group, with nothing to switch on. Anyone else in a group (or in the lobby) can too, once you let them. Mention `@home`:
 
 ```
 @home dim the lights to 20% and put on netflix
@@ -86,13 +86,13 @@ Setup on the host:
    - **A light:** Enter adds it, `t` blinks it so you can tell which one it is, and `n` gives it a name people will use ("Desk lamp").
    - **A TV:** Enter pairs it. The TV asks whether to allow hopchat; choose *Allow* with the remote. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings. A TV only shows up while it's switched on.
    - The panel also shows whether the model is ready, and the exact command to run if it isn't.
-3. To try it yourself, open the lobby and mention `@home`. To let other people in, open a group (or the lobby) and press `g` in the panel (or type `/home on`). `g` again, or `/home off`, revokes it.
+3. To try it yourself, mention `@home` in Me, the lobby or any group. To let other people in, open a group (or the lobby) and press `g` in the panel (or type `/home on`). `g` again, or `/home off`, revokes it.
 
 If a device is on another subnet or the scan can't see it, `/home add 192.168.1.40` adds it by address.
 
 Devices are remembered by MAC address, so one that gets a new IP from the router is followed, not lost. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home tells people so.
 
-Being in the group is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. In the lobby it's you, plus everyone with a secure session to you if you switched home on there. Home only answers while the host's hopchat is running. Settings are kept in `~/.hopchat/<name>/home.json`. That file holds each TV's client key and its pinned certificate: the TV's certificate is self-signed, so hopchat trusts the one it sees at pairing and refuses a different one later.
+You can always use your own devices. Beyond that, being in the group is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. In the lobby it's you, plus everyone with a secure session to you if you switched home on there. Home only answers while the host's hopchat is running. Settings are kept in `~/.hopchat/<name>/home.json`. That file holds each TV's client key and its pinned certificate: the TV's certificate is self-signed, so hopchat trusts the one it sees at pairing and refuses a different one later.
 
 Devices: Wiz bulbs (local UDP, port 38899) and LG webOS TVs (the WebSocket API on port 3001 over TLS, or 3000 on older sets). The code is in `src/home/`.
 
@@ -100,7 +100,7 @@ Devices: Wiz bulbs (local UDP, port 38899) and LG webOS TVs (the WebSocket API o
 
 Only one person in a group needs to run a model. Everyone else can use it.
 
-**Ask it anything.** In the lobby you can ask your own model straight away. In a group, the person whose machine runs the model types `/ai on` (or presses `i` in the Devices panel). After that, anyone in the group can mention `@ai`:
+**Ask it anything.** You can ask your own model straight away, in Me, the lobby or any group. To let the rest of a group ask it, the person whose machine runs the model types `/ai on` there (or presses `i` in the Devices panel). After that, anyone in the group can mention `@ai`:
 
 ```
 @ai what's a good name for a sourdough starter?

@@ -14,7 +14,6 @@ use super::ollama::{text_of, Ollama};
 use super::{Home, Request};
 use crate::engine::{Command, Input, Quote};
 use crate::lobby::LOBBY;
-use crate::me::ME;
 
 /// The word that addresses the model in a group.
 pub const MENTION: &str = "@ai";
@@ -43,10 +42,10 @@ impl Home {
         self.config.ai_groups.iter().any(|g| g == group)
     }
 
-    /// Where it is switched on, and in the lobby and Me for the person
-    /// at this machine.
+    /// Always for the person at this machine, and for everyone else
+    /// where it is switched on.
     fn ai_answers(&self, q: &Question) -> bool {
-        self.ai_enabled(&q.group) || (q.mine && (q.group == LOBBY || q.group == ME))
+        q.mine || self.ai_enabled(&q.group)
     }
 
     pub(super) fn ai_ask(&mut self, q: Question) {
@@ -132,12 +131,11 @@ impl Home {
                 self.config.ai_groups.retain(|g| g != group);
                 self.memory.remove(group);
                 self.save();
+                self.say_as(group, SIGNATURE, "is only answering its owner now.".into());
                 if group == LOBBY {
-                    self.say_as(group, SIGNATURE, "is only answering its owner now.".into());
                     return "only you can ask your model in the lobby now".into();
                 }
-                self.say_as(group, SIGNATURE, "has gone quiet.".into());
-                "this group can't ask your model any more".into()
+                "only you can ask your model in this group now".into()
             }
             "share" | "lend" => {
                 self.config.share = !matches!(value, Some("off" | "no"));
