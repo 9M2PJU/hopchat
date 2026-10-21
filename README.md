@@ -1,44 +1,115 @@
+<div align="center">
+
 # hopchat
 
-Offline terminal chat built on the [Offline Protocol SDK](https://github.com/Offline-Protocol/offline-protocol-sdk) and [ratatui](https://ratatui.rs).
-No server and no internet: peers on the same network find each other, and every conversation is end-to-end encrypted with MLS (RFC 9420).
+**Offline, end-to-end encrypted terminal chat for your local network. No server, no internet, no accounts.**
 
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Built with ratatui](https://img.shields.io/badge/built%20with-ratatui-8a2be2.svg)](https://ratatui.rs)
+[![MLS RFC 9420](https://img.shields.io/badge/encryption-MLS%20RFC%209420-success.svg)](https://www.rfc-editor.org/rfc/rfc9420)
+
+</div>
+
+hopchat is a terminal chat app built on the [Offline Protocol SDK](https://github.com/Offline-Protocol/offline-protocol-sdk) and [ratatui](https://ratatui.rs). Peers on the same network find each other on their own, and every conversation is end-to-end encrypted with MLS (RFC 9420).
+
+It's also a remote control for the room you're in. Mention `@home` to dim the lights or put something on the TV, and `@ai` to ask a local model. One person's model can answer for the whole group, and nothing leaves your network.
+
+## Table of contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+  - [The lobby](#the-lobby)
+  - [Me](#me)
+  - [Direct messages and files](#direct-messages-and-files)
+  - [Groups](#groups)
+  - [Smart home with `@home`](#smart-home-with-home)
+  - [A local model with `@ai`](#a-local-model-with-ai)
+  - [Headless mode](#headless-mode)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [Commands](#commands)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Security](#security)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Features
+
+**Chat**
+- **Serverless.** Peers on the same network discover each other over UDP multicast. Your identity is a key on your disk, so there are no accounts.
+- **End-to-end encrypted.** Direct messages, groups and the lobby all travel inside MLS (RFC 9420). History on disk is sealed with XChaCha20-Poly1305.
+- **Lobby.** A room everyone nearby is in by default, pinned at the top of the sidebar.
+- **Me.** A private space for notes and for talking to your own devices and model. Nothing in it goes on the network.
+- **Groups.** MLS groups created from a panel in a few keystrokes.
+- **File transfer.** Up to 100 MB per file, chunked and encrypted, with live progress, rate and time left. Pick files from a browser, drag them onto the window, or type a path.
+- **Delivery and read receipts.** `◷` queued, `✓` sent, `✓✓` delivered, highlighted `✓✓ read`, and `✗` failed (press `R` to retry).
+- **Replies, typing indicators and unread badges**, plus a bell and an unread count in the window title.
+- **Presence.** It tells you when people come online, drop off the network, or join a group.
+- **Offline delivery.** Messages written while a peer is away are delivered when they come back. History survives restarts.
+
+**Smart home and AI**
+- **`@home`.** Plain English becomes actions on Wiz lights and LG webOS TVs, through a local [Ollama](https://ollama.com) model.
+- **`@ai`.** Ask a local model anything in any conversation. Follow-up questions work.
+- **Shared models.** Only one person in a group needs a model. Everyone else borrows it over the encrypted session.
+- **Device panel.** Discover, pair, name and test devices without editing any config.
+
+**Interface**
+- **Calm theme.** Soft pastels on a dusk background, with a stable colour for each person.
+- **Mouse support.** The hints along the bottom are clickable buttons. You can click conversations and messages too.
+- **Completion.** Slash commands and `@` mentions complete with Tab.
+- **Multi-line composer** with word motions and readline-style editing keys.
+- **Scriptable.** Headless modes for bots, tests and one-off sends.
+
+## Requirements
+
+- Rust 1.88 or newer (the crate uses edition 2024)
+- macOS or Linux, on a network that allows UDP multicast
+- Optional, for `@home` and `@ai`: [Ollama](https://ollama.com) with a model that can call tools, such as `qwen2.5:7b`
+
+## Installation
+
+From GitHub:
+
+```sh
+cargo install --git https://github.com/bahdotsh/hopchat
 ```
-cargo run -- --name alice          # on one machine (or terminal)
-cargo run -- --name bob            # on another
+
+From source:
+
+```sh
+git clone https://github.com/bahdotsh/hopchat
+cd hopchat
+cargo build --release
+./target/release/hopchat --name alice
 ```
 
-Two terminals on one machine work too. Each name gets its own identity under `~/.hopchat/<name>`.
+Optional model setup for `@home` and `@ai`:
 
-## What you get
+```sh
+ollama serve
+ollama pull qwen2.5:7b
+```
 
-- **Quiet to look at**: soft pastels on a dusk background, no glow and no flicker. Everyone gets their own colour, the same in the sidebar and their messages, so you can tell who said what at a glance. It opens with a moment of the name fading in (any key skips it), and while nobody is around the lobby shows slow ripples instead of an empty page.
-- **Nothing to memorise**: the keys along the bottom are buttons, so click them. Click a chat on the left to open it. Click a message to reply, open, copy or retry it. Type `@` in a group or the lobby and it offers `@home` and `@ai`; Tab completes.
+## Quick start
 
-- **Files**: press Ctrl-O to browse, drag files onto the window, or type `/file PATH`. Each transfer shows a live progress bar with rate and time left. Transfers are chunked and MLS-encrypted, up to 100 MB each. Received files are saved to `~/Downloads/hopchat` (override with `--downloads`), never overwriting anything and never escaping that folder.
-- **Delivery you can see**: `◷` queued, `✓` on the wire, `✓✓` delivered, cyan `✓✓ read` once they've seen it, `✗` failed (press `R` to retry).
-- **Replies, typing indicators, unread badges**, plus a bell and a window-title count when a message arrives while you're elsewhere.
-- **History that survives restarts**: each conversation is sealed with XChaCha20-Poly1305 under your profile's key in `~/.hopchat/<name>/history`. Messages written while a peer is away are delivered when they come back.
-- **A real composer**: multi-line input (Shift/Alt-Enter or Ctrl-J), word motions, slash commands with completion.
+Run hopchat on two machines on the same network:
 
-| Key | Action |
-| --- | --- |
-| Enter | send (with any attached files) |
-| Ctrl-O | attach files |
-| Tab / Shift-Tab, Alt-1…9 | switch conversation |
-| click a message, or ↑ on an empty line | select it: `r` reply, `o` open, `f` show in folder, `y` copy, `R` retry |
-| PgUp / PgDn, mouse wheel | scroll |
-| Ctrl-G | new group: name it, pick people, Enter |
-| Ctrl-D | devices: find, pair and test them |
-| Ctrl-E | protocol event log |
-| F1 | help |
-| Ctrl-C / Ctrl-Q | quit |
+```sh
+hopchat --name alice    # on one machine
+hopchat --name bob      # on another
+```
 
-Commands: `/file`, `/downloads`, `/info`, `/me`, `/clear`, `/log`, `/help`, `/quit`, for groups and the lobby `/group`, `/invite`, `/members`, `/leave`, for devices `/devices`, `/home`, and for the model `/ai`.
+Two terminals on one machine work too, because each name gets its own identity under `~/.hopchat/<name>`. Both of you start in the lobby. Click the other person's name in the sidebar to talk privately, and press **F1** at any time to see every key and command.
 
-## The lobby
+## Usage
 
-hopchat opens in the **Lobby**, pinned at the top of the sidebar. Everyone on your network who runs hopchat is in it by themselves: there's nothing to create and nobody to invite.
+### The lobby
+
+hopchat opens in the **Lobby**. Everyone on your network who runs hopchat is in it automatically, so there's nothing to create and nobody to invite.
 
 ```
 anyone up for lunch?
@@ -46,13 +117,13 @@ anyone up for lunch?
 @ai what's a good name for a sourdough starter?
 ```
 
-Your own `@home` and `@ai` always work in the lobby, with nothing to set up beyond the devices and the model themselves. Only you can use them there until you say otherwise: `/home on` and `/ai on` in the lobby (or `g` and `i` in the Devices panel while it's open) let everyone nearby use your devices and ask your model. `off` makes them yours again.
+A lobby message goes, end-to-end encrypted, to each person who is connected when you send it. It works like a room, not a mailbox: people who join later don't see earlier messages, and there are no delivery ticks. You can't leave the lobby, and files are sent one-to-one.
 
-A lobby message goes, end-to-end encrypted, to each person who is connected when you send it. It's a room, not a mailbox: someone who joins later doesn't get what was said before, and there are no delivery ticks. For something that should wait for a person, write to them directly. The lobby can't be left, and files still go one-to-one.
+Your own `@home` and `@ai` always work in the lobby. Only you can use them there until you run `/home on` or `/ai on`, or press `g` or `i` in the Devices panel. `off` makes them yours again.
 
-## Me
+### Me
 
-Right under the lobby is **Me**: a conversation with nobody else in it. Jot notes to yourself, and talk to your own devices and model:
+**Me** sits right under the lobby. It's a conversation with nobody else in it: write notes to yourself, and talk to your own devices and model.
 
 ```
 remember to call the landlord
@@ -60,15 +131,30 @@ remember to call the landlord
 @ai what can I make with eggs, spinach and feta?
 ```
 
-Nothing written in Me goes on the network. It stays on this machine, kept in history like any other conversation. `@home` and `@ai` always answer you here, with nothing to switch on, and nobody else can ever reach them through it. There is nobody to invite and no leaving it, and files still go one-to-one.
+Nothing written in Me goes on the network. It's kept in local history, and nobody else can ever reach your devices or model through it.
 
-## Groups
+### Direct messages and files
 
-Press **Ctrl-G** (or click **+ New group** at the top of the sidebar, or type `/group`). Name the group, press ↓, tick people with Space, and press Enter. The group is created with everyone you picked invited, and it opens. Only people who are online can be picked, because an invite needs their key package. `/invite` in a group opens the same picker to add more people. The quick forms still work: `/group house` creates a group straight away, and `/invite bob` adds one person. Groups are MLS groups (RFC 9420) carried over the same peer-to-peer links, so they need no server either. Files still go one-to-one.
+Click a person in the sidebar to open a private chat. A secure session is set up as soon as you see each other.
 
-## Home: talk to your devices
+- **Send** with Enter. Shift-Enter, Alt-Enter or Ctrl-J starts a new line.
+- **Reply, open, copy or retry** a message by clicking it, or by pressing ↑ on an empty line.
+- **Send files** with Ctrl-O, by dragging them onto the window, or with `/file PATH`. Up to two transfers run per peer at once, and the rest wait in a queue. A transfer interrupted by quitting resumes on the next run.
+- **Received files** are saved to `~/Downloads/hopchat`. They never overwrite an existing file and never end up outside that folder.
 
-You can talk to the smart devices on your own machine anywhere: in [Me](#me), the [lobby](#the-lobby) and any group, with nothing to switch on. Anyone else in a group (or in the lobby) can too, once you let them. Mention `@home`:
+### Groups
+
+Press **Ctrl-G**, click **+ New group**, or type `/group`. Name the group, press ↓, tick people with Space, and press Enter. Only people who are online can be invited, because an invite needs their key package.
+
+- `/invite` opens the same picker in an existing group. `/invite bob` adds one person.
+- `/group house` creates a group straight away.
+- `/members` lists who's in the group, and `/leave` leaves it.
+
+Groups are MLS groups carried over the same peer-to-peer links, so they need no server either. Files are still sent one-to-one.
+
+### Smart home with `@home`
+
+Mention `@home` in Me, the lobby or any group you're in:
 
 ```
 @home dim the lights to 20% and put on netflix
@@ -77,30 +163,31 @@ You can talk to the smart devices on your own machine anywhere: in [Me](#me), th
 @home is the light on?
 ```
 
-A local model (via [Ollama](https://ollama.com)) turns the request into device actions, and home answers in the conversation with a 🏠. Nothing leaves your network.
+A local model turns the request into device actions, and home replies in the conversation with 🏠.
 
-Setup on the host:
+**Setup on the machine that owns the devices:**
 
-1. `ollama serve`, with a tool-calling model pulled (`ollama pull qwen2.5:7b` is the default; `/home model NAME` picks another). The host can skip this if someone else in the group runs a model: see [One model for the whole group](#one-model-for-the-whole-group).
-2. Press **Ctrl-D** (or `/devices`). hopchat scans the network for Wiz lights and LG TVs and lists what it finds.
-   - **A light:** Enter adds it, `t` blinks it so you can tell which one it is, and `n` gives it a name people will use ("Desk lamp").
-   - **A TV:** Enter pairs it. The TV asks whether to allow hopchat; choose *Allow* with the remote. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings. A TV only shows up while it's switched on.
+1. Start Ollama with a tool-calling model (`qwen2.5:7b` by default; `/home model NAME` picks another). You can skip this if someone in the group shares a model (see [Shared models](#shared-models)).
+2. Press **Ctrl-D** (or type `/devices`). hopchat scans the network for Wiz lights and LG TVs.
+   - **Light:** Enter adds it, `t` blinks it so you can tell which one it is, and `n` names it ("Desk lamp").
+   - **TV:** Enter pairs it. Choose *Allow* on the TV with the remote. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings. A TV only shows up while it's on.
    - The panel also shows whether the model is ready, and the exact command to run if it isn't.
-3. To try it yourself, mention `@home` in Me, the lobby or any group. To let other people in, open a group (or the lobby) and press `g` in the panel (or type `/home on`). `g` again, or `/home off`, revokes it.
+3. To let others in a group or the lobby use your devices, press `g` in the panel or type `/home on` there. `/home off` revokes it.
 
-If a device is on another subnet or the scan can't see it, `/home add 192.168.1.40` adds it by address.
+If a device is on another subnet, add it with `/home add 192.168.1.40`. `/home scan` searches again, and a bare `/home` shows the current status.
 
-Devices are remembered by MAC address, so one that gets a new IP from the router is followed, not lost. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home tells people so.
+**Supported devices**
 
-You can always use your own devices. Beyond that, being in the group is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. In the lobby it's you, plus everyone with a secure session to you if you switched home on there. Home only answers while the host's hopchat is running. Settings are kept in `~/.hopchat/<name>/home.json`. That file holds each TV's client key and its pinned certificate: the TV's certificate is self-signed, so hopchat trusts the one it sees at pairing and refuses a different one later.
+| Device | Protocol |
+| --- | --- |
+| Wiz bulbs | local UDP, port 38899 |
+| LG webOS TVs | WebSocket API on port 3001 over TLS (3000 on older sets) |
 
-Devices: Wiz bulbs (local UDP, port 38899) and LG webOS TVs (the WebSocket API on port 3001 over TLS, or 3000 on older sets). The code is in `src/home/`.
+Devices are tracked by MAC address, so a new IP from the router doesn't lose them. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home says so.
 
-## One model for the whole group
+**Permissions.** You can always use your own devices. Beyond that, membership is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. In the lobby, that means everyone with a secure session to you, once you switch home on there. Home only answers while the host's hopchat is running.
 
-Only one person in a group needs to run a model. Everyone else can use it.
-
-**Ask it anything.** You can ask your own model straight away, in Me, the lobby or any group. To let the rest of a group ask it, the person whose machine runs the model types `/ai on` there (or presses `i` in the Devices panel). After that, anyone in the group can mention `@ai`:
+### A local model with `@ai`
 
 ```
 @ai what's a good name for a sourdough starter?
@@ -108,38 +195,169 @@ Only one person in a group needs to run a model. Everyone else can use it.
 @ai and in French?
 ```
 
-The answer comes back as a 🤖 reply to the question. Each group's recent questions and answers are remembered, so follow-ups work. `/ai forget` clears that memory, and `/ai off` stops answering.
+You can ask your own model in any conversation. To let the rest of a group ask it, type `/ai on` there or press `i` in the Devices panel. Answers come back as 🤖 replies. Each conversation remembers its recent questions, so follow-ups work. `/ai forget` clears that memory, and `/ai off` stops answering others.
 
-**It thinks for `@home` too.** The machine with the devices doesn't need a model. If none is ready there, home sends each step to a model that someone in the group shares, and runs the device actions itself. The other machine only does the thinking and never touches the devices. The Devices panel shows `borrowing bob (qwen2.5:7b)`. `@ai` works the same way on a host whose own model is down.
+#### Shared models
 
-**Sharing.** A machine whose model is ready offers it to the people it is connected to. It answers only someone who is in a group with it (the lobby counts, so anyone with a secure session to it), for that group's question, and at most two requests at a time. It shows a note when someone starts using it ("alice is using your qwen2.5:7b"). `/ai share off` stops lending, and `/ai share on` resumes it. A bare `/ai` shows the model, where it's on, and whose models you could borrow.
+Only one person in a group needs to run a model.
 
-The questions, and for `@home` the device names and states, go to the lender inside the same end-to-end encrypted one-to-one session as chat. They are never shown as messages. Nothing leaves your network.
+- A machine whose model is ready offers it to the people it's connected to. It answers only people it shares a group with (the lobby counts), and handles at most two requests at a time.
+- If the device owner has no model, home sends each reasoning step to a shared model and still runs the device actions itself. The Devices panel shows something like `borrowing bob (qwen2.5:7b)`.
+- The lender sees a note when someone starts using its model. `/ai share off` stops lending, and `/ai share on` resumes it.
+- Requests travel inside the same end-to-end encrypted one-to-one session as chat, and are never shown as messages.
 
-## Headless modes
+### Headless mode
 
-```
-hopchat --name bot --echo                         # answers every message and file: something to test against
-hopchat --name alice --say "hello" --to bot       # sends one message, prints what happens
-hopchat --name alice --file ./notes.pdf --to bot  # sends one file
-hopchat --name alice --group house --home --to bob --say "@home is the light on?"
-                                                  # starts a group, invites bob, lets it use the devices
-hopchat --name alice --group quiz --ai --to bob --say "@ai what is 2+2?"
-                                                  # the same, and lets the group ask the model
+Run hopchat without the UI, for bots, tests and scripts:
+
+```sh
+hopchat --name bot --echo                         # answer every message and file
+hopchat --name alice --say "hello" --to bot       # send one message
+hopchat --name alice --file ./notes.pdf --to bot  # send one file
 hopchat --name alice --lobby --to bob --say "hi all"
-                                                  # says it in the lobby once bob is there
+hopchat --name alice --group house --home --to bob --say "@home is the light on?"
+hopchat --name alice --group quiz --ai --to bob --say "@ai what is 2+2?"
 ```
 
-Without `--to`, `--say` and `--file` go to the first peer whose secure session comes up.
+Without `--to`, `--say` and `--file` go to the first peer whose secure session comes up. `--lobby` and `--group` can't be combined.
 
-## How it works
+## Keyboard shortcuts
 
-The SDK does no I/O itself, so hopchat supplies the "platform bridge" for its peer-stream (`wifi_direct`) transport:
+| Key | Action |
+| --- | --- |
+| Enter | send (with any attached files) |
+| Shift-Enter, Alt-Enter, Ctrl-J | new line |
+| Tab / Shift-Tab, Ctrl-N / Ctrl-P, Alt-1…9 | switch conversation |
+| Tab after `/` or `@` | complete a command or mention |
+| Ctrl-O | attach files |
+| ↑ on an empty line, or click | select a message: `r` reply, `o` open, `f` show in folder, `y` copy, `R` retry, `g`/`G` first/last, Esc back |
+| PgUp / PgDn, mouse wheel | scroll |
+| Ctrl-G | new group |
+| Ctrl-D | devices panel |
+| Ctrl-E | protocol event log |
+| F1 | help |
+| Ctrl-C / Ctrl-Q | quit |
 
-- **Discovery** (`src/net.rs`): a UDP multicast beacon on `239.255.42.99:47999` announces `address, tcp port, nick` every 2 s. The lower address dials.
-- **Streams**: one TCP connection per peer. The first frame in each direction is the SDK's signed identity assertion, verified with `verify_identity_assertion`. A peer is announced only under the address that assertion proves, never under what the beacon claims.
-- **Engine** (`src/engine.rs`): owns `OfflineProtocol` on one thread. It feeds frames in, drains `get_next_message()` out to the right stream, and forwards protocol events to the UI. Discovering a neighbor triggers the automatic key exchange.
-- **Files**: the SDK's `send_media` chunks and seals each file and windows the chunks over the stream. The engine queues files until a session and a transfer slot (two per peer) are free. A transfer interrupted by quitting is re-supplied from its source path when the SDK asks for it.
-- **Storage**: the SDK's file stores and hopchat's history, sealed with a key in `~/.hopchat/<name>/store.key`.
+**Editing:** ←/→ move; Ctrl/Alt-←/→ and Alt-B/F jump words; Home/End or Ctrl-A/Ctrl-E go to the start or end; Ctrl-W and Alt-Backspace delete a word; Ctrl-U clears the line.
 
-The nick in the beacon is unauthenticated and only for display; the `off1…` address is the identity.
+**File browser:** ↑/↓ move; → or Enter opens a folder or picks the file; ← goes up; `~` jumps home; Space marks several files; typing filters the list.
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `/file [PATH]` | send files (no path opens the browser) |
+| `/downloads` | open the folder received files are saved in |
+| `/info` | who this peer is and how they're connected |
+| `/me` | show and copy your own address |
+| `/group [NAME]` | start a group |
+| `/invite [NICK]` | add people to this group |
+| `/members` | list who is in this group |
+| `/leave` | leave this group |
+| `/devices` | find, pair and test devices |
+| `/home on\|off` | let everyone here use your devices, or stop |
+| `/home add IP` | add a device by address |
+| `/home scan` | scan for devices again |
+| `/home model NAME` | choose the Ollama model |
+| `/ai on\|off` | let everyone here ask your model, or stop |
+| `/ai forget` | clear this conversation's model memory |
+| `/ai share on\|off` | lend your model to people you share a group with, or stop |
+| `/clear` | delete this conversation from this device |
+| `/log` | show or hide the protocol event log |
+| `/help` | keys and commands |
+| `/quit` | quit |
+
+## Configuration
+
+```
+hopchat [--name NICK] [--dir PATH] [--downloads PATH]
+        [--echo | --say TEXT | --file PATH] [--to NICK]
+        [--lobby | --group NAME [--home] [--ai]]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--name`, `-n` | `$USER` | the name peers see |
+| `--dir` | `~/.hopchat/<name>` | where identity, history and settings live |
+| `--downloads` | `~/Downloads/hopchat` | where received files are saved |
+| `--echo` | | no UI: answer every message |
+| `--say TEXT` | | no UI: send one message |
+| `--file PATH` | | no UI: send one file |
+| `--to NICK` | | with `--say`/`--file`: only send to this peer |
+| `--lobby` | | with `--say`: say it in the lobby |
+| `--group NAME` | | no UI: create a group and invite peers as they connect |
+| `--home` | | with `--group`: let the group use this machine's devices |
+| `--ai` | | with `--group`: let the group ask this machine's model |
+
+**Data directory** (`~/.hopchat/<name>`):
+
+| Path | Contents |
+| --- | --- |
+| `store.key` | the key that seals everything else |
+| `history/` | each conversation, sealed with XChaCha20-Poly1305 |
+| `home.json` | devices, the model, where home and `@ai` are on, and each TV's client key and pinned certificate |
+| everything else | the SDK's identity and protocol stores |
+
+If there's no `~/Downloads` folder, received files go to `<dir>/downloads`.
+
+## Architecture
+
+The SDK does no I/O itself, so hopchat supplies the platform bridge for its peer-stream (`wifi_direct`) transport.
+
+| Component | Where | Role |
+| --- | --- | --- |
+| Discovery | `src/net.rs` | UDP multicast beacon on `239.255.42.99:47999` announcing `address, tcp port, nick` every 2 s. The lower address dials. |
+| Streams | `src/net.rs` | One TCP connection per peer. The first frame each way is the SDK's signed identity assertion, checked with `verify_identity_assertion`. |
+| Engine | `src/engine.rs` | Owns `OfflineProtocol` on one thread. It feeds frames in, routes outgoing messages to streams, queues file transfers, and forwards events to the UI. |
+| Lobby | `src/lobby.rs` | Not an MLS group. Each message is a hidden one-to-one message to every peer with a session, sharing one id so replies line up. |
+| Me | `src/me.rs` | A local-only conversation. Messages go straight back to the UI and to home, never onto the wire. |
+| History | `src/history.rs` | Encrypted per-conversation history. |
+| Home | `src/home/` | Device discovery and drivers (`wiz.rs`, `webos.rs`), the Ollama client, the `@home` tool-calling loop (`assistant.rs`), `@ai` (`ai.rs`), and model lending (`lend.rs`). |
+| UI | `src/ui/` | ratatui rendering, the composer, the file browser, and the group and device panels. |
+
+## Security
+
+- Every message is end-to-end encrypted with MLS (RFC 9420) through the Offline Protocol SDK.
+- A peer is identified only by the address its signed identity assertion proves (`off1…`). The nick in the beacon is unauthenticated and only used for display.
+- History and stores on disk are sealed with a per-profile key.
+- Received file names are sanitised: files never overwrite existing ones or escape the downloads folder.
+- LG TVs use self-signed certificates. hopchat pins the certificate it sees when pairing and refuses a different one later.
+- Model requests sent to a lender travel inside the encrypted one-to-one session, and lenders only answer people they share a group with.
+- Nothing is sent to the internet, apart from whatever your own Ollama setup does.
+
+If you find a security issue, please report it privately to the maintainer instead of opening a public issue.
+
+## Contributing
+
+Contributions are welcome. Open an issue to discuss a larger change before you start.
+
+```sh
+cargo build
+cargo test
+cargo clippy --all-targets
+cargo fmt
+```
+
+To test without a second machine, run two copies with different names, or chat with the headless echo bot:
+
+```sh
+cargo run -- --name bot --echo
+cargo run -- --name alice
+```
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org) (`feat(ui): …`, `fix(home): …`).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0
+- MIT license
+
+at your option.
+
+## Acknowledgements
+
+- [Offline Protocol SDK](https://github.com/Offline-Protocol/offline-protocol-sdk) for identity, MLS sessions and transport
+- [ratatui](https://ratatui.rs) for the terminal UI
+- [Ollama](https://ollama.com) for running local models
