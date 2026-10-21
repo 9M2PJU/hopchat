@@ -24,6 +24,7 @@ use tungstenite::Message;
 
 use super::driver::{Backend, Category, Found};
 use super::light::{scene_key, Caps, LightDriver, Pilot};
+use super::tv::TvDriver;
 use super::{Device, State};
 
 /// Where HA listens unless told otherwise.
@@ -275,6 +276,10 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
             let effects = attrs.get("effect_list").cloned().unwrap_or(json!([]));
             Some(("ha_light", json!({"name": name, "colour": colour, "white": white, "effects": effects})))
         }
+        // A speaker or receiver is a media player too, but not a TV.
+        "media_player" if attrs.get("device_class").and_then(Value::as_str) == Some("tv") => {
+            Some(("ha_tv", json!({"name": name})))
+        }
         _ => None,
     }
 }
@@ -438,6 +443,173 @@ fn describe_light(state: &Value) -> String {
     parts.join(" · ")
 }
 
+// ----- TVs ------------------------------------------------------------------
+
+/// TVs Home Assistant drives, as media players.
+pub struct HaTv;
+
+impl Backend for HaTv {
+    fn id(&self) -> &'static str {
+        "ha_tv"
+    }
+
+    fn category(&self) -> Category {
+        Category::Tv
+    }
+
+    fn label(&self) -> &'static str {
+        "Home Assistant TVs"
+    }
+
+    /// Listed by home from the hub it connected to, not found by looking.
+    fn discover(&self, _each: &dyn Fn(Found)) {}
+
+    fn probe(&self, _ip: Ipv4Addr) -> Option<Found> {
+        None
+    }
+
+    fn name(&self, d: &Device) -> Option<String> {
+        d.data.get("name").and_then(Value::as_str).map(str::to_string)
+    }
+
+    fn about(&self, _d: &Device) -> String {
+        "through Home Assistant".into()
+    }
+
+    fn found_detail(&self, _d: &Device) -> String {
+        "Home Assistant · TV".into()
+    }
+
+    fn check(&self, d: &Device) -> (State, String) {
+        check_entity(d, describe_tv)
+    }
+
+    /// Nothing an HA media player does is a harmless hello, so this only
+    /// says what it is doing.
+    fn test(&self, d: &mut Device) -> Result<String, String> {
+        self.status(d).map(|state| format!("{} is {state}", d.name))
+    }
+
+    fn test_help(&self) -> &'static str {
+        " shows what it is doing"
+    }
+
+    fn as_tv(&self) -> Option<&dyn TvDriver> {
+        Some(self)
+    }
+}
+
+impl TvDriver for HaTv {
+    fn power(&self, d: &mut Device, on: bool) -> Result<String, String> {
+        let service = if on { "media_player.turn_on" } else { "media_player.turn_off" };
+        Hub::of(d)?.call(service, entity(d)?, json!({}))?;
+        Ok(format!("{} is turning {}", d.name, if on { "on" } else { "off" }))
+    }
+
+    fn volume(&self, d: &mut Device, level: Option<u8>, change: Option<i8>, mute: Option<bool>) -> Result<String, String> {
+        let hub = Hub::of(d)?;
+        let entity = entity(d)?;
+        if let Some(mute) = mute {
+            hub.call("media_player.volume_mute", entity, json!({"is_volume_muted": mute}))?;
+        }
+        if let Some(level) = level {
+            hub.call("media_player.volume_set", entity, json!({"volume_level": f64::from(level.min(100)) / 100.0}))?;
+        } else if let Some(change) = change {
+            let service = if change > 0 { "media_player.volume_up" } else { "media_player.volume_down" };
+            for _ in 0..change.unsigned_abs() {
+                hub.call(service, entity, json!({}))?;
+            }
+        }
+        self.status(d).map(|state| format!("{} is {state}", d.name))
+    }
+
+    fn status(&self, d: &mut Device) -> Result<String, String> {
+        Ok(describe_tv(&Hub::of(d)?.state(entity(d)?)?))
+    }
+
+    /// An app and an input are both a source to HA.
+    fn open_app(&self, d: &mut Device, app: &str) -> Result<String, String> {
+        self.source(d, app)
+    }
+
+    fn input(&self, d: &mut Device, input: &str) -> Result<String, String> {
+        self.source(d, input)
+    }
+
+    fn media(&self, d: &mut Device, action: &str) -> Result<String, String> {
+        let service = match action {
+            "play" => "media_player.media_play",
+            "pause" => "media_player.media_pause",
+            "stop" => "media_player.media_stop",
+            _ => return Err(format!("{} can't {action} through Home Assistant", d.name)),
+        };
+        Hub::of(d)?.call(service, entity(d)?, json!({}))?;
+        Ok(format!("{} did {action}", d.name))
+    }
+}
+
+impl HaTv {
+    /// Switches to the source whose name `wanted` is, or is part of.
+    fn source(&self, d: &mut Device, wanted: &str) -> Result<String, String> {
+        let hub = Hub::of(d)?;
+        let entity = entity(d)?;
+        let state = hub.state(entity)?;
+        let sources: Vec<&str> = state["attributes"]
+            .get("source_list")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let Some(source) = pick_source(&sources, wanted) else {
+            return Err(if sources.is_empty() {
+                format!("{} has no sources to switch to", d.name)
+            } else {
+                format!("{} has no {wanted}; it has {}", d.name, sources.join(", "))
+            });
+        };
+        hub.call("media_player.select_source", entity, json!({"source": source}))?;
+        Ok(format!("{} switched to {source}", d.name))
+    }
+}
+
+/// The source `wanted` means: the same name, else the one it is part of,
+/// ignoring case, spaces and punctuation ("hdmi 1" is "HDMI_1").
+fn pick_source<'a>(sources: &[&'a str], wanted: &str) -> Option<&'a str> {
+    let key = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    let wanted = key(wanted);
+    if wanted.is_empty() {
+        return None;
+    }
+    sources
+        .iter()
+        .find(|s| key(s) == wanted)
+        .or_else(|| sources.iter().find(|s| key(s).contains(&wanted)))
+        .copied()
+}
+
+/// A TV's state as "on · Netflix · volume 20".
+fn describe_tv(state: &Value) -> String {
+    let power = state.get("state").and_then(Value::as_str).unwrap_or("unknown");
+    if matches!(power, "off" | "standby" | "unavailable") {
+        return power.into();
+    }
+    let attrs = &state["attributes"];
+    let mut parts = vec![power.to_string()];
+    let showing = ["media_title", "app_name", "source"]
+        .iter()
+        .find_map(|k| attrs.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()));
+    if let Some(showing) = showing {
+        parts.push(showing.to_string());
+    }
+    if attrs.get("is_volume_muted").and_then(Value::as_bool) == Some(true) {
+        parts.push("muted".into());
+    } else if let Some(v) = attrs.get("volume_level").and_then(Value::as_f64) {
+        parts.push(format!("volume {}", (v * 100.0).round() as u8));
+    }
+    parts.join(" · ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +656,32 @@ mod tests {
         let effect = json!({"state": "on", "attributes": {"color_mode": "hs", "effect": "Rainbow"}});
         assert_eq!(describe_light(&effect), "on · Rainbow");
         assert_eq!(describe_light(&json!({"state": "off", "attributes": {}})), "off");
+    }
+
+    #[test]
+    fn only_tvs_are_tvs() {
+        let tv = json!({"attributes": {"friendly_name": "Lounge TV", "device_class": "tv"}});
+        assert_eq!(describe("media_player.lounge", &tv), Some(("ha_tv", json!({"name": "Lounge TV"}))));
+        let speaker = json!({"attributes": {"device_class": "speaker"}});
+        assert!(describe("media_player.kitchen", &speaker).is_none());
+    }
+
+    #[test]
+    fn sources_by_what_people_say() {
+        let sources = ["HDMI_1", "HDMI 2", "Netflix", "YouTube TV"];
+        assert_eq!(pick_source(&sources, "hdmi 1"), Some("HDMI_1"));
+        assert_eq!(pick_source(&sources, "netflix"), Some("Netflix"));
+        assert_eq!(pick_source(&sources, "youtube"), Some("YouTube TV"));
+        assert_eq!(pick_source(&sources, "disney+"), None);
+        assert_eq!(pick_source(&sources, "+"), None);
+    }
+
+    #[test]
+    fn tv_states() {
+        let on = json!({"state": "playing", "attributes": {"source": "Netflix", "volume_level": 0.2, "is_volume_muted": false}});
+        assert_eq!(describe_tv(&on), "playing · Netflix · volume 20");
+        let muted = json!({"state": "on", "attributes": {"app_name": "YouTube", "is_volume_muted": true}});
+        assert_eq!(describe_tv(&muted), "on · YouTube · muted");
+        assert_eq!(describe_tv(&json!({"state": "off", "attributes": {}})), "off");
     }
 }

@@ -209,7 +209,7 @@ If a device is on another subnet, add it with `/home add 192.168.1.40`. `/home s
 | --- | --- |
 | Wiz bulbs | local UDP, port 38899 |
 | LG webOS TVs | WebSocket API on port 3001 over TLS (3000 on older sets) |
-| Home Assistant lights | HA's REST API, port 8123 by default |
+| Home Assistant lights and TVs | HA's REST API, port 8123 by default |
 
 Devices are tracked by MAC address, so a new IP from the router doesn't lose them. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home says so.
 

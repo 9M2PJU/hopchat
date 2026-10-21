@@ -20,7 +20,7 @@ use super::tv::TvDriver;
 use super::{ha, webos, wiz, Device, State};
 
 /// Every backend home knows, in the order an address is probed.
-pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs, &ha::HaLight];
+pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs, &ha::HaLight, &ha::HaTv];
 
 /// The backend a device was added with; `None` for one written by a newer
 /// hopchat that knows a backend this one doesn't.
