@@ -152,11 +152,17 @@ impl Bulb {
     pub fn blink(&self) -> Result<(), String> {
         let before = self.pilot()?;
         let was_on = before.get("state") != Some(&Value::Bool(false));
+        let mut blinked = Ok(());
         for dimming in [10, 100, 10, 100] {
-            self.set_raw(json!({"state": true, "dimming": dimming}))?;
+            blinked = self.set_raw(json!({"state": true, "dimming": dimming}));
+            if blinked.is_err() {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(350));
         }
-        self.set_raw(restore(&before, was_on))
+        // Put it back even if a blink got lost.
+        let restored = self.set_raw(restore(&before, was_on));
+        blinked.and(restored)
     }
 
     fn call(&self, request: Value) -> Result<Value, String> {
