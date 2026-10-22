@@ -28,6 +28,7 @@ use super::driver::{backend_of, Found};
 use super::light::scene_key;
 use super::{Device, State};
 
+pub(super) mod connect;
 #[cfg(test)]
 pub(super) mod fake;
 mod lights;
