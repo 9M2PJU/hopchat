@@ -17,14 +17,13 @@ use crate::home::{ha, Device, Home, Request, State};
 /// an address sent as the token.
 pub(in crate::home) fn ha_args(first: &str, second: Option<&str>) -> Result<(Option<String>, String), String> {
     const USAGE: &str = "/home ha URL TOKEN (/home ha find looks for the address)";
+    // Nothing typed is quoted back: a word that is almost a token, or a
+    // token typed where the address goes, would be shown on screen.
     match second {
-        None if !looks_like_token(first) && (looks_like_address(first) || first.contains('.')) => {
-            Err(format!("give the token too: {USAGE}"))
-        }
-        None => Ok((None, first.to_string())),
-        Some(second) if looks_like_token(first) && !looks_like_token(second) => {
-            Err(format!("the address goes before the token: {USAGE}"))
-        }
+        None if looks_like_token(first) => Ok((None, first.to_string())),
+        None if looks_like_address(first) || first.contains('.') => Err(format!("give the token too: {USAGE}")),
+        None => Err(format!("that isn't a Home Assistant token or address: {USAGE}")),
+        Some(_) if looks_like_token(first) => Err(format!("the address goes before the token: {USAGE}")),
         Some(second) => Ok((Some(first.to_string()), second.to_string())),
     }
 }

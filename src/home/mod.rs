@@ -1771,7 +1771,17 @@ mod tests {
         assert_eq!(ha_args("homeassistant.local", Some(token)), Ok((Some("homeassistant.local".into()), token.into())));
         assert_eq!(ha_args(token, None), Ok((None, token.into())));
         // Mistakes are said back, and never echo the token.
-        for (first, second) in [(token, Some(url)), (token, Some("ha.home.lan")), (url, None), ("homeassistant.local", None), ("10.0.0.4", None)] {
+        // Two tokens: the first is never tried, or quoted, as an address.
+        for (first, second) in [
+            (token, Some(url)),
+            (token, Some("ha.home.lan")),
+            (token, Some(token)),
+            (url, None),
+            ("homeassistant.local", None),
+            ("10.0.0.4", None),
+            ("status", None),
+            ("help", None),
+        ] {
             let e = ha_args(first, second).unwrap_err();
             assert!(e.contains("/home ha URL TOKEN") && !e.contains(token), "{first} {second:?}: {e}");
         }
@@ -1782,6 +1792,16 @@ mod tests {
     fn a_lone_address_asks_for_the_token_and_connects_nowhere() {
         let mut home = home_with(Vec::new());
         assert!(home.configure(None, "ha http://10.0.0.4:8123").starts_with("give the token too"));
+    }
+
+    #[test]
+    fn a_word_that_isnt_a_token_looks_for_nothing() {
+        let mut home = home_with(Vec::new());
+        for word in ["status", "help", "eyJnot-quite"] {
+            let reply = home.configure(None, &format!("ha {word}"));
+            assert!(reply.starts_with("that isn't a Home Assistant token") && !reply.contains(word), "{word}: {reply}");
+        }
+        assert_eq!(home.connecting_ha, None, "no find was started");
     }
 
     #[test]
