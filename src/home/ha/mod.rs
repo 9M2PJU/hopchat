@@ -133,16 +133,16 @@ pub fn find() -> Option<String> {
     while let Some(left) = until.checked_duration_since(Instant::now()) {
         match browse.recv_timeout(left) {
             Ok(mdns_sd::ServiceEvent::ServiceResolved(service)) => {
-                // What HA itself says to use, else the address it answered from.
                 let said = ["internal_url", "base_url"]
                     .iter()
                     .filter_map(|k| service.get_property_val_str(k))
                     .find_map(|u| url(u).ok());
-                let seen = || {
-                    let ip = service.get_addresses_v4().into_iter().next()?;
-                    Some(format!("http://{ip}:{}", service.get_port()))
-                };
-                found = said.or_else(seen);
+                let seen = service
+                    .get_addresses_v4()
+                    .into_iter()
+                    .next()
+                    .map(|ip| format!("http://{ip}:{}", service.get_port()));
+                found = announced(seen, said);
                 if found.is_some() {
                     break;
                 }
@@ -153,6 +153,27 @@ pub fn find() -> Option<String> {
     }
     let _ = daemon.shutdown();
     found
+}
+
+/// The address to tell the person of, given where an announcement came
+/// from (`seen`) and the URL its TXT record claims (`said`). The address
+/// it came from wins: the TXT record is whatever the announcer wrote,
+/// and home mustn't put an address off the LAN in front of someone about
+/// to type their token after it. A claimed URL stands only when nothing
+/// was seen and it points at this LAN.
+fn announced(seen: Option<String>, said: Option<String>) -> Option<String> {
+    seen.or_else(|| said.filter(|u| on_lan(u)))
+}
+
+/// Whether a URL's host is on this LAN: a private or link-local IPv4
+/// address, or a `.local` name.
+fn on_lan(url: &str) -> bool {
+    let host = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = host.rsplit_once(':').map_or(host, |(host, _)| host);
+    match host.parse::<Ipv4Addr>() {
+        Ok(ip) => ip.is_private() || ip.is_link_local(),
+        Err(_) => host.to_ascii_lowercase().ends_with(".local"),
+    }
 }
 
 impl Hub {
@@ -599,6 +620,20 @@ mod tests {
         assert!(url("http://10.0.0.4:8123?x=1").is_err());
         assert!(url("http://user:pass@10.0.0.4:8123").is_err());
         assert!(url("10.0.0.4#frag").is_err());
+    }
+
+    #[test]
+    fn an_announcement_is_believed_only_about_the_lan() {
+        let seen = || Some("http://10.0.0.4:8123".to_string());
+        let said = |u: &str| Some(u.to_string());
+        assert_eq!(announced(seen(), said("https://evil.example.com")), seen(), "where it came from wins");
+        assert_eq!(announced(seen(), said("http://10.0.0.9:8123")), seen());
+        assert_eq!(announced(None, said("https://evil.example.com")), None, "off the LAN: never offered");
+        assert_eq!(announced(None, said("http://8.8.8.8:8123")), None);
+        assert_eq!(announced(None, said("http://homeassistant.local:8123")), said("http://homeassistant.local:8123"));
+        assert_eq!(announced(None, said("http://192.168.1.20:8123")), said("http://192.168.1.20:8123"));
+        assert_eq!(announced(None, said("http://169.254.3.4:8123")), said("http://169.254.3.4:8123"));
+        assert_eq!(announced(None, None), None);
     }
 
     #[test]
