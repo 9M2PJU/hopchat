@@ -1066,11 +1066,21 @@ mod tests {
     use super::*;
     use super::ha::connect::{ha_args, list_hub, looks_like_token};
 
+    /// A settings directory of this test's own, so what one test saves (a
+    /// hub, with its token) is never what another test opens.
+    fn test_root() -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("hopchat-home-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     fn home_with(devices: Vec<Device>) -> Home {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, _) = std::sync::mpsc::channel();
         let (me, _) = std::sync::mpsc::channel();
-        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        let mut home = Home::open(&test_root(), engine, ui, me);
         home.config = Config { devices, ..Default::default() };
         home
     }
@@ -1098,7 +1108,7 @@ mod tests {
         let (engine, from_home) = std::sync::mpsc::channel();
         let (ui, _) = std::sync::mpsc::channel();
         let (me, _) = std::sync::mpsc::channel();
-        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        let mut home = Home::open(&test_root(), engine, ui, me);
         home.config = Config::default();
         (home, from_home)
     }
@@ -1511,7 +1521,7 @@ mod tests {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, notes) = std::sync::mpsc::channel();
         let (me, _) = std::sync::mpsc::channel();
-        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        let mut home = Home::open(&test_root(), engine, ui, me);
         home.config = Config::default();
         let empty = || ha::Listing { found: Vec::new(), warning: None };
         home.ha_connected(Ok((hub("http://10.0.0.4:8123", "a"), "Home".into(), empty())));
@@ -1561,7 +1571,7 @@ mod tests {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, _) = std::sync::mpsc::channel();
         let (me, requests) = std::sync::mpsc::channel();
-        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        let mut home = Home::open(&test_root(), engine, ui, me);
         home.config = Config::default();
         let (url, token) = (std::env::var("HA_URL").unwrap(), std::env::var("HA_TOKEN").unwrap());
         assert_eq!(home.configure(None, &format!("ha {url} {token}")), "connecting to Home Assistant…");
@@ -1591,7 +1601,7 @@ mod tests {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, notes) = std::sync::mpsc::channel();
         let (me, requests) = std::sync::mpsc::channel();
-        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        let mut home = Home::open(&test_root(), engine, ui, me);
         home.config = Config::default();
         (home, notes, requests)
     }
@@ -1780,7 +1790,7 @@ mod tests {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, notes) = std::sync::mpsc::channel();
         let (me, requests) = std::sync::mpsc::channel();
-        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        let mut home = Home::open(&test_root(), engine, ui, me);
         let plug = Device { unit: Some("switch.fridge".into()), ..Device::new("ha_switch", "Fridge".into(), [10, 0, 0, 4].into(), None, json!({})) };
         home.config = Config { devices: vec![plug], ..Default::default() };
         home.handle(Request::Test("switch.fridge".into()));
