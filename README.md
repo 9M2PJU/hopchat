@@ -197,7 +197,7 @@ A local model turns the request into device actions, and home replies in the con
 2. Press **Ctrl-D** (or type `/devices`). hopchat scans the network for Wiz lights, LG TVs, and printers.
    - **Light:** Enter adds it, `t` blinks it so you can tell which one it is, and `n` names it ("Desk lamp").
    - **TV:** Enter pairs it. Choose *Allow* on the TV with the remote. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings. A TV only shows up while it's on.
-   - **Printer or copier:** Enter adds it, `t` makes it beep or flash if it supports that, and `n` names it. Home can then say whether it is printing, how much ink or toner is left, and whether it is jammed or out of paper. It never prints anything.
+   - **Printer or copier:** Enter adds it, `t` makes it beep or flash if it supports that, and `n` names it. Home can then say whether it is printing, how much ink or toner is left, and whether it is jammed or out of paper. It never prints anything. A printer a computer shares through CUPS isn't listed, since a network printer is found on its own; a USB printer behind a print server therefore doesn't show up.
    - The panel also shows whether the model is ready, and the exact command to run if it isn't.
 3. To let others in a group or the lobby use your devices, press `g` in the panel or type `/home on` there. `/home off` revokes it.
 
@@ -216,7 +216,7 @@ The token is kept in `home.json` in hopchat's settings directory, readable only 
 | Printers and copiers | IPP 2.0 or 1.1 on port 631, found over Bonjour (`_ipp._tcp`) |
 | Home Assistant lights, TVs and switches | HA's REST API, port 8123 by default |
 
-Devices are tracked by MAC address, so a new IP from the router doesn't lose them. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home says so.
+Devices are tracked by MAC address, and printers by the UUID they report over IPP, so a new IP from the router doesn't lose them. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home says so.
 
 **Permissions.** You can always use your own devices. Beyond that, membership is the permission: everyone MLS has admitted to a group where home is on can use the devices, and nobody else can. In the lobby, that means everyone with a secure session to you, once you switch home on there. Home only answers while the host's hopchat is running.
 
