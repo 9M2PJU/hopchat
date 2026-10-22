@@ -1,11 +1,14 @@
 //! Connecting home to a Home Assistant, listing what it has, and
 //! letting it go: what `/home ha` and a scan do with the hub.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::mpsc::Sender;
 use std::thread;
 
-use crate::home::driver::backend_of;
+use serde_json::Value;
+
+use crate::home::driver::{backend_of, Found};
 use crate::home::{ha, Device, Home, Request, State};
 
 /// The address and token typed after `/home ha`: `[URL] TOKEN`, in that
@@ -96,6 +99,14 @@ impl Home {
         let before = self.config.ha.replace(hub).map(|h| h.url).filter(|old| *old != url);
         if let Some(old) = before {
             self.note(format!("home: Home Assistant at {old} is replaced by the one at {url}"));
+            let gone = self.keep_what_the_new_hub_vouches_for(&found);
+            if !gone.is_empty() {
+                self.note(format!(
+                    "home: forgot {}: the Home Assistant at {url} doesn't have {}",
+                    gone.join(", "),
+                    if gone.len() == 1 { "it" } else { "them" },
+                ));
+            }
         }
         let before = self.found.len();
         self.on_listed(found);
@@ -108,6 +119,36 @@ impl Home {
             "connected to {home} at {url}: {new} new device{} to add in /devices",
             if new == 1 { "" } else { "s" },
         ));
+    }
+
+    /// After the hub moved to another address: forgets each HA device the
+    /// new one doesn't list under the same entity id and HA name, and
+    /// says which. An entity id is only unique within one Home Assistant:
+    /// another one's `light.kitchen` may be a different light, and the
+    /// device people call "Kitchen" mustn't silently drive it. Where both
+    /// match, it is the same home's HA at a new address, and the device
+    /// stays. What the new hub lists is offered again in the panel.
+    fn keep_what_the_new_hub_vouches_for(&mut self, listed: &[Found]) -> Vec<String> {
+        let names: HashMap<&str, Option<&str>> = listed
+            .iter()
+            .filter_map(|f| Some((f.unit.as_deref()?, f.data.get("name").and_then(Value::as_str))))
+            .collect();
+        let vouched = |d: &Device| {
+            let named = d.data.get("name").and_then(Value::as_str);
+            d.unit.as_deref().and_then(|u| names.get(u)).is_some_and(|listed| *listed == named)
+        };
+        let (gone, kept): (Vec<Device>, Vec<Device>) =
+            std::mem::take(&mut self.config.devices).into_iter().partition(|d| ha::drives(d) && !vouched(d));
+        self.config.devices = kept;
+        let offered: Vec<String> = self.found.iter().filter(|d| ha::drives(d)).map(Device::id).collect();
+        self.found.retain(|d| !ha::drives(d));
+        for id in gone.iter().map(Device::id).chain(offered) {
+            self.live.remove(&id);
+        }
+        if !gone.is_empty() {
+            self.save();
+        }
+        gone.into_iter().map(|d| d.name).collect()
     }
 
     /// `/home ha forget`: drops the hub, its token, and every device from it.

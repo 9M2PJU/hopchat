@@ -1654,7 +1654,29 @@ mod tests {
         home.add("switch.kettle");
         home.ha_connected(Ok((second.clone(), "Home".into(), listing(plug("switch.fan")))));
         assert_eq!(home.config.ha, Some(second.clone()));
-        assert_eq!(reached(&home, 0), Some(second), "every entity goes through the one hub");
+        assert!(home.config.devices.is_empty(), "the new hub has no kettle, so it can't drive one");
+        assert_eq!(home.found.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["switch.fan"]);
+        assert!(!home.live.contains_key("switch.kettle"));
+    }
+
+    #[test]
+    fn another_homes_entity_of_the_same_id_is_not_driven() {
+        let mut home = home_with(Vec::new());
+        let light = |name: &str| entity("ha_light", "light.kitchen", json!({"name": name, "colour": true, "white": true}));
+        let desk = entity("ha_switch", "switch.desk", json!({"name": "Desk"}));
+        let first = ha::Listing { found: vec![light("Kitchen"), desk], warning: None };
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "a"), "Home".into(), first)));
+        home.add("light.kitchen");
+        home.add("switch.desk");
+        home.config.devices[0].name = "Kitchen ceiling".into();
+        // Same home's HA at a new address: the desk is still the Desk.
+        // Another HA's light.kitchen is someone's "Garage strip".
+        let second = ha::Listing { found: vec![light("Garage strip"), entity("ha_switch", "switch.desk", json!({"name": "Desk"}))], warning: None };
+        home.ha_connected(Ok((hub("http://10.0.0.9:8123", "b"), "Home".into(), second)));
+        let names: Vec<&str> = home.config.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Desk"], "kept where the new hub vouches for it, and only there");
+        assert_eq!(reached(&home, 0), Some(hub("http://10.0.0.9:8123", "b")));
+        assert_eq!(home.found.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Garage strip"], "offered, to add if wanted");
     }
 
     #[test]
