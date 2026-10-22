@@ -213,7 +213,7 @@ The token is kept in `home.json` in hopchat's settings directory, readable only 
 | --- | --- |
 | Wiz bulbs | local UDP, port 38899 |
 | LG webOS TVs | WebSocket API on port 3001 over TLS (3000 on older sets) |
-| Printers and copiers | IPP on port 631, found over Bonjour (`_ipp._tcp`) |
+| Printers and copiers | IPP 2.0 or 1.1 on port 631, found over Bonjour (`_ipp._tcp`) |
 | Home Assistant lights, TVs and switches | HA's REST API, port 8123 by default |
 
 Devices are tracked by MAC address, so a new IP from the router doesn't lose them. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home says so.

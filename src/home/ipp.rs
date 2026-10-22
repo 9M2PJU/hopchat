@@ -33,6 +33,10 @@ const PATHS: &[&str] = &["ipp/print", "ipp", ""];
 
 const GET_PRINTER_ATTRIBUTES: u16 = 0x000B;
 const IDENTIFY_PRINTER: u16 = 0x003C;
+/// `server-error-version-not-supported`: the printer wants another version.
+const VERSION_NOT_SUPPORTED: u16 = 0x0503;
+const IPP_2_0: [u8; 2] = [2, 0];
+const IPP_1_1: [u8; 2] = [1, 1];
 
 /// What home asks a printer for.
 const WANTED: &[&str] = &[
@@ -209,10 +213,27 @@ impl Printer {
     }
 
     fn send(&self, req: Request) -> Result<Attributes, String> {
+        let mut request = req.finish();
+        let (mut status, mut attrs) = self.post(&request)?;
+        // A printer that only speaks IPP 1.1 says so with this status; ask
+        // it again in 1.1, as CUPS does. Nothing home asks needs 2.0.
+        if status == VERSION_NOT_SUPPORTED {
+            request[..2].copy_from_slice(&IPP_1_1);
+            (status, attrs) = self.post(&request)?;
+        }
+        // 0x0000–0x00FF are the successful ones.
+        if status > 0x00FF {
+            return Err(format!("the printer refused (IPP status {status:#06x})"));
+        }
+        Ok(attrs)
+    }
+
+    /// Sends one encoded request; the answer's status and attributes.
+    fn post(&self, request: &[u8]) -> Result<(u16, Attributes), String> {
         let mut response = agent()
             .post(self.uri("http"))
             .header("Content-Type", "application/ipp")
-            .send(&req.finish()[..])
+            .send(request)
             .map_err(|e| format!("the printer isn't answering: {e}"))?;
         let body = response
             .body_mut()
@@ -220,12 +241,7 @@ impl Printer {
             .limit(MAX_ANSWER)
             .read_to_vec()
             .map_err(|e| format!("couldn't read the printer's answer: {e}"))?;
-        let (status, attrs) = parse(&body).ok_or("the printer's answer made no sense")?;
-        // 0x0000–0x00FF are the successful ones.
-        if status > 0x00FF {
-            return Err(format!("the printer refused (IPP status {status:#06x})"));
-        }
-        Ok(attrs)
+        parse(&body).ok_or_else(|| "the printer's answer made no sense".into())
     }
 }
 
@@ -262,7 +278,7 @@ const LANGUAGE: u8 = 0x48;
 
 impl Request {
     fn new(operation: u16, uri: &str) -> Request {
-        let mut bytes = vec![2, 0];
+        let mut bytes = IPP_2_0.to_vec();
         bytes.extend(operation.to_be_bytes());
         bytes.extend(1u32.to_be_bytes());
         bytes.push(OPERATION);
@@ -488,6 +504,12 @@ pub(super) mod fake {
 
     /// Its port, and what it was asked.
     pub fn printer(answer: impl Fn(u16) -> Vec<u8> + Send + Sync + 'static) -> (u16, Asked) {
+        speaking(move |_, op| answer(op))
+    }
+
+    /// One that answers as `answer` says given the IPP version a request
+    /// was sent in, as `[major, minor]`, and its operation.
+    pub fn speaking(answer: impl Fn([u8; 2], u16) -> Vec<u8> + Send + Sync + 'static) -> (u16, Asked) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let asked: Asked = Default::default();
@@ -522,7 +544,7 @@ pub(super) mod fake {
                         // A request is laid out as an answer is, with the
                         // operation where the status goes.
                         let (op, attrs) = parse(&body).expect("a well-formed IPP request");
-                        let reply = answer(op);
+                        let reply = answer([body[0], body[1]], op);
                         log.lock().unwrap().push((op, attrs));
                         let head = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: {}\r\n\r\n",
@@ -591,7 +613,7 @@ pub(super) mod fake {
 
 #[cfg(test)]
 mod tests {
-    use super::fake::{answer, inkjet, printer};
+    use super::fake::{answer, inkjet, printer, speaking};
     use super::*;
 
     fn device(port: u16) -> Device {
@@ -692,6 +714,16 @@ mod tests {
         assert!(printer_err(port).contains("refused"));
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         assert_eq!(Ipp.check(&device(closed)).0, State::Offline);
+    }
+
+    #[test]
+    fn a_printer_that_only_speaks_ipp_1_1_is_asked_again_in_1_1() {
+        let (port, asked) = speaking(|version, op| if version == IPP_2_0 { answer(VERSION_NOT_SUPPORTED, &[]) } else { inkjet(op) });
+        assert_eq!(Ipp.check(&device(port)), (State::Ready, "printing · black 60%, cyan 8% (low) · out of paper, ink low".into()));
+        assert_eq!(asked.lock().unwrap().len(), 2, "once in 2.0, once in 1.1");
+        let (port, asked) = speaking(|_, _| answer(VERSION_NOT_SUPPORTED, &[]));
+        assert!(printer_err(port).contains("refused"), "one that wants neither is refused, not asked forever");
+        assert_eq!(asked.lock().unwrap().len(), 2);
     }
 
     /// Lists the printers on this network and what each says: run with
