@@ -1082,20 +1082,36 @@ impl Home {
 }
 
 /// Lists a hub's entities, each with its state, for a scan. An added
-/// device the listing leaves out, or every one when the hub can't be
-/// listed, is checked on its own, so none stays "checking".
+/// device the listing leaves out is checked on its own, so none stays
+/// "checking"; those checks run side by side, like any other device's.
+/// A hub that can't be listed can't drive anything either, so its
+/// devices are all offline at once rather than after a wait each.
 fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<Request>, each: impl Fn(driver::Found)) {
-    let found = hub.entities().map(|listing| listing.found).unwrap_or_default();
+    let found = match hub.entities() {
+        Ok(listing) => listing.found,
+        Err(e) => {
+            for d in added {
+                let _ = me.send(Request::Checked { id: d.id(), state: State::Offline, detail: e.clone() });
+            }
+            return;
+        }
+    };
     let listed = ha::listed(&found);
     found.into_iter().for_each(each);
-    for d in added {
-        let has = d.unit.as_ref().is_some_and(|u| listed.iter().any(|(b, l)| *b == d.backend && l == u));
-        if has {
-            continue;
-        }
-        let Some(backend) = backend_of(&d) else { continue };
-        let (state, detail) = backend.check(&d);
-        let _ = me.send(Request::Checked { id: d.id(), state, detail });
+    let checks: Vec<_> = added
+        .into_iter()
+        .filter(|d| !d.unit.as_ref().is_some_and(|u| listed.contains(u)))
+        .filter_map(|d| {
+            let backend = backend_of(&d)?;
+            let me = me.clone();
+            Some(thread::spawn(move || {
+                let (state, detail) = backend.check(&d);
+                let _ = me.send(Request::Checked { id: d.id(), state, detail });
+            }))
+        })
+        .collect();
+    for check in checks {
+        let _ = check.join();
     }
 }
 
@@ -1628,6 +1644,48 @@ mod tests {
         home.ha_connected(Ok((second.clone(), "Home".into(), listing(plug("switch.fan")))));
         assert_eq!(home.config.ha, Some(second.clone()));
         assert_eq!(reached(&home, 0), Some(second), "every entity goes through the one hub");
+    }
+
+    /// What list_hub reported for each device, by id.
+    fn listed_states(hub: &ha::Hub, added: Vec<Device>) -> HashMap<String, State> {
+        let (me, requests) = std::sync::mpsc::channel();
+        list_hub(hub, added, &me, |_| {});
+        drop(me);
+        requests
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::Checked { id, state, .. } => Some((id, state)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ha_device(backend: &str, unit: &str, hub: &ha::Hub) -> Device {
+        Device { unit: Some(unit.into()), hub: Some(hub.clone()), ..Device::new(backend, unit.into(), [127, 0, 0, 1].into(), None, json!({})) }
+    }
+
+    #[test]
+    fn a_hub_that_is_down_takes_its_devices_with_it_at_once() {
+        // Nothing listens on port 1: refused at once, as a hub that is off.
+        let down = hub("http://127.0.0.1:1", "t");
+        let added: Vec<Device> = (0..20).map(|n| ha_device("ha_switch", &format!("switch.plug_{n}"), &down)).collect();
+        let started = Instant::now();
+        let states = listed_states(&down, added);
+        assert!(started.elapsed() < Duration::from_secs(2), "one answer for all, not a wait each");
+        assert_eq!(states.len(), 20);
+        assert!(states.values().all(|s| *s == State::Offline));
+    }
+
+    #[test]
+    fn a_device_the_hub_no_longer_lists_is_checked_on_its_own() {
+        let fake = ha::fake::Fake::start("t", Some(json!([])), |_, path, _| match path {
+            "/api/states" => (200, json!([{"entity_id": "switch.kettle", "state": "on", "attributes": {}}]).to_string()),
+            _ => (200, json!({"entity_id": "switch.fan", "state": "off", "attributes": {}}).to_string()),
+        });
+        let at = hub(&fake.url, "t");
+        let states = listed_states(&at, vec![ha_device("ha_switch", "switch.kettle", &at), ha_device("ha_switch", "switch.fan", &at)]);
+        assert_eq!(states.into_iter().collect::<Vec<_>>(), [("switch.fan".to_string(), State::Ready)], "the kettle came with the listing");
+        assert!(fake.asked().contains(&"GET /api/states/switch.fan".to_string()));
     }
 
     #[test]

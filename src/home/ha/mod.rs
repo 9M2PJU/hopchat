@@ -29,7 +29,7 @@ use super::light::scene_key;
 use super::{Device, State};
 
 #[cfg(test)]
-mod fake;
+pub(super) mod fake;
 mod lights;
 mod switches;
 mod tvs;
@@ -359,9 +359,10 @@ pub fn drives(d: &Device) -> bool {
     backend_of(d).is_some_and(|b| b.listed_by_hub())
 }
 
-/// The entities a listing has, by backend and entity id.
-pub fn listed(listing: &[Found]) -> HashSet<(&'static str, String)> {
-    listing.iter().filter_map(|f| Some((f.backend, f.unit.clone()?))).collect()
+/// The entity ids a listing has. An entity's id says its domain, and so
+/// which backend drives it.
+pub fn listed(listing: &[Found]) -> HashSet<String> {
+    listing.iter().filter_map(|f| f.unit.clone()).collect()
 }
 
 /// The next JSON message on a WebSocket.
