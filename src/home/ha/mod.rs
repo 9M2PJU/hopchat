@@ -95,7 +95,8 @@ pub fn url(typed: &str) -> Result<String, String> {
         Some((other, _)) => return Err(format!("{other}:// isn't how to reach Home Assistant; use http:// or https://")),
         None => ("http", typed),
     };
-    if rest.is_empty() || rest.contains('/') {
+    // A path, query or login would be dropped or misread; HA is at the root.
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
         return Err(format!("{typed} isn't an address like http://homeassistant.local:8123"));
     }
     // Unbracketed, an IPv6 address's last group would read as a port.
@@ -502,6 +503,9 @@ mod tests {
         assert!(url("fd00::4").unwrap_err().contains("brackets"));
         assert!(url("ftp://10.0.0.4").is_err());
         assert!(url("http://10.0.0.4:8123/lovelace").is_err());
+        assert!(url("http://10.0.0.4:8123?x=1").is_err());
+        assert!(url("http://user:pass@10.0.0.4:8123").is_err());
+        assert!(url("10.0.0.4#frag").is_err());
     }
 
     #[test]

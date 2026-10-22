@@ -358,20 +358,21 @@ pub enum Request {
     Answered { question: ai::Question, asked: serde_json::Value, answer: Result<String, String> },
 }
 
-/// The address and token typed after `/home ha`, in either order. Taken
-/// the wrong way round, the token would be shown back as the address that
-/// couldn't be reached.
-fn ha_args(first: &str, second: Option<&str>) -> (Option<String>, String) {
-    let Some(second) = second else { return (None, first.to_string()) };
-    let token_first = if looks_like_token(first) != looks_like_token(second) {
-        looks_like_token(first)
-    } else {
-        looks_like_address(second) && !looks_like_address(first)
-    };
-    if token_first {
-        (Some(second.to_string()), first.to_string())
-    } else {
-        (Some(first.to_string()), second.to_string())
+/// The address and token typed after `/home ha`: `[URL] TOKEN`, in that
+/// order. Anything else is said back as a mistake rather than guessed
+/// at, so a token is never tried as an address, shown back as one, or
+/// an address sent as the token.
+fn ha_args(first: &str, second: Option<&str>) -> Result<(Option<String>, String), String> {
+    const USAGE: &str = "/home ha TOKEN, or /home ha URL TOKEN";
+    match second {
+        None if !looks_like_token(first) && (looks_like_address(first) || first.contains('.')) => {
+            Err(format!("give the token too: {USAGE}"))
+        }
+        None => Ok((None, first.to_string())),
+        Some(second) if looks_like_token(first) && !looks_like_token(second) => {
+            Err(format!("the address goes before the token: {USAGE}"))
+        }
+        Some(second) => Ok((Some(first.to_string()), second.to_string())),
     }
 }
 
@@ -902,11 +903,13 @@ impl Home {
                     .into(),
             },
             ("ha", Some("forget" | "off")) => self.forget_ha(),
-            ("ha", Some(first)) => {
-                let (typed, token) = ha_args(first, words.next());
-                self.connect_ha(typed, token);
-                "connecting to Home Assistant…".into()
-            }
+            ("ha", Some(first)) => match ha_args(first, words.next()) {
+                Ok((typed, token)) => {
+                    self.connect_ha(typed, token);
+                    "connecting to Home Assistant…".into()
+                }
+                Err(e) => e,
+            },
             ("model", Some(model)) => {
                 self.config.model = model.to_string();
                 self.save();
@@ -1605,18 +1608,23 @@ mod tests {
     }
 
     #[test]
-    fn home_assistant_address_and_token_in_either_order() {
-        let both = |a: &str, b: Option<&str>| ha_args(a, b);
+    fn home_assistant_address_then_token() {
         let (url, token) = ("http://10.0.0.4:8123", "eyJhbGciOi.eyJpc3Mi.sig");
-        assert_eq!(both(url, Some(token)), (Some(url.into()), token.into()));
-        assert_eq!(both(token, Some(url)), (Some(url.into()), token.into()));
-        assert_eq!(both(token, Some("10.0.0.4")), (Some("10.0.0.4".into()), token.into()));
-        assert_eq!(both("homeassistant.local", Some(token)), (Some("homeassistant.local".into()), token.into()));
-        assert_eq!(both(token, None), (None, token.into()));
-        // A bare hostname after the token is still the address, never the token.
-        assert_eq!(both(token, Some("homeassistant.local")), (Some("homeassistant.local".into()), token.into()));
-        assert_eq!(both("ha.home.lan", Some(token)), (Some("ha.home.lan".into()), token.into()));
+        assert_eq!(ha_args(url, Some(token)), Ok((Some(url.into()), token.into())));
+        assert_eq!(ha_args("homeassistant.local", Some(token)), Ok((Some("homeassistant.local".into()), token.into())));
+        assert_eq!(ha_args(token, None), Ok((None, token.into())));
+        // Mistakes are said back, and never echo the token.
+        for (first, second) in [(token, Some(url)), (token, Some("ha.home.lan")), (url, None), ("homeassistant.local", None), ("10.0.0.4", None)] {
+            let e = ha_args(first, second).unwrap_err();
+            assert!(e.contains("/home ha URL TOKEN") && !e.contains(token), "{first} {second:?}: {e}");
+        }
         assert!(looks_like_token(token) && !looks_like_token("ha.home.lan") && !looks_like_token("10.0.0.4"));
+    }
+
+    #[test]
+    fn a_lone_address_asks_for_the_token_and_connects_nowhere() {
+        let mut home = home_with(Vec::new());
+        assert!(home.configure(None, "ha http://10.0.0.4:8123").starts_with("give the token too"));
     }
 
     #[test]
