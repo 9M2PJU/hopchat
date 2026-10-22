@@ -295,9 +295,15 @@ impl Hub {
 
     /// Every entity home can drive, as found devices, each with its state.
     pub fn entities(&self) -> Result<Listing, String> {
-        let states = self.get_within("/api/states", LISTING)?;
+        // Neither needs the other, and each can take a while on a big home.
+        let (states, registry) = std::thread::scope(|s| {
+            let registry = s.spawn(|| self.registry());
+            let states = self.get_within("/api/states", LISTING);
+            (states, registry.join().unwrap_or_else(|_| Err("reading it went wrong".into())))
+        });
+        let states = states?;
         // Without the registry, nothing is filtered out; still worth listing.
-        let (registry, warning) = match self.registry() {
+        let (registry, warning) = match registry {
             Ok(registry) => (registry, None),
             Err(e) => (
                 HashMap::new(),
