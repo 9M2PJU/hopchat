@@ -942,8 +942,10 @@ impl Home {
                                               /home ha http://IP:8123 TOKEN")?,
                 };
                 let hub = ha::Hub { url, token };
-                let home = hub.check()?;
-                let found = hub.entities()?;
+                // Said only to the person at this machine: where it tried.
+                let tried = |e: String| format!("{e}; tried {}", hub.url);
+                let home = hub.check().map_err(tried)?;
+                let found = hub.entities().map_err(tried)?;
                 Ok((hub, home, found))
             })();
             let _ = me.send(Request::HaConnected(result));

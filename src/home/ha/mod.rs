@@ -173,11 +173,13 @@ impl Hub {
         })
     }
 
-    /// The JSON HA answered, or why not.
+    /// The JSON HA answered, or why not. What goes wrong driving a device
+    /// is said in the group that asked, so it never names the hub's
+    /// address on the LAN.
     fn answer(&self, sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value, String> {
         let mut response = sent.map_err(|e| match e {
             ureq::Error::Timeout(_) => "Home Assistant took too long to answer".to_string(),
-            e => format!("can't reach Home Assistant at {}: {e}", self.url),
+            e => format!("can't reach Home Assistant: {e}"),
         })?;
         let code = response.status().as_u16();
         let body = response
@@ -286,7 +288,7 @@ impl Hub {
             .to_socket_addrs()
             .ok()
             .and_then(|mut addrs| addrs.find_map(|a| TcpStream::connect_timeout(&a, WAIT).ok()))
-            .ok_or_else(|| format!("can't reach Home Assistant at {}", self.url))?;
+            .ok_or("can't reach Home Assistant")?;
         stream.set_read_timeout(Some(LISTING)).map_err(|e| e.to_string())?;
         let scheme = if self.secure() { "wss" } else { "ws" };
         let ws_url = format!("{scheme}://{address}/api/websocket");
@@ -617,6 +619,13 @@ mod tests {
         assert_eq!(hub.state("light.nope").unwrap_err(), "Home Assistant has no light.nope");
         assert!(hub.state("sensor.page").unwrap_err().contains("not as Home Assistant"));
         assert_eq!(hub.state("light.other").unwrap_err(), "Home Assistant answered HTTP 500");
+    }
+
+    #[test]
+    fn what_goes_wrong_never_says_where_the_hub_is() {
+        let down = Hub { url: "http://127.0.0.1:1".into(), token: "t".into() };
+        let e = down.state("switch.kettle").unwrap_err();
+        assert!(e.starts_with("can't reach Home Assistant") && !e.contains("127.0.0.1"), "{e}");
     }
 
     fn states() -> Value {
