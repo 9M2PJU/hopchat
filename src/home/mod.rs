@@ -1630,6 +1630,27 @@ mod tests {
         assert_eq!(reached(&home, 0), Some(second), "every entity goes through the one hub");
     }
 
+    #[test]
+    fn all_the_lights_take_as_long_as_the_slowest() {
+        let fake = ha::fake::Fake::start("t", None, |method, _, _| {
+            std::thread::sleep(Duration::from_millis(400));
+            match method {
+                "POST" => (200, "[]".into()),
+                _ => (200, json!({"state": "off", "attributes": {}}).to_string()),
+            }
+        });
+        let at = hub(&fake.url, "t");
+        let lamps: Vec<Device> = (0..8)
+            .map(|n| Device { unit: Some(format!("light.lamp_{n}")), ..Device::new("ha_light", format!("Lamp {n}"), [127, 0, 0, 1].into(), None, json!({})) })
+            .collect();
+        let mut home = home_with(lamps);
+        home.config.ha = Some(at);
+        let started = Instant::now();
+        let said = home.run_tool("light_set", &json!({"light": "all", "on": false})).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "eight lights side by side, not one after another: {:?}", started.elapsed());
+        assert!(said.starts_with("Lamp 0 is now off; Lamp 1 is now off"), "{said}");
+    }
+
     /// What list_hub reported for each device, by id.
     fn listed_states(hub: &ha::Hub, added: Vec<Device>) -> HashMap<String, State> {
         let (me, requests) = std::sync::mpsc::channel();
