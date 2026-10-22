@@ -200,7 +200,36 @@ pub(super) fn describe_tv(state: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::super::fake::Fake;
     use super::*;
+
+    #[test]
+    fn volume_mutes_then_steps_where_it_cant_be_set() {
+        let fake = Fake::start("t", None, |method, _, _| match method {
+            "GET" => (200, json!({"entity_id": "media_player.tv", "state": "on",
+                                  "attributes": {"volume_level": 0.2, "supported_features": 0}}).to_string()),
+            _ => (200, "[]".into()),
+        });
+        let mut data = json!({"name": "TV"});
+        Hub { url: fake.url.clone(), token: "t".into() }.stamp(&mut data);
+        let mut tv = Device {
+            unit: Some("media_player.tv".into()),
+            ..Device::new("ha_tv", "TV".into(), Ipv4Addr::LOCALHOST, None, data)
+        };
+        assert_eq!(HaTv.volume(&mut tv, None, Some(-15), Some(false)).unwrap(), "TV is on · volume 20");
+        let asked = fake.asked();
+        let calls: Vec<&str> = asked.iter().map(|a| a.splitn(3, ' ').take(2).last().unwrap()).collect();
+        assert_eq!(calls, [
+            "/api/services/media_player/volume_mute",
+            "/api/states/media_player.tv",
+            "/api/services/media_player/volume_down",
+            "/api/services/media_player/volume_down",
+            "/api/states/media_player.tv",
+        ], "fifteen points is two of HA's tenth steps");
+        assert!(asked[0].contains(r#""is_volume_muted":false"#), "{}", asked[0]);
+    }
 
     #[test]
     fn volume_moves_by_points_on_every_tv() {

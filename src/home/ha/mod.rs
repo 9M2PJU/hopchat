@@ -27,6 +27,8 @@ use super::driver::{backend_of, Found};
 use super::light::scene_key;
 use super::{Device, State};
 
+#[cfg(test)]
+mod fake;
 mod lights;
 mod switches;
 mod tvs;
@@ -582,6 +584,60 @@ mod tests {
         let d = |backend: &str| Device::new(backend, "x".into(), Ipv4Addr::UNSPECIFIED, None, Value::Null);
         assert!(drives(&d("ha_light")) && drives(&d("ha_tv")) && drives(&d("ha_switch")));
         assert!(!drives(&d("wiz")) && !drives(&d("webos")) && !drives(&d("ha_something_newer")));
+    }
+
+    fn hub_at(fake: &fake::Fake, token: &str) -> Hub {
+        Hub { url: fake.url.clone(), token: token.into() }
+    }
+
+    #[test]
+    fn a_hub_is_checked_and_says_why_not() {
+        let fake = fake::Fake::start("t", None, |_, path, _| match path {
+            "/api/config" => (200, json!({"location_name": "Flat", "version": "2026.10.1"}).to_string()),
+            "/api/states/light.nope" => (404, json!({"message": "Entity not found."}).to_string()),
+            "/api/states/sensor.page" => (200, "<html>Sign in</html>".into()),
+            _ => (500, String::new()),
+        });
+        let hub = hub_at(&fake, "t");
+        assert_eq!(hub.check(), Ok("Flat".into()));
+        assert!(hub_at(&fake, "wrong").check().unwrap_err().contains("refused the token"));
+        assert_eq!(hub.state("light.nope").unwrap_err(), "Home Assistant has no light.nope");
+        assert!(hub.state("sensor.page").unwrap_err().contains("not as Home Assistant"));
+        assert_eq!(hub.state("light.other").unwrap_err(), "Home Assistant answered HTTP 500");
+    }
+
+    fn states() -> Value {
+        json!([
+            {"entity_id": "light.desk", "state": "on", "attributes": {"friendly_name": "Desk", "supported_color_modes": ["brightness"]}},
+            {"entity_id": "light.hidden", "state": "off", "attributes": {"supported_color_modes": ["brightness"]}},
+            {"entity_id": "light.bulb", "state": "off", "attributes": {"supported_color_modes": ["hs"]}},
+            {"entity_id": "switch.kettle", "state": "unavailable", "attributes": {"friendly_name": "Kettle"}},
+            {"entity_id": "sensor.temperature", "state": "21", "attributes": {}},
+        ])
+    }
+
+    #[test]
+    fn listings_leave_out_what_the_registry_hides() {
+        let registry = json!([
+            {"entity_id": "light.desk", "platform": "hue"},
+            {"entity_id": "light.hidden", "platform": "hue", "hidden_by": "user"},
+            {"entity_id": "light.bulb", "platform": "wiz"},
+        ]);
+        let fake = fake::Fake::start("t", Some(registry), |_, _, _| (200, states().to_string()));
+        let listing = hub_at(&fake, "t").entities().unwrap();
+        assert_eq!(listing.warning, None);
+        let units: Vec<&str> = listing.found.iter().filter_map(|f| f.unit.as_deref()).collect();
+        assert_eq!(units, ["light.desk", "switch.kettle"]);
+        assert_eq!(listing.found[0].checked, Some((State::Ready, "on".into())));
+        assert_eq!(listing.found[1].checked.as_ref().map(|c| &c.0), Some(&State::Offline));
+    }
+
+    #[test]
+    fn without_the_registry_everything_is_listed_with_a_warning() {
+        let fake = fake::Fake::start("t", None, |_, _, _| (200, states().to_string()));
+        let listing = hub_at(&fake, "t").entities().unwrap();
+        assert_eq!(listing.found.len(), 4, "every light and switch, and no sensor");
+        assert!(listing.warning.unwrap().contains("entity registry"));
     }
 
     /// Lists and drives a real Home Assistant. `HA_URL=… HA_TOKEN=… cargo
