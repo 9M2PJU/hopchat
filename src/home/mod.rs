@@ -358,7 +358,7 @@ pub enum Request {
     Checked { id: String, state: State, detail: String },
     /// `/home ha` reached a Home Assistant: the hub and what it has, or
     /// why not.
-    HaConnected(Result<(ha::Hub, String, ha::Listing), String>),
+    HaConnected { attempt: u64, result: Result<(ha::Hub, String, ha::Listing), String> },
     /// A test finished: the device with what it learned and what to say,
     /// or why not; `before` is its data when the test began.
     Tested { id: String, before: Value, result: Result<(Box<Device>, String), String> },
@@ -419,6 +419,10 @@ pub struct Home {
     /// Who was last told about borrowing this model, and when, so one
     /// request doesn't note every turn.
     lent_to: Option<(String, Instant)>,
+    /// The `/home ha` connection on its way, if one is.
+    connecting_ha: Option<u64>,
+    /// How many `/home ha` connections were started, to tell them apart.
+    ha_attempts: u64,
 }
 
 impl Home {
@@ -444,6 +448,8 @@ impl Home {
             offered: None,
             lending: Arc::new(AtomicUsize::new(0)),
             lent_to: None,
+            connecting_ha: None,
+            ha_attempts: 0,
         };
         if unstamped {
             home.save();
@@ -602,7 +608,7 @@ impl Home {
                 }
                 self.on_listed(found);
             }
-            Request::HaConnected(result) => self.ha_connected(result),
+            Request::HaConnected { attempt, result } => self.on_ha_connected(attempt, result),
             Request::ScanDone => self.scanning = false,
             Request::Checked { id, state, detail } => self.checked(id, state, detail),
             Request::Paired { id, result } => self.on_paired(&id, result),
@@ -1561,7 +1567,7 @@ mod tests {
         let (url, token) = (std::env::var("HA_URL").unwrap(), std::env::var("HA_TOKEN").unwrap());
         assert_eq!(home.configure(None, &format!("ha {url} {token}")), "connecting to Home Assistant…");
         let connected = requests.recv_timeout(Duration::from_secs(20)).unwrap();
-        assert!(matches!(connected, Request::HaConnected(Ok(_))));
+        assert!(matches!(connected, Request::HaConnected { result: Ok(_), .. }));
         home.handle(connected);
         let names: Vec<String> = home.found.iter().map(|d| d.name.clone()).collect();
         println!("found: {names:?}");
@@ -1638,6 +1644,26 @@ mod tests {
         home.ha_connected(Ok((hub("http://10.0.0.9:8123", "a"), "Home".into(), listing(kitchen))));
         let units: Vec<&str> = home.config.devices.iter().filter_map(|d| d.unit.as_deref()).collect();
         assert_eq!(units, ["light.kitchen"], "listed: kept; not listed by a hub that moved: forgotten");
+    }
+
+    #[test]
+    fn one_home_assistant_connection_at_a_time() {
+        let (mut home, notes, requests) = noted_home();
+        let token = "eyJhbGciOi.eyJpc3Mi.sig";
+        // Nothing listens on port 1, so this fails at once.
+        assert_eq!(home.configure(None, &format!("ha http://127.0.0.1:1 {token}")), "connecting to Home Assistant…");
+        assert!(home.configure(None, &format!("ha http://127.0.0.1:2 {token}")).starts_with("already connecting"));
+        let answered = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        home.handle(answered);
+        assert!(said(&notes).iter().any(|t| t.starts_with("home: can't reach Home Assistant")));
+        assert_eq!(home.connecting_ha, None, "a failure ends the attempt");
+        // A connection that answers after /home ha forget is dropped.
+        let kettle = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.configure(None, &format!("ha http://127.0.0.1:1 {token}"));
+        home.forget_ha();
+        let late = Request::HaConnected { attempt: home.ha_attempts, result: Ok((hub("http://10.0.0.4:8123", "t"), "Home".into(), listing(kettle))) };
+        home.handle(late);
+        assert!(home.config.ha.is_none() && home.found.is_empty());
     }
 
     #[test]

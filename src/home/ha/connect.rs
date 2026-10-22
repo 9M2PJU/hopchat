@@ -56,6 +56,9 @@ impl Home {
             },
             Some("forget" | "off") => self.forget_ha(),
             Some(first) => match ha_args(first, next) {
+                // Two at once would race to be the one hub; the later answer
+                // would quietly undo the earlier.
+                Ok(_) if self.connecting_ha.is_some() => "already connecting to Home Assistant; wait for it to answer".into(),
                 Ok((typed, token)) => {
                     self.connect_ha(typed, token);
                     "connecting to Home Assistant…".into()
@@ -67,7 +70,10 @@ impl Home {
 
     /// Reaches a Home Assistant, at `typed` or wherever one announces
     /// itself, and lists what it has.
-    fn connect_ha(&self, typed: Option<String>, token: String) {
+    fn connect_ha(&mut self, typed: Option<String>, token: String) {
+        self.ha_attempts += 1;
+        let attempt = self.ha_attempts;
+        self.connecting_ha = Some(attempt);
         let me = self.me.clone();
         thread::spawn(move || {
             let result = (|| {
@@ -83,8 +89,17 @@ impl Home {
                 let found = hub.entities().map_err(tried)?;
                 Ok((hub, home, found))
             })();
-            let _ = me.send(Request::HaConnected(result));
+            let _ = me.send(Request::HaConnected { attempt, result });
         });
+    }
+
+    /// What a `/home ha` connection came back with. Only the one connecting
+    /// now is taken: one that answers after `/home ha forget` is dropped.
+    pub(in crate::home) fn on_ha_connected(&mut self, attempt: u64, result: Result<(ha::Hub, String, ha::Listing), String>) {
+        if self.connecting_ha == Some(attempt) {
+            self.connecting_ha = None;
+            self.ha_connected(result);
+        }
     }
 
     pub(in crate::home) fn ha_connected(&mut self, result: Result<(ha::Hub, String, ha::Listing), String>) {
@@ -168,6 +183,8 @@ impl Home {
     /// `/home ha forget`: drops the hub, its token, and every device from it.
     /// Every HA device is the one hub's.
     pub(in crate::home) fn forget_ha(&mut self) -> String {
+        // A connection still on its way is dropped when it answers.
+        self.connecting_ha = None;
         let Some(hub) = self.config.ha.take() else {
             return "home isn't connected to Home Assistant".into();
         };
