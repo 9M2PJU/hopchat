@@ -382,8 +382,16 @@ fn registry_of(answer: Value) -> Result<HashMap<String, Value>, String> {
 /// group. Only the socket's own error is passed on, as in "Connection
 /// refused"; a TLS error can name the host its certificate was for, and
 /// the rest can quote the URL, so those are said in fixed words.
+///
+/// Running out of time before the hub was even reached (its name didn't
+/// resolve, nothing accepted the connection) means nothing was sent, so
+/// that is "can't reach", not [`SLOW`]: a call that is [`SLOW`] was sent,
+/// and HA may still carry it out.
 fn unreached(e: ureq::Error) -> String {
     match e {
+        ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => {
+            "can't reach Home Assistant: no answer from its address".into()
+        }
         ureq::Error::Timeout(_) => SLOW.into(),
         ureq::Error::Io(e) => format!("can't reach Home Assistant: {}", e.kind()),
         ureq::Error::Tls(_) => "can't reach Home Assistant: its certificate isn't one this machine trusts".into(),
@@ -729,6 +737,19 @@ mod tests {
     }
 
     #[test]
+    fn a_call_that_never_reached_the_hub_is_not_said_to_be_on_its_way() {
+        // The connection timed out: nothing was sent.
+        for never_sent in [ureq::Timeout::Resolve, ureq::Timeout::Connect] {
+            let e = unreached(ureq::Error::Timeout(never_sent));
+            assert!(e.starts_with("can't reach Home Assistant") && e != SLOW, "{e}");
+        }
+        // Sent, and HA is slow to say what it did.
+        for sent in [ureq::Timeout::Global, ureq::Timeout::RecvResponse, ureq::Timeout::RecvBody] {
+            assert_eq!(unreached(ureq::Error::Timeout(sent)), SLOW);
+        }
+    }
+
+    #[test]
     fn a_refused_registry_says_why() {
         let refused = json!({"id": 1, "type": "result", "success": false, "error": {"code": "unauthorized", "message": "Unauthorized"}});
         assert_eq!(registry_of(refused).unwrap_err(), "Home Assistant wouldn't list it: Unauthorized");
@@ -763,7 +784,8 @@ mod tests {
         assert_eq!(listing.found[1].checked.as_ref().map(|c| &c.0), Some(&State::Offline));
     }
 
-    /// Slow: answers after the five seconds a driving call gets.
+    /// Slow: answers after the five seconds a status read gets (a call
+    /// that drives something gets `DRIVE`, longer).
     #[test]
     #[ignore = "takes six seconds"]
     fn a_slow_listing_is_waited_for() {
