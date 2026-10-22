@@ -11,7 +11,8 @@
 //! keep a MAC address, so it is still itself after DHCP moves it.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -68,14 +69,23 @@ fn uuid_of(said: &str) -> String {
     said.trim().trim_start_matches("urn:uuid:").to_ascii_lowercase()
 }
 
+fn model_in(data: &Value) -> Option<&str> {
+    data.get("model").and_then(Value::as_str).filter(|m| !m.is_empty())
+}
+
 fn model(d: &Device) -> Option<&str> {
-    d.data.get("model").and_then(Value::as_str).filter(|m| !m.is_empty())
+    model_in(&d.data)
+}
+
+/// The printer at `ip`, on the port and path `data` keeps for it.
+fn at(ip: Ipv4Addr, data: &Value) -> Printer {
+    let port = data.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).unwrap_or(PORT);
+    let path = data.get("path").and_then(Value::as_str).unwrap_or(PATHS[0]);
+    Printer { ip, port, path: path.into() }
 }
 
 fn printer(d: &Device) -> Printer {
-    let port = d.data.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).unwrap_or(PORT);
-    let path = d.data.get("path").and_then(Value::as_str).unwrap_or(PATHS[0]);
-    Printer { ip: d.ip, port, path: path.into() }
+    at(d.ip, &d.data)
 }
 
 impl Backend for Ipp {
@@ -96,21 +106,36 @@ impl Backend for Ipp {
         let Ok(browse) = daemon.browse(SERVICE) else { return };
         let until = Instant::now() + DISCOVER;
         let mut seen = std::collections::HashSet::new();
-        while let Some(left) = until.checked_duration_since(Instant::now()) {
-            match browse.recv_timeout(left) {
-                Ok(mdns_sd::ServiceEvent::ServiceResolved(service)) => {
-                    let Some(ip) = service.get_addresses_v4().into_iter().min() else { continue };
-                    if !seen.insert(service.get_fullname().to_string()) {
-                        continue;
+        let (asked_tx, asked) = mpsc::channel();
+        // A printer whose announcement has no UUID is asked for one on its
+        // own thread, so a slow one doesn't keep the others from being
+        // heard. Every such thread has finished when the scope ends.
+        thread::scope(|threads| {
+            while let Some(left) = until.checked_duration_since(Instant::now()) {
+                match browse.recv_timeout(left) {
+                    Ok(mdns_sd::ServiceEvent::ServiceResolved(service)) => {
+                        let Some(ip) = service.get_addresses_v4().into_iter().min() else { continue };
+                        if !seen.insert(service.get_fullname().to_string()) {
+                            continue;
+                        }
+                        match announced(ip, service.get_port(), |k| service.get_property_val_str(k)) {
+                            Some(f) if f.mac.is_none() => {
+                                let tx = asked_tx.clone();
+                                threads.spawn(move || {
+                                    let _ = tx.send(asked_about(f));
+                                });
+                            }
+                            Some(f) => each(f),
+                            None => {}
+                        }
                     }
-                    if let Some(f) = announced(ip, service.get_port(), |k| service.get_property_val_str(k)) {
-                        each(f);
-                    }
+                    Ok(_) => {}
+                    Err(_) => break,
                 }
-                Ok(_) => {}
-                Err(_) => break,
+                asked.try_iter().for_each(each);
             }
-        }
+        });
+        asked.try_iter().for_each(each);
         let _ = daemon.shutdown();
     }
 
@@ -118,9 +143,8 @@ impl Backend for Ipp {
         // Most addresses aren't printers: don't wait on IPP for each path.
         TcpStream::connect_timeout(&SocketAddr::from((ip, PORT)), WAIT).ok()?;
         PATHS.iter().find_map(|path| {
-            let p = Printer { ip, port: PORT, path: (*path).into() };
-            let attrs = p.attributes().ok()?;
-            Some(found(ip, attrs.text("printer-uuid").map(String::from), PORT, path, attrs.model()))
+            let attrs = Printer { ip, port: PORT, path: (*path).into() }.attributes().ok()?;
+            Some(told(found(ip, None, PORT, path, None), &attrs))
         })
     }
 
@@ -180,13 +204,33 @@ fn announced<'a>(ip: Ipv4Addr, port: u16, txt: impl Fn(&str) -> Option<&'a str>)
     }
     let path = txt("rp").unwrap_or(PATHS[0]).trim_matches('/');
     let model = txt("ty").map(str::trim).filter(|m| !m.is_empty()).map(String::from);
-    let uuid = txt("UUID").map(String::from).or_else(|| {
-        // IPP Everywhere requires it in the TXT record, but not every
-        // printer does; ask the printer.
-        let p = Printer { ip, port, path: path.into() };
-        p.attributes().ok()?.text("printer-uuid").map(String::from)
-    });
-    Some(found(ip, uuid, port, path, model))
+    // IPP Everywhere requires a UUID in the TXT record, but not every
+    // printer has one: one without is left for `asked_about`.
+    Some(found(ip, txt("UUID").map(String::from), port, path, model))
+}
+
+/// `f`, with what the printer says of itself when asked; as it was if the
+/// printer doesn't answer.
+fn asked_about(f: Found) -> Found {
+    match at(f.ip, &f.data).attributes() {
+        Ok(attrs) => told(f, &attrs),
+        Err(_) => f,
+    }
+}
+
+/// `f` with what a printer's attributes add: its UUID and model when `f`
+/// has none, and what it is doing, so no one need ask it again at once.
+fn told(mut f: Found, attrs: &Attributes) -> Found {
+    if f.mac.is_none() {
+        f.mac = attrs.text("printer-uuid").map(uuid_of);
+    }
+    if model_in(&f.data).is_none()
+        && let Some(model) = attrs.model()
+    {
+        f.data["model"] = json!(model);
+    }
+    f.checked = Some((State::Ready, attrs.summary()));
+    f
 }
 
 struct Printer {
@@ -790,6 +834,22 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(attrs.summary(), "idle · black 50%");
+    }
+
+    #[test]
+    fn an_announcement_with_no_uuid_is_completed_by_asking_the_printer() {
+        let (port, _) = printer(inkjet);
+        let ip = Ipv4Addr::LOCALHOST;
+        let f = announced(ip, port, |k| (k == "rp").then_some("ipp/print")).unwrap();
+        assert_eq!(f.mac, None, "an announcement alone doesn't wait on the printer");
+        let f = asked_about(f);
+        assert_eq!(f.mac.as_deref(), Some("abcd-1234"), "the same form a TXT record's UUID takes");
+        assert_eq!(f.data["model"], "Acme InkJet 3000");
+        assert_eq!(f.checked, Some((State::Ready, "printing · black 60%, cyan 8% (low) · out of paper, ink low".into())));
+        // One that doesn't answer is still offered, as it was announced.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let f = asked_about(announced(ip, closed, |_| None).unwrap());
+        assert_eq!((f.mac, f.checked), (None, None));
     }
 
     /// Lists the printers on this network and what each says: run with
