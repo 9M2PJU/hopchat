@@ -43,7 +43,12 @@ use tvs::describe_tv;
 
 /// Where HA listens unless told otherwise.
 const PORT: u16 = 8123;
+/// How long to wait for HA to answer a call that drives something, and
+/// to connect at all.
 const WAIT: Duration = Duration::from_secs(5);
+/// How long a listing may take: a big home's states and entity registry
+/// run to megabytes, which HA takes a while to put together and send.
+const LISTING: Duration = Duration::from_secs(60);
 /// How long to look for an HA announcing itself.
 const FIND: Duration = Duration::from_secs(3);
 const SERVICE: &str = "_home-assistant._tcp.local.";
@@ -158,6 +163,7 @@ impl Hub {
                 .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build();
             ureq::Agent::config_builder()
+                .timeout_connect(Some(WAIT))
                 .timeout_global(Some(WAIT))
                 .tls_config(tls)
                 // An HTTP error from HA says why in its body; keep it.
@@ -184,9 +190,17 @@ impl Hub {
     }
 
     fn get(&self, path: &str) -> Result<Value, String> {
+        self.get_within(path, WAIT)
+    }
+
+    /// GETs `path`, allowing `wait` for the whole answer to arrive.
+    fn get_within(&self, path: &str, wait: Duration) -> Result<Value, String> {
         let sent = Self::agent()
             .get(format!("{}{path}", self.url))
             .header("Authorization", format!("Bearer {}", self.token))
+            .config()
+            .timeout_global(Some(wait))
+            .build()
             .call();
         self.answer(sent)
     }
@@ -234,7 +248,7 @@ impl Hub {
 
     /// Every entity home can drive, as found devices, each with its state.
     pub fn entities(&self) -> Result<Listing, String> {
-        let states = self.get("/api/states")?;
+        let states = self.get_within("/api/states", LISTING)?;
         // Without the registry, nothing is filtered out; still worth listing.
         let (registry, warning) = match self.registry() {
             Ok(registry) => (registry, None),
@@ -273,7 +287,7 @@ impl Hub {
             .ok()
             .and_then(|mut addrs| addrs.find_map(|a| TcpStream::connect_timeout(&a, WAIT).ok()))
             .ok_or_else(|| format!("can't reach Home Assistant at {}", self.url))?;
-        stream.set_read_timeout(Some(WAIT)).map_err(|e| e.to_string())?;
+        stream.set_read_timeout(Some(LISTING)).map_err(|e| e.to_string())?;
         let scheme = if self.secure() { "wss" } else { "ws" };
         let ws_url = format!("{scheme}://{address}/api/websocket");
         let (mut ws, _) = tungstenite::client_tls(ws_url.as_str(), stream).map_err(|e| e.to_string())?;
@@ -628,6 +642,19 @@ mod tests {
         assert_eq!(units, ["light.desk", "switch.kettle"]);
         assert_eq!(listing.found[0].checked, Some((State::Ready, "on".into())));
         assert_eq!(listing.found[1].checked.as_ref().map(|c| &c.0), Some(&State::Offline));
+    }
+
+    /// Slow: answers after the five seconds a driving call gets.
+    #[test]
+    #[ignore = "takes six seconds"]
+    fn a_slow_listing_is_waited_for() {
+        let fake = fake::Fake::start("t", Some(json!([])), |_, path, _| {
+            std::thread::sleep(Duration::from_secs(6));
+            (200, if path == "/api/states" { states().to_string() } else { "{}".into() })
+        });
+        let hub = hub_at(&fake, "t");
+        assert_eq!(hub.entities().map(|l| l.found.len()), Ok(4), "a listing gets its own budget");
+        assert_eq!(hub.state("light.desk").unwrap_err(), "Home Assistant took too long to answer");
     }
 
     #[test]
