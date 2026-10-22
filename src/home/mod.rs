@@ -21,8 +21,10 @@ pub mod lend;
 mod discover;
 pub mod driver;
 pub mod ha;
+mod ipp;
 mod light;
 mod ollama;
+mod printer;
 mod switch;
 mod tv;
 pub mod webos;
@@ -1149,6 +1151,29 @@ mod tests {
 
     fn light(name: &str, ip: [u8; 4], module: &str) -> Device {
         Device::new("wiz", name.into(), ip.into(), Some(format!("mac-{name}")), json!({"module": module}))
+    }
+
+    #[test]
+    fn home_reads_a_printer_for_whoever_asks() {
+        let (port, _) = ipp::fake::printer(ipp::fake::inkjet);
+        let printer = Device::new("ipp", "Office printer".into(), Ipv4Addr::LOCALHOST, Some("abcd-1234".into()), json!({"port": port, "path": "ipp/print"}));
+        let mut home = home_with(vec![printer, light("Desk", [10, 0, 0, 2], "ESP01_SHRGB_03")]);
+        let tools = home.tools().to_string();
+        assert!(tools.contains("printer_status") && !tools.contains("switch_set"));
+        assert!(home.system_prompt().contains("- printer \"Office printer\""));
+        assert_eq!(
+            home.run_tool("printer_status", &json!({"printer": "office"})).unwrap(),
+            "Office printer is printing · black 60%, cyan 8% (low) · out of paper, ink low"
+        );
+        assert_eq!(home.run_tool("printer_status", &json!({"printer": "garage"})).unwrap_err(), "there's no printer called garage");
+    }
+
+    #[test]
+    fn every_category_icon_takes_two_columns() {
+        use unicode_width::UnicodeWidthStr;
+        for c in [Category::Light, Category::Tv, Category::Switch, Category::Printer] {
+            assert_eq!(c.icon().width(), 2, "{c:?}");
+        }
     }
 
     #[test]

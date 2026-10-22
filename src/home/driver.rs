@@ -4,7 +4,8 @@
 //! of tools for every light, whoever made it, so a small model isn't handed
 //! a tool per brand. A [`Backend`] (Wiz, LG webOS) is how one brand is
 //! found, paired and driven, and it implements its category's trait
-//! ([`LightDriver`], [`TvDriver`], [`SwitchDriver`]) to take part in that category's tools.
+//! ([`LightDriver`], [`TvDriver`], [`SwitchDriver`], [`PrinterDriver`]) to take part in that
+//! category's tools.
 //!
 //! A new brand of light or TV is one file implementing [`Backend`] and the
 //! category trait, plus a line in [`BACKENDS`]. A new category is a module
@@ -16,12 +17,13 @@ use std::net::Ipv4Addr;
 use serde_json::Value;
 
 use super::light::LightDriver;
+use super::printer::PrinterDriver;
 use super::switch::SwitchDriver;
 use super::tv::TvDriver;
-use super::{ha, webos, wiz, Device, State};
+use super::{ha, ipp, webos, wiz, Device, State};
 
 /// Every backend home knows, in the order an address is probed.
-pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs, &ha::HaLight, &ha::HaTv, &ha::HaSwitch];
+pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs, &ipp::Ipp, &ha::HaLight, &ha::HaTv, &ha::HaSwitch];
 
 /// The most devices home talks to at once when it has many to reach: a
 /// home can have a hundred lights, and each is a thread and a connection.
@@ -42,6 +44,7 @@ pub enum Category {
     Light,
     Tv,
     Switch,
+    Printer,
 }
 
 impl Category {
@@ -51,6 +54,7 @@ impl Category {
             Category::Light => "Light",
             Category::Tv => "TV",
             Category::Switch => "Switch",
+            Category::Printer => "Printer",
         }
     }
 
@@ -60,6 +64,7 @@ impl Category {
             Category::Light => "light",
             Category::Tv => "TV",
             Category::Switch => "switch",
+            Category::Printer => "printer",
         }
     }
 
@@ -68,6 +73,7 @@ impl Category {
             Category::Light => "💡",
             Category::Tv => "📺",
             Category::Switch => "🔌",
+            Category::Printer => "🖨️",
         }
     }
 
@@ -77,6 +83,7 @@ impl Category {
             Category::Light => format!("dim the {name}"),
             Category::Tv => format!("put netflix on the {name}"),
             Category::Switch => format!("turn on the {name}"),
+            Category::Printer => format!("is the {name} out of ink?"),
         }
     }
 }
@@ -167,6 +174,9 @@ pub trait Backend: Sync {
         None
     }
     fn as_switch(&self) -> Option<&dyn SwitchDriver> {
+        None
+    }
+    fn as_printer(&self) -> Option<&dyn PrinterDriver> {
         None
     }
 }

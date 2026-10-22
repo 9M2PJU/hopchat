@@ -29,7 +29,7 @@ fn said_scenes(scenes: &[String]) -> String {
 
 impl Home {
     pub(super) fn ask(&mut self, group: &str, from: &str, text: &str) -> String {
-        if self.lights().is_empty() && self.tvs().is_empty() && self.switches().is_empty() {
+        if self.lights().is_empty() && self.tvs().is_empty() && self.switches().is_empty() && self.printers().is_empty() {
             return "no devices are set up yet; whoever hosts home can add them with /devices.".into();
         }
         let mind = self.mind(group, Ollama::new(self.config.ollama.clone(), self.config.model.clone()));
@@ -84,11 +84,13 @@ impl Home {
         let lights = self.lights();
         let tvs = self.tvs();
         let switches = self.switches();
+        let printers = self.printers();
         let devices: Vec<String> = lights
             .iter()
             .map(|(_, d)| d)
             .chain(tvs.iter().map(|(_, d)| d))
             .chain(switches.iter().map(|(_, d)| d))
+            .chain(printers.iter().map(|(_, d)| d))
             .filter_map(|d| {
                 let backend = backend_of(d)?;
                 Some(format!("- {} \"{}\" ({})", backend.category().word(), d.name, backend.about(d)))
@@ -120,6 +122,7 @@ impl Home {
         let mut tools = self.light_tools();
         tools.extend(self.tv_tools());
         tools.extend(self.switch_tools());
+        tools.extend(self.printer_tools());
         Value::Array(tools)
     }
 
@@ -128,6 +131,7 @@ impl Home {
         self.run_light(name, args)
             .or_else(|| self.run_tv(name, args))
             .or_else(|| self.run_switch(name, args))
+            .or_else(|| self.run_printer(name, args))
             .unwrap_or_else(|| Err(format!("there's no tool called {name}")))
     }
 }

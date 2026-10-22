@@ -54,7 +54,7 @@ It's also a remote control for the room you're in. Mention `@home` to dim the li
 - **Offline delivery.** Messages written while a peer is away are delivered when they come back. History survives restarts.
 
 **Smart home and AI**
-- **`@home`.** Plain English becomes actions on Wiz lights and LG webOS TVs, through a local [Ollama](https://ollama.com) model.
+- **`@home`.** Plain English becomes actions on Wiz lights and LG webOS TVs, and answers about network printers and copiers, through a local [Ollama](https://ollama.com) model.
 - **`@ai`.** Ask a local model anything in any conversation. Follow-up questions work.
 - **Shared models.** Only one person in a group needs a model. Everyone else borrows it over the encrypted session.
 - **Device panel.** Discover, pair, name and test devices without editing any config.
@@ -194,9 +194,10 @@ A local model turns the request into device actions, and home replies in the con
 **Setup on the machine that owns the devices:**
 
 1. Start Ollama with a tool-calling model (`qwen2.5:7b` by default; `/home model NAME` picks another). You can skip this if someone in the group shares a model (see [Shared models](#shared-models)).
-2. Press **Ctrl-D** (or type `/devices`). hopchat scans the network for Wiz lights and LG TVs.
+2. Press **Ctrl-D** (or type `/devices`). hopchat scans the network for Wiz lights, LG TVs, and printers.
    - **Light:** Enter adds it, `t` blinks it so you can tell which one it is, and `n` names it ("Desk lamp").
    - **TV:** Enter pairs it. Choose *Allow* on the TV with the remote. For "turn the TV on" to work, enable *Turn on via Wi-Fi* (or *Mobile TV On*) in the TV's settings. A TV only shows up while it's on.
+   - **Printer or copier:** Enter adds it, `t` makes it beep or flash if it supports that, and `n` names it. Home can then say whether it is printing, how much ink or toner is left, and whether it is jammed or out of paper. It never prints anything.
    - The panel also shows whether the model is ready, and the exact command to run if it isn't.
 3. To let others in a group or the lobby use your devices, press `g` in the panel or type `/home on` there. `/home off` revokes it.
 
@@ -212,6 +213,7 @@ The token is kept in `home.json` in hopchat's settings directory, readable only 
 | --- | --- |
 | Wiz bulbs | local UDP, port 38899 |
 | LG webOS TVs | WebSocket API on port 3001 over TLS (3000 on older sets) |
+| Printers and copiers | IPP on port 631, found over Bonjour (`_ipp._tcp`) |
 | Home Assistant lights, TVs and switches | HA's REST API, port 8123 by default |
 
 Devices are tracked by MAC address, so a new IP from the router doesn't lose them. Each light's capabilities come from its module name: a white-tones bulb is never asked for a colour, and home says so.
@@ -353,7 +355,7 @@ The SDK does no I/O itself, so hopchat supplies the platform bridge for its peer
 | Me | `src/me.rs` | A local-only conversation. Messages go straight back to the UI and to home, never onto the wire. |
 | History | `src/history.rs` | Encrypted per-conversation history. |
 | Tasks | `src/tasks.rs` | Todos and reminders: reading times from plain English, repeats, and what is due. They fire from the UI loop into Me. |
-| Home | `src/home/` | Device discovery and drivers (`wiz.rs`, `webos.rs`), the Ollama client, the `@home` tool-calling loop (`assistant.rs`), `@ai` (`ai.rs`), and model lending (`lend.rs`). |
+| Home | `src/home/` | Device discovery and drivers (`wiz.rs`, `webos.rs`, `ipp.rs`), the Ollama client, the `@home` tool-calling loop (`assistant.rs`), `@ai` (`ai.rs`), and model lending (`lend.rs`). |
 | UI | `src/ui/` | ratatui rendering, the composer, the file browser, and the group and device panels. |
 
 ## Security
