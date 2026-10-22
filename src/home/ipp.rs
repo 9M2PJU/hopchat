@@ -252,6 +252,9 @@ fn agent() -> &'static ureq::Agent {
         ureq::Agent::config_builder()
             .timeout_connect(Some(WAIT))
             .timeout_global(Some(WAIT))
+            // A printer has no reason to send home elsewhere, and following
+            // would let anything on the LAN point it at any URL.
+            .max_redirects(0)
             .build()
             .new_agent()
     })
@@ -724,6 +727,39 @@ mod tests {
         let (port, asked) = speaking(|_, _| answer(VERSION_NOT_SUPPORTED, &[]));
         assert!(printer_err(port).contains("refused"), "one that wants neither is refused, not asked forever");
         assert_eq!(asked.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_redirect_is_not_followed() {
+        // Where the redirect points: anything connecting at all is a failure.
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let elsewhere = target.local_addr().unwrap().port();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let Ok((stream, _)) = listener.accept() else { return };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.eq_ignore_ascii_case("content-length")
+                {
+                    length = v.trim().parse().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            // 303 is the one a client follows as a GET, body or not.
+            let moved = format!("HTTP/1.1 303 See Other\r\nLocation: http://127.0.0.1:{elsewhere}/x\r\nContent-Length: 0\r\n\r\n");
+            (&stream).write_all(moved.as_bytes()).unwrap();
+        });
+        assert!(Ipp.status(&device(port)).is_err());
+        target.set_nonblocking(true).unwrap();
+        assert!(target.accept().is_err(), "home never went where the redirect pointed");
     }
 
     /// Lists the printers on this network and what each says: run with
