@@ -101,9 +101,10 @@ pub struct Device {
     ///
     /// Only [`Home::reach`] sets it: a device taken straight from
     /// `config.devices` has none, and its backend answers that home isn't
-    /// connected. Hand every device to a backend through `reach`.
+    /// connected. Hand every device to a backend through `reach`. Private
+    /// to home and its backends, so nothing outside can set it either.
     #[serde(skip)]
-    pub hub: Option<ha::Hub>,
+    hub: Option<ha::Hub>,
 }
 
 impl Device {
