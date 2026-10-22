@@ -204,6 +204,8 @@ If a device is on another subnet, add it with `/home add 192.168.1.40`. `/home s
 
 **Home Assistant.** If you run Home Assistant, hopchat can drive anything it has an integration for. Make a long-lived access token under your HA profile (Security tab), then type `/home ha http://IP:8123 TOKEN`. `/home ha find` looks for an HA announcing itself over mDNS and tells you its address; the token is only ever sent to an address you typed, since anything on the LAN can announce itself as HA. Its devices show up in `/devices` under their HA names, to add like any other. Hidden, disabled and settings entities are left out, as are Wiz and LG TVs, which hopchat drives directly. `https://` works too, with a certificate this machine trusts. An HA integration may itself go through the cloud. hopchat talks to one Home Assistant at a time: connecting again with a new token or address updates every HA device. `/home ha forget` disconnects HA and removes its devices.
 
+The token is kept in `home.json` in hopchat's settings directory, readable only by you on macOS and Linux and in plain text elsewhere; anyone who can read that file can drive your Home Assistant, so revoke the token in HA if the file leaks. Once HA devices are added, don't go back to a hopchat from before this feature: it drops their entity ids when it saves, and they can't be driven afterwards.
+
 **Supported devices**
 
 | Device | Protocol |
