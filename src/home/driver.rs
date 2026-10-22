@@ -23,6 +23,10 @@ use super::{ha, webos, wiz, Device, State};
 /// Every backend home knows, in the order an address is probed.
 pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs, &ha::HaLight, &ha::HaTv, &ha::HaSwitch];
 
+/// The most devices home talks to at once when it has many to reach: a
+/// home can have a hundred lights, and each is a thread and a connection.
+pub const MAX_PARALLEL: usize = 16;
+
 /// The backend a device was added with; `None` for one written by a newer
 /// hopchat that knows a backend this one doesn't.
 pub fn backend_of(d: &Device) -> Option<&'static dyn Backend> {

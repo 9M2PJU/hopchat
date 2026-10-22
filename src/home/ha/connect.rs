@@ -8,7 +8,7 @@ use std::thread;
 
 use serde_json::Value;
 
-use crate::home::driver::{backend_of, Found};
+use crate::home::driver::{backend_of, Found, MAX_PARALLEL};
 use crate::home::{ha, Device, Home, Request, State};
 
 /// The address and token typed after `/home ha`: `[URL] TOKEN`, in that
@@ -208,9 +208,9 @@ impl Home {
 
 /// Lists a hub's entities, each with its state, for a scan. An added
 /// device the listing leaves out is checked on its own, so none stays
-/// "checking"; those checks run side by side, like any other device's.
-/// A hub that can't be listed can't drive anything either, so its
-/// devices are all offline at once rather than after a wait each.
+/// "checking"; those checks run side by side, a few at a time. A hub
+/// that can't be listed can't drive anything either, so its devices are
+/// all offline at once rather than after a wait each.
 pub(in crate::home) fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<Request>) {
     let listing = match hub.entities() {
         Ok(listing) => listing,
@@ -225,19 +225,22 @@ pub(in crate::home) fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<R
     // Sent whole: a listing the registry couldn't filter says so, as
     // `/home ha` does, rather than offering hidden entities unannounced.
     let _ = me.send(Request::Listed(listing));
-    let checks: Vec<_> = added
-        .into_iter()
-        .filter(|d| !d.unit.as_ref().is_some_and(|u| listed.contains(u)))
-        .filter_map(|d| {
-            let backend = backend_of(&d)?;
-            let me = me.clone();
-            Some(thread::spawn(move || {
-                let (state, detail) = backend.check(&d);
-                let _ = me.send(Request::Checked { id: d.id(), state, detail });
-            }))
-        })
-        .collect();
-    for check in checks {
-        let _ = check.join();
-    }
+    let unlisted: Vec<Device> = added.into_iter().filter(|d| !d.unit.as_ref().is_some_and(|u| listed.contains(u))).collect();
+    thread::scope(|s| {
+        for batch in unlisted.chunks(MAX_PARALLEL) {
+            let checks: Vec<_> = batch
+                .iter()
+                .filter_map(|d| {
+                    let backend = backend_of(d)?;
+                    Some(s.spawn(move || {
+                        let (state, detail) = backend.check(d);
+                        let _ = me.send(Request::Checked { id: d.id(), state, detail });
+                    }))
+                })
+                .collect();
+            for check in checks {
+                let _ = check.join();
+            }
+        }
+    });
 }

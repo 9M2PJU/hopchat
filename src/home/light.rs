@@ -4,7 +4,7 @@
 use serde_json::{json, Value};
 
 use super::assistant::{colour, flag, number, text, tool};
-use super::driver::backend_of;
+use super::driver::{backend_of, MAX_PARALLEL};
 use super::{Device, Home};
 
 /// What a light should change to; anything left `None` stays as it is.
@@ -193,10 +193,10 @@ impl Home {
     }
 }
 
-/// `f` on every light at once, its answers in the lights' order. Each
-/// light can take a few seconds to answer, or to time out when its hub is
-/// down, so "all" takes as long as the slowest light, not their sum: home
-/// answers nothing else meanwhile.
+/// `f` on every light, [`MAX_PARALLEL`] at a time, its answers in the
+/// lights' order. Each light can take a few seconds to answer, or to time
+/// out when its hub is down, so "all" takes as long as the slowest light
+/// in each batch, not their sum: home answers nothing else meanwhile.
 fn each_light<F>(lights: &[Light], f: F) -> Vec<String>
 where
     F: Fn(&dyn LightDriver, &Device) -> String + Sync,
@@ -206,11 +206,16 @@ where
     }
     std::thread::scope(|s| {
         let f = &f;
-        let running: Vec<_> = lights.iter().map(|(l, d)| s.spawn(move || f(*l, d))).collect();
-        running
-            .into_iter()
-            .zip(lights)
-            .map(|(r, (_, d))| r.join().unwrap_or_else(|_| format!("{}: something went wrong", d.name)))
+        lights
+            .chunks(MAX_PARALLEL)
+            .flat_map(|batch| {
+                let running: Vec<_> = batch.iter().map(|(l, d)| s.spawn(move || f(*l, d))).collect();
+                running
+                    .into_iter()
+                    .zip(batch)
+                    .map(|(r, (_, d))| r.join().unwrap_or_else(|_| format!("{}: something went wrong", d.name)))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     })
 }
