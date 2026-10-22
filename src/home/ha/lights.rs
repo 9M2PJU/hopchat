@@ -165,7 +165,35 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::super::describe;
+    use super::super::fake::Fake;
     use super::*;
+
+    /// What a test of a light that is `now` sends HA, in order.
+    fn tested(now: &str, data: Value) -> (String, Vec<String>) {
+        let state = json!({"entity_id": "light.lamp", "state": now, "attributes": {}}).to_string();
+        let fake = Fake::start("t", None, move |method, _, _| (200, if method == "GET" { state.clone() } else { "[]".into() }));
+        let mut lamp = Device {
+            unit: Some("light.lamp".into()),
+            hub: Some(Hub { url: fake.url.clone(), token: "t".into() }),
+            ..Device::new("ha_light", "Lamp".into(), Ipv4Addr::LOCALHOST, None, data)
+        };
+        let said = HaLight.test(&mut lamp).unwrap();
+        (said, fake.asked())
+    }
+
+    #[test]
+    fn a_test_flashes_where_it_can_and_leaves_it_as_it_was() {
+        let (said, asked) = tested("on", json!({"flash": true}));
+        assert_eq!(said, "Lamp flashed");
+        assert_eq!(asked, ["GET /api/states/light.lamp", r#"POST /api/services/light/turn_on {"entity_id":"light.lamp","flash":"short"}"#]);
+        let (said, asked) = tested("off", json!({"flash": true}));
+        assert_eq!(said, "Lamp blinked", "an off light can't flash");
+        assert_eq!(asked, [
+            "GET /api/states/light.lamp",
+            r#"POST /api/services/light/turn_on {"entity_id":"light.lamp"}"#,
+            r#"POST /api/services/light/turn_off {"entity_id":"light.lamp"}"#,
+        ], "and ends off");
+    }
 
     #[test]
     fn an_on_off_light_says_it_only_switches() {
