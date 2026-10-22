@@ -188,10 +188,7 @@ impl Hub {
     /// is said in the group that asked, so it never names the hub's
     /// address on the LAN.
     fn answer(&self, sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value, String> {
-        let mut response = sent.map_err(|e| match e {
-            ureq::Error::Timeout(_) => "Home Assistant took too long to answer".to_string(),
-            e => format!("can't reach Home Assistant: {e}"),
-        })?;
+        let mut response = sent.map_err(unreached)?;
         let code = response.status().as_u16();
         let body = response
             .body_mut()
@@ -319,11 +316,35 @@ impl Hub {
             }
         };
         let _ = ws.close(None);
-        let entries = answer.get("result").and_then(Value::as_array).ok_or("Home Assistant sent no registry")?;
-        Ok(entries
-            .iter()
-            .filter_map(|e| Some((e.get("entity_id")?.as_str()?.to_string(), e.clone())))
-            .collect())
+        registry_of(answer)
+    }
+}
+
+/// The entries of a `config/entity_registry/list` answer, by entity id, or
+/// why HA didn't send them, in its own words when it gave any.
+fn registry_of(answer: Value) -> Result<HashMap<String, Value>, String> {
+    let Some(Value::Array(entries)) = answer.get("result").cloned() else {
+        return Err(match answer.pointer("/error/message").and_then(Value::as_str) {
+            Some(why) => format!("Home Assistant wouldn't list it: {why}"),
+            None => "Home Assistant sent no registry".into(),
+        });
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|e| Some((e.get("entity_id")?.as_str()?.to_string(), e)))
+        .collect())
+}
+
+/// Why a call never got an answer, in words that are safe to say in a
+/// group. Only the socket's own error is passed on, as in "Connection
+/// refused"; a TLS error can name the host its certificate was for, and
+/// the rest can quote the URL, so those are said in fixed words.
+fn unreached(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Timeout(_) => "Home Assistant took too long to answer".into(),
+        ureq::Error::Io(e) => format!("can't reach Home Assistant: {}", e.kind()),
+        ureq::Error::Tls(_) => "can't reach Home Assistant: its certificate isn't one this machine trusts".into(),
+        _ => "can't reach Home Assistant".into(),
     }
 }
 
@@ -656,6 +677,19 @@ mod tests {
         let down = Hub { url: "http://127.0.0.1:1".into(), token: "t".into() };
         let e = down.state("switch.kettle").unwrap_err();
         assert!(e.starts_with("can't reach Home Assistant") && !e.contains("127.0.0.1"), "{e}");
+        let tls = unreached(ureq::Error::Tls("certificate is not valid for ha.home.lan"));
+        assert_eq!(tls, "can't reach Home Assistant: its certificate isn't one this machine trusts");
+        let uri = unreached(ureq::Error::BadUri("http://ha.home.lan:8123/x".into()));
+        assert!(!uri.contains("ha.home.lan"), "{uri}");
+    }
+
+    #[test]
+    fn a_refused_registry_says_why() {
+        let refused = json!({"id": 1, "type": "result", "success": false, "error": {"code": "unauthorized", "message": "Unauthorized"}});
+        assert_eq!(registry_of(refused).unwrap_err(), "Home Assistant wouldn't list it: Unauthorized");
+        assert_eq!(registry_of(json!({"id": 1})).unwrap_err(), "Home Assistant sent no registry");
+        let listed = registry_of(json!({"result": [{"entity_id": "light.desk", "platform": "hue"}, {"platform": "x"}]})).unwrap();
+        assert_eq!(listed.keys().collect::<Vec<_>>(), ["light.desk"]);
     }
 
     fn states() -> Value {
