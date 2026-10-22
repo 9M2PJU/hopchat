@@ -400,17 +400,24 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
     let (domain, _) = entity.split_once('.')?;
     match domain {
         "light" => {
-            let modes: Vec<&str> = attrs
+            let modes: Option<Vec<&str>> = attrs
                 .get("supported_color_modes")
                 .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
-            let colour = modes.iter().any(|m| matches!(*m, "hs" | "rgb" | "rgbw" | "rgbww" | "xy"));
-            let white = modes.contains(&"color_temp");
-            // Every mode but "onoff" has a brightness.
-            let dims = modes.iter().any(|m| *m != "onoff");
+                .map(|modes| modes.iter().filter_map(Value::as_str).collect());
+            let (colour, white, dims) = match modes {
+                Some(modes) => {
+                    let colour = modes.iter().any(|m| matches!(*m, "hs" | "rgb" | "rgbw" | "rgbww" | "xy"));
+                    // HA turns a white temperature into a colour for a light
+                    // that has colours but no color_temp mode.
+                    let white = colour || modes.contains(&"color_temp");
+                    // Every mode but "onoff" has a brightness.
+                    (colour, white, modes.iter().any(|m| *m != "onoff"))
+                }
+                // Not said, as by a light that is unavailable while listed:
+                // let it try everything, and HA refuses what it can't do.
+                // The next listing says what it really has.
+                None => (true, true, true),
+            };
             // HA lists "off" among the effects, as the way to stop one.
             let effects: Vec<&str> = attrs
                 .get("effect_list")
@@ -550,6 +557,12 @@ mod tests {
         assert_eq!((data["name"].as_str(), data["colour"].as_bool(), data["white"].as_bool()), (Some("light.hall"), Some(false), Some(false)));
         assert_eq!((data["dims"].as_bool(), data["stops"].as_bool(), data["flash"].as_bool()), (Some(true), Some(false), Some(false)));
         assert!(describe("sensor.temperature", &state).is_none());
+        let rgb = json!({"state": "on", "attributes": {"supported_color_modes": ["rgb"]}});
+        let (_, data) = describe("light.bulb", &rgb).unwrap();
+        assert_eq!((data["colour"].as_bool(), data["white"].as_bool()), (Some(true), Some(true)), "HA makes white tones from colour");
+        let unknown = json!({"state": "unavailable", "attributes": {}});
+        let (_, data) = describe("light.away", &unknown).unwrap();
+        assert_eq!((data["colour"].as_bool(), data["white"].as_bool(), data["dims"].as_bool()), (Some(true), Some(true), Some(true)));
     }
 
     #[test]
