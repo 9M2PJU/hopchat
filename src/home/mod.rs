@@ -1459,6 +1459,25 @@ mod tests {
         assert_eq!(saved["devices"][0]["data"], json!({"name": "Kettle"}));
     }
 
+    #[test]
+    fn a_strip_with_a_hundred_effects_doesnt_fill_the_prompt() {
+        let effects: Vec<String> = (0..100).map(|n| format!("Effect {n}")).collect();
+        let strip = Device {
+            unit: Some("light.strip".into()),
+            ..Device::new("ha_light", "Strip".into(), [10, 0, 0, 4].into(), None,
+                          json!({"name": "Strip", "colour": true, "white": true, "effects": effects}))
+        };
+        let desk = light("Desk", [10, 0, 0, 5], "ESP01_SHRGB1C_31");
+        let wiz_first = driver::Backend::as_light(&wiz::Wiz).unwrap().scenes(&desk)[0].clone();
+        let mut home = home_with(vec![strip, desk]);
+        let prompt = home.system_prompt();
+        assert!(prompt.contains("Effect 0") && prompt.contains(&wiz_first), "every light gets a share");
+        assert!(!prompt.contains("Effect 99") && prompt.contains("more; use any scene name"), "{prompt}");
+        // Left out of the prompt, but still a scene the strip has.
+        let e = home.run_tool("light_set", &json!({"light": "strip", "scene": "effect 99"}));
+        assert!(!matches!(&e, Err(e) if e.contains("no scene called")), "{e:?}");
+    }
+
     /// `/home ha URL TOKEN` against a real Home Assistant, through to the
     /// tools the model calls. `HA_URL=… HA_TOKEN=… cargo test -- --ignored
     /// live`, with HA's `demo:` integration.

@@ -9,6 +9,23 @@ use super::Home;
 
 /// Model turns per request: act, maybe act again on what it saw, then say.
 const MAX_TURNS: usize = 4;
+/// The most scenes the model is told of by name. A strip can list a
+/// hundred effects, and every one would be in every request's prompt.
+const MAX_SCENES_SAID: usize = 40;
+
+/// The scenes as the system prompt names them: the first few, and how
+/// many more there are, any of which `light_set` still takes by name.
+fn said_scenes(scenes: &[String]) -> String {
+    match scenes.len() {
+        0 => String::new(),
+        n if n <= MAX_SCENES_SAID => format!(" Light scenes: {}.", scenes.join(", ")),
+        n => format!(
+            " Light scenes include: {}, and {} more; use any scene name they ask for.",
+            scenes[..MAX_SCENES_SAID].join(", "),
+            n - MAX_SCENES_SAID,
+        ),
+    }
+}
 
 impl Home {
     pub(super) fn ask(&mut self, group: &str, from: &str, text: &str) -> String {
@@ -94,7 +111,7 @@ impl Home {
             } else {
                 ""
             },
-            if scenes.is_empty() { String::new() } else { format!(" Light scenes: {}.", scenes.join(", ")) },
+            said_scenes(&scenes),
         )
     }
 

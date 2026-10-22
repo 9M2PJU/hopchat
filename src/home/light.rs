@@ -62,13 +62,17 @@ impl Home {
             .collect()
     }
 
-    /// Every scene some light here has.
+    /// Every scene some light here has, taking each light's first, then
+    /// each one's second, and so on, so a strip with a hundred effects
+    /// doesn't push every other light's scenes to the end.
     pub(super) fn scenes(&self) -> Vec<String> {
+        let each: Vec<Vec<String>> = self.lights().iter().map(|(driver, d)| driver.scenes(d)).collect();
+        let longest = each.iter().map(Vec::len).max().unwrap_or(0);
         let mut scenes: Vec<String> = Vec::new();
-        for (driver, d) in self.lights() {
-            for scene in driver.scenes(&d) {
-                if !scenes.contains(&scene) {
-                    scenes.push(scene);
+        for i in 0..longest {
+            for scene in each.iter().filter_map(|list| list.get(i)) {
+                if !scenes.contains(scene) {
+                    scenes.push(scene.clone());
                 }
             }
         }
