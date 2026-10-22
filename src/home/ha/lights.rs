@@ -60,7 +60,11 @@ impl Backend for HaLight {
         let (first, then) = if on { ("light.turn_off", "light.turn_on") } else { ("light.turn_on", "light.turn_off") };
         hub.call(first, entity, json!({}))?;
         thread::sleep(Duration::from_secs(1));
-        hub.call(then, entity, json!({}))?;
+        // Switching back is what leaves it as it was, so it gets a second
+        // go; switching on or off twice is harmless.
+        hub.call(then, entity, json!({})).or_else(|_| hub.call(then, entity, json!({}))).map_err(|e| {
+            format!("{e}; {} may be left {}", d.name, if on { "off" } else { "on" })
+        })?;
         Ok(format!("{} blinked", d.name))
     }
 
@@ -193,6 +197,25 @@ mod tests {
             r#"POST /api/services/light/turn_on {"entity_id":"light.lamp"}"#,
             r#"POST /api/services/light/turn_off {"entity_id":"light.lamp"}"#,
         ], "and ends off");
+    }
+
+    #[test]
+    fn a_test_that_cant_switch_back_says_how_it_left_the_light() {
+        let state = json!({"entity_id": "light.lamp", "state": "on", "attributes": {}}).to_string();
+        let fake = Fake::start("t", None, move |method, path, _| match (method, path) {
+            ("GET", _) => (200, state.clone()),
+            (_, "/api/services/light/turn_on") => (500, String::new()),
+            _ => (200, "[]".into()),
+        });
+        let mut lamp = Device {
+            unit: Some("light.lamp".into()),
+            hub: Some(Hub { url: fake.url.clone(), token: "t".into() }),
+            ..Device::new("ha_light", "Lamp".into(), Ipv4Addr::LOCALHOST, None, json!({}))
+        };
+        let e = HaLight.test(&mut lamp).unwrap_err();
+        assert!(e.ends_with("Lamp may be left off"), "{e}");
+        let ons = fake.asked().iter().filter(|a| a.contains("light/turn_on")).count();
+        assert_eq!(ons, 2, "switching back is tried twice");
     }
 
     #[test]
