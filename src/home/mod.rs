@@ -1464,6 +1464,23 @@ mod tests {
     }
 
     #[test]
+    fn a_new_token_at_the_same_address_replaces_nothing() {
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, notes) = std::sync::mpsc::channel();
+        let (me, _) = std::sync::mpsc::channel();
+        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        home.config = Config::default();
+        let empty = || ha::Listing { found: Vec::new(), warning: None };
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "a"), "Home".into(), empty())));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "b"), "Home".into(), empty())));
+        let said: Vec<String> = notes.try_iter().filter_map(|u| match u { Update::Home(t) => Some(t), _ => None }).collect();
+        assert!(!said.iter().any(|t| t.contains("replaced")), "{said:?}");
+        home.ha_connected(Ok((hub("http://10.0.0.5:8123", "b"), "Home".into(), empty())));
+        let said: Vec<String> = notes.try_iter().filter_map(|u| match u { Update::Home(t) => Some(t), _ => None }).collect();
+        assert!(said.iter().any(|t| t.contains("http://10.0.0.4:8123 is replaced by the one at http://10.0.0.5:8123")), "{said:?}");
+    }
+
+    #[test]
     fn a_strip_with_a_hundred_effects_doesnt_fill_the_prompt() {
         let effects: Vec<String> = (0..100).map(|n| format!("Effect {n}")).collect();
         let strip = Device {
