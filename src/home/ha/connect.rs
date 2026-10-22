@@ -111,11 +111,14 @@ impl Home {
         // address reaches them all. Home has one hub: another address is
         // this one moved, or a replacement for it.
         let url = hub.url.clone();
-        let moved = self.config.ha.replace(hub).map(|h| h.url).filter(|old| *old != url);
+        let before = self.config.ha.replace(hub);
+        let same = before.as_ref() == self.config.ha.as_ref();
+        let moved = before.map(|h| h.url).filter(|old| *old != url);
         if let Some(old) = &moved {
             self.note(format!("home: Home Assistant at {old} is replaced by the one at {url}"));
         }
-        let gone = self.keep_what_the_hub_vouches_for(&found, moved.is_some());
+        let gone = self.keep_what_the_hub_vouches_for(&found, moved.is_some(), same);
+        self.drop_unlisted_offers(&ha::listed(&found));
         if !gone.is_empty() {
             let one = gone.len() == 1;
             self.note(format!(
@@ -145,15 +148,18 @@ impl Home {
     /// `light.kitchen` may be a different light, and the device people
     /// call "Kitchen" mustn't silently drive it.
     ///
-    /// When the hub `moved` to another address, a device stays only where
-    /// the new one lists its entity id under the same HA name. At the same
-    /// address, one the listing leaves out stays (it may be hidden in HA
-    /// since), and only one listed under another name goes: another Home
-    /// Assistant answers there now, or the entity was renamed, and either
-    /// way it is added again knowingly. A device whose HA name was never
-    /// kept can't be told apart that way, so it stays wherever its entity
-    /// id is listed. Saving is left to the caller.
-    fn keep_what_the_hub_vouches_for(&mut self, listed: &[Found], moved: bool) -> Vec<String> {
+    /// The `same` hub as before, address and token alike, is the one a
+    /// scan has been listing all along, and a changed name is a rename in
+    /// HA, kept up with as a scan would. Otherwise: when the hub `moved`
+    /// to another address, a device stays only where the new one lists
+    /// its entity id under the same HA name. At the same address with a
+    /// new token, one the listing leaves out stays (it may be hidden in
+    /// HA since), and only one listed under another name goes: another
+    /// Home Assistant answers there now, or the entity was renamed, and
+    /// either way it is added again knowingly. A device whose HA name was
+    /// never kept can't be told apart that way, so it stays wherever its
+    /// entity id is listed. Saving is left to the caller.
+    fn keep_what_the_hub_vouches_for(&mut self, listed: &[Found], moved: bool, same: bool) -> Vec<String> {
         let names: HashMap<&str, Option<&str>> = listed
             .iter()
             .filter_map(|f| Some((f.unit.as_deref()?, f.data.get("name").and_then(Value::as_str))))
@@ -164,6 +170,7 @@ impl Home {
             }
             match d.unit.as_deref().and_then(|u| names.get(u)) {
                 None => !moved,
+                Some(_) if same => true,
                 Some(listed) => match d.data.get("name").and_then(Value::as_str) {
                     None => true,
                     Some(named) => *listed == Some(named),
@@ -210,13 +217,16 @@ impl Home {
 /// device the listing leaves out is checked on its own, so none stays
 /// "checking"; those checks run side by side, a few at a time. A hub
 /// that can't be listed can't drive anything either, so its devices are
-/// all offline at once rather than after a wait each.
+/// all offline at once rather than after a wait each. Everything sent
+/// names the hub, so home can tell a scan that outlived it from a
+/// current one.
 pub(in crate::home) fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<Request>) {
+    let checked = |id: String, state: State, detail: String| Request::HubChecked { hub: hub.clone(), id, state, detail };
     let listing = match hub.entities() {
         Ok(listing) => listing,
         Err(e) => {
             for d in added {
-                let _ = me.send(Request::Checked { id: d.id(), state: State::Offline, detail: e.clone() });
+                let _ = me.send(checked(d.id(), State::Offline, e.clone()));
             }
             return;
         }
@@ -224,7 +234,7 @@ pub(in crate::home) fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<R
     let listed = ha::listed(&listing.found);
     // Sent whole: a listing the registry couldn't filter says so, as
     // `/home ha` does, rather than offering hidden entities unannounced.
-    let _ = me.send(Request::Listed(listing));
+    let _ = me.send(Request::Listed { hub: hub.clone(), listing });
     let unlisted: Vec<Device> = added.into_iter().filter(|d| !d.unit.as_ref().is_some_and(|u| listed.contains(u))).collect();
     thread::scope(|s| {
         for batch in unlisted.chunks(MAX_PARALLEL) {
@@ -232,9 +242,10 @@ pub(in crate::home) fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<R
                 .iter()
                 .filter_map(|d| {
                     let backend = backend_of(d)?;
+                    let checked = &checked;
                     Some(s.spawn(move || {
                         let (state, detail) = backend.check(d);
-                        let _ = me.send(Request::Checked { id: d.id(), state, detail });
+                        let _ = me.send(checked(d.id(), state, detail));
                     }))
                 })
                 .collect();

@@ -28,7 +28,7 @@ mod tv;
 pub mod webos;
 pub mod wiz;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -351,10 +351,15 @@ pub enum Request {
     SetGroup { group: String, on: bool },
     // Results from home's own worker threads.
     Found(driver::Found),
-    /// Everything a hub listed, at once, and what to warn of about it.
-    Listed(ha::Listing),
+    /// Everything `hub` listed, at once, and what to warn of about it.
+    /// Taken only while `hub` is still home's: a scan outlives `/home ha
+    /// forget` or a move, and the old hub's word mustn't stand for the new.
+    Listed { hub: ha::Hub, listing: ha::Listing },
     ScanDone,
     Checked { id: String, state: State, detail: String },
+    /// What `hub` says one of its devices is doing; taken on the same
+    /// terms as [`Request::Listed`].
+    HubChecked { hub: ha::Hub, id: String, state: State, detail: String },
     /// `/home ha` reached a Home Assistant: the hub and what it has, or
     /// why not.
     HaConnected { attempt: u64, result: Result<(ha::Hub, String, ha::Listing), String> },
@@ -601,11 +606,18 @@ impl Home {
                 self.note(reply);
             }
             Request::Found(found) => self.on_found(found),
-            Request::Listed(ha::Listing { found, warning }) => {
-                if let Some(warning) = warning {
-                    self.note(format!("home: {warning}"));
+            Request::Listed { hub, listing } => {
+                if self.config.ha.as_ref() == Some(&hub) {
+                    if let Some(warning) = listing.warning {
+                        self.note(format!("home: {warning}"));
+                    }
+                    self.on_listed(listing.found);
                 }
-                self.on_listed(found);
+            }
+            Request::HubChecked { hub, id, state, detail } => {
+                if self.config.ha.as_ref() == Some(&hub) {
+                    self.checked(id, state, detail);
+                }
             }
             Request::HaConnected { attempt, result } => self.on_ha_connected(attempt, result),
             Request::ScanDone => self.scanning = false,
@@ -688,8 +700,22 @@ impl Home {
 
     /// Everything a hub listed, saved once rather than once per entity.
     fn on_listed(&mut self, found: Vec<driver::Found>) {
+        let listed = ha::listed(&found);
         if self.learn_all(found) {
             self.save();
+        }
+        self.drop_unlisted_offers(&listed);
+    }
+
+    /// Drops the hub's entities that were offered, never added, and that
+    /// `listed` doesn't have: hidden or gone in Home Assistant since. An
+    /// added one stays, and is checked on its own.
+    pub(super) fn drop_unlisted_offers(&mut self, listed: &HashSet<String>) {
+        let unlisted = |d: &Device| ha::drives(d) && !d.unit.as_ref().is_some_and(|u| listed.contains(u));
+        let gone: Vec<String> = self.found.iter().filter(|d| unlisted(d)).map(Device::id).collect();
+        self.found.retain(|d| !unlisted(d));
+        for id in gone {
+            self.live.remove(&id);
         }
     }
 
@@ -1619,8 +1645,9 @@ mod tests {
         let (me, requests) = std::sync::mpsc::channel();
         list_hub(&hub(&fake.url, "t"), Vec::new(), &me);
         drop(me);
-        let listed = requests.into_iter().find(|r| matches!(r, Request::Listed(_))).expect("a listing");
+        let listed = requests.into_iter().find(|r| matches!(r, Request::Listed { .. })).expect("a listing");
         let (mut home, notes, _) = noted_home();
+        home.config.ha = Some(hub(&fake.url, "t"));
         home.handle(listed);
         let said = said(&notes);
         assert!(said.iter().any(|t| t.contains("entity registry")), "{said:?}");
@@ -1832,10 +1859,65 @@ mod tests {
         requests
             .into_iter()
             .filter_map(|r| match r {
-                Request::Checked { id, state, .. } => Some((id, state)),
+                Request::HubChecked { hub: by, id, state, .. } if by == *hub => Some((id, state)),
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_scan_that_outlived_its_hub_is_not_believed() {
+        let mut home = home_with(Vec::new());
+        let old = hub("http://10.0.0.4:8123", "a");
+        let kettle = || entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((old.clone(), "Home".into(), listing(kettle()))));
+        home.add("switch.kettle");
+        // Forgotten while a scan was still listing: the listing arrives late.
+        home.forget_ha();
+        home.handle(Request::Listed { hub: old.clone(), listing: listing(kettle()) });
+        home.handle(Request::HubChecked { hub: old.clone(), id: "switch.kettle".into(), state: State::Ready, detail: "on".into() });
+        assert!(home.found.is_empty() && home.config.devices.is_empty() && home.live.is_empty(), "nothing comes back from the dead");
+        // Replaced by another hub while scanning: the old one's entities aren't offered against the new.
+        let new = hub("http://10.0.0.9:8123", "b");
+        home.ha_connected(Ok((new.clone(), "Home".into(), listing(entity("ha_switch", "switch.fan", json!({"name": "Fan"}))))));
+        home.add("switch.fan");
+        home.handle(Request::Listed { hub: old.clone(), listing: listing(kettle()) });
+        home.handle(Request::HubChecked { hub: old, id: "switch.fan".into(), state: State::Offline, detail: "down".into() });
+        assert!(home.found.is_empty(), "the old hub's kettle isn't offered");
+        assert_ne!(home.live["switch.fan"].0, State::Offline, "the old hub doesn't speak for the new one's fan");
+        home.handle(Request::Listed { hub: new.clone(), listing: listing(entity("ha_switch", "switch.fan", json!({"name": "Fan"}))) });
+        home.handle(Request::HubChecked { hub: new, id: "switch.fan".into(), state: State::Offline, detail: "down".into() });
+        assert_eq!(home.live["switch.fan"].0, State::Offline, "the current hub does");
+    }
+
+    #[test]
+    fn the_same_hub_renaming_an_entity_is_a_rename() {
+        let mut home = home_with(Vec::new());
+        let at = hub("http://10.0.0.4:8123", "a");
+        let light = |name: &str| entity("ha_light", "light.kitchen", json!({"name": name, "colour": true, "white": true}));
+        home.ha_connected(Ok((at.clone(), "Home".into(), listing(light("Kitchen")))));
+        home.add("light.kitchen");
+        // Connected again to the same hub, same token: renamed in HA since.
+        home.ha_connected(Ok((at, "Home".into(), listing(light("Kitchen ceiling")))));
+        assert_eq!(home.config.devices.len(), 1, "kept: the hub that answers to this token is the one that listed it");
+        assert_eq!(home.config.devices[0].data["name"], "Kitchen ceiling", "and kept up with, as a scan would");
+        assert!(home.found.is_empty());
+    }
+
+    #[test]
+    fn an_offer_the_hub_stops_listing_goes() {
+        let mut home = home_with(Vec::new());
+        home.config.ha = Some(hub("http://10.0.0.4:8123", "a"));
+        let strip = entity("ha_light", "light.strip", json!({"name": "Strip", "colour": true, "white": true}));
+        let plug = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.on_listed(vec![strip, plug]);
+        home.add("switch.kettle");
+        // Hidden in HA since: the strip is withdrawn, the added kettle stays.
+        home.on_listed(vec![entity("ha_light", "light.desk", json!({"name": "Desk", "colour": false, "white": false}))]);
+        let offered: Vec<&str> = home.found.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(offered, ["Desk"]);
+        assert!(!home.live.contains_key("light.strip"));
+        assert_eq!(home.config.devices.len(), 1);
     }
 
     fn ha_device(backend: &str, unit: &str, hub: &ha::Hub) -> Device {
