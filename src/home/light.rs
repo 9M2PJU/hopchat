@@ -11,7 +11,8 @@ use super::{Device, Home};
 #[derive(Default, Debug, PartialEq)]
 pub struct Pilot {
     pub on: Option<bool>,
-    /// 10–100 %.
+    /// Percent, 0–100; each backend clamps it to what its lights take
+    /// (a Wiz bulb goes no lower than 10, HA no lower than 1).
     pub brightness: Option<u8>,
     /// 2200–6500 K.
     pub kelvin: Option<u16>,
