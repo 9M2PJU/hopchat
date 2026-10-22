@@ -359,6 +359,9 @@ pub enum Request {
     /// `/home ha` reached a Home Assistant: the hub and what it has, or
     /// why not.
     HaConnected(Result<(ha::Hub, String, ha::Listing), String>),
+    /// A test finished: the device with what it learned and what to say,
+    /// or why not; `before` is its data when the test began.
+    Tested { id: String, before: Value, result: Result<(Box<Device>, String), String> },
     /// A pairing finished: the device with what it learned, and its detail.
     Paired { id: String, result: Result<(Box<Device>, String), String> },
     ModelChecked(ModelState),
@@ -570,6 +573,7 @@ impl Home {
                 }
             }
             Request::Test(id) => self.test(&id),
+            Request::Tested { id, before, result } => self.on_tested(&id, before, result),
             Request::Rename(id, name) => {
                 let name = clean_name(&name);
                 if name.is_empty() {
@@ -831,19 +835,42 @@ impl Home {
         }
     }
 
+    /// Shows which device it is, on a worker thread: a blink takes a
+    /// second or more, and a hub that is down takes its whole timeout, and
+    /// home answers nothing else while it waits.
     fn test(&mut self, id: &str) {
-        let Some(d) = self.config.devices.iter().find(|d| d.id() == id).cloned() else {
+        let Some(d) = self.config.devices.iter().find(|d| d.id() == id).map(|d| self.reach(d)) else {
             return self.note("add it first, then test it".into());
         };
         let Some(backend) = backend_of(&d) else { return };
-        match self.drive(id, |d| backend.test(d)).unwrap_or_else(|| Err("it's gone".into())) {
-            Ok(text) => {
+        self.checked(id.to_string(), State::Checking, String::new());
+        let (me, id) = (self.me.clone(), id.to_string());
+        thread::spawn(move || {
+            let before = d.data.clone();
+            let mut d = d;
+            let result = backend.test(&mut d).map(|text| (Box::new(d), text));
+            let _ = me.send(Request::Tested { id, before, result });
+        });
+    }
+
+    /// A test finished: keeps what the backend learned doing it, unless
+    /// something else changed the device meanwhile.
+    fn on_tested(&mut self, id: &str, before: Value, result: Result<(Box<Device>, String), String>) {
+        let Some(at) = self.config.devices.iter().position(|d| d.id() == id) else { return };
+        match result {
+            Ok((tested, text)) => {
+                let d = &mut self.config.devices[at];
+                if tested.data != d.data && d.data == before {
+                    d.data = tested.data;
+                    self.save();
+                }
                 self.note(text);
-                self.check(d);
+                self.check(self.config.devices[at].clone());
             }
             Err(e) => {
-                self.live.insert(id.to_string(), (State::Failed(e.clone()), String::new()));
-                self.note(format!("{}: {e}", d.name));
+                let name = self.config.devices[at].name.clone();
+                self.checked(id.to_string(), State::Failed(e.clone()), String::new());
+                self.note(format!("{name}: {e}"));
             }
         }
     }
@@ -1628,6 +1655,24 @@ mod tests {
         home.ha_connected(Ok((second.clone(), "Home".into(), listing(plug("switch.fan")))));
         assert_eq!(home.config.ha, Some(second.clone()));
         assert_eq!(reached(&home, 0), Some(second), "every entity goes through the one hub");
+    }
+
+    #[test]
+    fn a_test_runs_off_home_and_reports_back() {
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, notes) = std::sync::mpsc::channel();
+        let (me, requests) = std::sync::mpsc::channel();
+        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        let plug = Device { unit: Some("switch.fridge".into()), ..Device::new("ha_switch", "Fridge".into(), [10, 0, 0, 4].into(), None, json!({})) };
+        home.config = Config { devices: vec![plug], ..Default::default() };
+        home.handle(Request::Test("switch.fridge".into()));
+        assert_eq!(home.live["switch.fridge"].0, State::Checking, "home answers at once, the test still running");
+        let tested = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(tested, Request::Tested { .. }));
+        home.handle(tested);
+        assert!(matches!(home.live["switch.fridge"].0, State::Failed(_)), "no hub to test it through");
+        let said: Vec<String> = notes.try_iter().filter_map(|u| match u { Update::Home(t) => Some(t), _ => None }).collect();
+        assert!(said.iter().any(|t| t.starts_with("Fridge: home isn't connected")), "{said:?}");
     }
 
     #[test]
