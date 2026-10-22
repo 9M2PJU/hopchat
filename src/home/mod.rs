@@ -611,12 +611,7 @@ impl Home {
             Request::Found(found) => self.on_found(found),
             Request::HaConnected(result) => self.ha_connected(result),
             Request::ScanDone => self.scanning = false,
-            Request::Checked { id, state, detail } => {
-                // A check finishing must not overwrite a pairing in progress.
-                if !matches!(self.live.get(&id), Some((State::Pairing { .. }, _))) {
-                    self.live.insert(id, (state, detail));
-                }
-            }
+            Request::Checked { id, state, detail } => self.checked(id, state, detail),
             Request::Paired { id, result } => self.on_paired(&id, result),
             Request::ModelChecked(state) => {
                 self.model_state = state;
@@ -666,6 +661,14 @@ impl Home {
             }
             let _ = me.send(Request::ScanDone);
         });
+    }
+
+    /// Keeps what a check found a device doing.
+    fn checked(&mut self, id: String, state: State, detail: String) {
+        // A check finishing must not overwrite a pairing in progress.
+        if !matches!(self.live.get(&id), Some((State::Pairing { .. }, _))) {
+            self.live.insert(id, (state, detail));
+        }
     }
 
     /// Looks at an added device in the background and reports its state.
@@ -729,7 +732,7 @@ impl Home {
                 self.note(moved);
             }
             match f.checked {
-                Some((state, detail)) => self.handle(Request::Checked { id: d.id(), state, detail }),
+                Some((state, detail)) => self.checked(d.id(), state, detail),
                 None => self.check(d),
             }
             return;
