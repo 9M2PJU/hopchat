@@ -1090,7 +1090,7 @@ mod tests {
     use super::assistant::{colour, flag, number, text};
     use super::ollama::{self, Ollama, Turn};
     use super::*;
-    use super::ha::connect::{found_only, ha_args, list_hub, looks_like_token};
+    use super::ha::connect::{answered, found_only, ha_args, list_hub, looks_like_token};
 
     /// A settings directory of this test's own, so what one test saves (a
     /// hub, with its token) is never what another test opens. It is
@@ -1792,6 +1792,13 @@ mod tests {
     fn a_lone_address_asks_for_the_token_and_connects_nowhere() {
         let mut home = home_with(Vec::new());
         assert!(home.configure(None, "ha http://10.0.0.4:8123").starts_with("give the token too"));
+    }
+
+    #[test]
+    fn an_attempt_that_panics_still_answers() {
+        let result: Result<(), String> = answered(|| panic!("the TLS stack fell over"));
+        assert!(result.unwrap_err().contains("went wrong"));
+        assert_eq!(answered(|| Ok::<_, String>(4)), Ok(4));
     }
 
     #[test]

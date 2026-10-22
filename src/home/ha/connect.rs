@@ -85,7 +85,8 @@ impl Home {
         let attempt = self.start_ha_attempt();
         let me = self.me.clone();
         thread::spawn(move || {
-            let _ = me.send(Request::HaConnected { attempt, result: Err(found_only(ha::find())) });
+            let result = answered(|| Err(found_only(ha::find())));
+            let _ = me.send(Request::HaConnected { attempt, result });
         });
     }
 
@@ -94,14 +95,14 @@ impl Home {
         let attempt = self.start_ha_attempt();
         let me = self.me.clone();
         thread::spawn(move || {
-            let result = (|| {
+            let result = answered(|| {
                 let hub = ha::Hub { url: ha::url(&typed)?, token };
                 // Said only to the person at this machine: where it tried.
                 let tried = |e: String| format!("{e}; tried {}", hub.url);
                 let home = hub.check().map_err(tried)?;
                 let found = hub.entities().map_err(tried)?;
                 Ok((hub, home, found))
-            })();
+            });
             let _ = me.send(Request::HaConnected { attempt, result });
         });
     }
@@ -231,6 +232,14 @@ impl Home {
             if gone.len() == 1 { "" } else { "s" },
         )
     }
+}
+
+/// What a `/home ha` attempt came back with, even if it panicked: home
+/// takes no other `/home ha` until the one on its way answers, so one
+/// that never did would leave it saying "already connecting" for good.
+pub(in crate::home) fn answered<T>(attempt: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt))
+        .unwrap_or_else(|_| Err("connecting to Home Assistant went wrong; try again".into()))
 }
 
 /// What `/home ha find`, or a token with no address, says: where a Home
