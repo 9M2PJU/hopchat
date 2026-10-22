@@ -1090,7 +1090,7 @@ mod tests {
     use super::assistant::{colour, flag, number, text};
     use super::ollama::{self, Ollama, Turn};
     use super::*;
-    use super::ha::connect::{ha_args, list_hub, looks_like_token};
+    use super::ha::connect::{found_only, ha_args, list_hub, looks_like_token};
 
     /// A settings directory of this test's own, so what one test saves (a
     /// hub, with its token) is never what another test opens.
@@ -1918,6 +1918,26 @@ mod tests {
         assert_eq!(offered, ["Desk"]);
         assert!(!home.live.contains_key("light.strip"));
         assert_eq!(home.config.devices.len(), 1);
+    }
+
+    #[test]
+    fn finding_home_assistant_never_sends_the_token() {
+        let (mut home, notes, requests) = noted_home();
+        let token = "eyJhbGciOi.eyJpc3Mi.sig";
+        // A token alone only looks; the only way to send it is with an address typed.
+        let reply = home.configure(None, &format!("ha {token}"));
+        assert!(reply.starts_with("looking for"), "{reply}");
+        let answered = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        let Request::HaConnected { result: Err(e), .. } = &answered else { panic!("a find answers with where HA is, or isn't") };
+        assert!(!e.contains(token) && e.contains("TOKEN"), "{e}");
+        home.handle(answered);
+        assert!(home.config.ha.is_none() && home.connecting_ha.is_none());
+        assert!(said(&notes).iter().any(|t| t.starts_with("home: ") && !t.contains(token)));
+        assert!(home.configure(None, "ha find").starts_with("looking for"));
+        let url = "http://10.0.0.4:8123";
+        let e = found_only(Some(url.into()));
+        assert!(e.contains(&format!("/home ha {url} TOKEN")), "{e}");
+        assert!(found_only(None).contains("/home ha http://IP:8123 TOKEN"));
     }
 
     fn ha_device(backend: &str, unit: &str, hub: &ha::Hub) -> Device {

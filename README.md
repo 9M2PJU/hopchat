@@ -202,7 +202,7 @@ A local model turns the request into device actions, and home replies in the con
 
 If a device is on another subnet, add it with `/home add 192.168.1.40`. `/home scan` searches again, and a bare `/home` shows the current status.
 
-**Home Assistant.** If you run Home Assistant, hopchat can drive anything it has an integration for. Make a long-lived access token under your HA profile (Security tab), then type `/home ha TOKEN` (or `/home ha http://IP:8123 TOKEN` if HA doesn't announce itself over mDNS). Its devices show up in `/devices` under their HA names, to add like any other. Hidden, disabled and settings entities are left out, as are Wiz and LG TVs, which hopchat drives directly. `https://` works too, with a certificate this machine trusts. An HA integration may itself go through the cloud. hopchat talks to one Home Assistant at a time: connecting again with a new token or address updates every HA device. `/home ha forget` disconnects HA and removes its devices.
+**Home Assistant.** If you run Home Assistant, hopchat can drive anything it has an integration for. Make a long-lived access token under your HA profile (Security tab), then type `/home ha http://IP:8123 TOKEN`. `/home ha find` looks for an HA announcing itself over mDNS and tells you its address; the token is only ever sent to an address you typed, since anything on the LAN can announce itself as HA. Its devices show up in `/devices` under their HA names, to add like any other. Hidden, disabled and settings entities are left out, as are Wiz and LG TVs, which hopchat drives directly. `https://` works too, with a certificate this machine trusts. An HA integration may itself go through the cloud. hopchat talks to one Home Assistant at a time: connecting again with a new token or address updates every HA device. `/home ha forget` disconnects HA and removes its devices.
 
 **Supported devices**
 
@@ -290,7 +290,8 @@ Without `--to`, `--say` and `--file` go to the first peer whose secure session c
 | `/home on\|off` | let everyone here use your devices, or stop |
 | `/home add IP` | add a device by address |
 | `/home scan` | scan for devices again |
-| `/home ha [URL] TOKEN` | connect Home Assistant and list its devices |
+| `/home ha URL TOKEN` | connect Home Assistant and list its devices |
+| `/home ha find` | look for a Home Assistant announcing itself, and say its address |
 | `/home ha forget` | disconnect Home Assistant and remove its devices |
 | `/home model NAME` | choose the Ollama model |
 | `/ai on\|off` | let everyone here ask your model, or stop |

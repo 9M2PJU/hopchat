@@ -16,7 +16,7 @@ use crate::home::{ha, Device, Home, Request, State};
 /// at, so a token is never tried as an address, shown back as one, or
 /// an address sent as the token.
 pub(in crate::home) fn ha_args(first: &str, second: Option<&str>) -> Result<(Option<String>, String), String> {
-    const USAGE: &str = "/home ha TOKEN, or /home ha URL TOKEN";
+    const USAGE: &str = "/home ha URL TOKEN (/home ha find looks for the address)";
     match second {
         None if !looks_like_token(first) && (looks_like_address(first) || first.contains('.')) => {
             Err(format!("give the token too: {USAGE}"))
@@ -50,39 +50,53 @@ impl Home {
         match value {
             None => match &self.config.ha {
                 Some(hub) => format!("home lists the devices of Home Assistant at {}; /home ha forget to stop", hub.url),
-                None => "connect Home Assistant with /home ha TOKEN, or /home ha URL TOKEN; \
+                None => "connect Home Assistant with /home ha URL TOKEN; /home ha find looks for its address; \
                          make the token under your HA profile, Security. /home ha forget disconnects it"
                     .into(),
             },
             Some("forget" | "off") => self.forget_ha(),
+            // Two at once would race to be the one hub; the later answer
+            // would quietly undo the earlier.
+            Some(_) if self.connecting_ha.is_some() => "already connecting to Home Assistant; wait for it to answer".into(),
+            Some("find") => {
+                self.find_ha();
+                "looking for a Home Assistant announcing itself…".into()
+            }
             Some(first) => match ha_args(first, next) {
-                // Two at once would race to be the one hub; the later answer
-                // would quietly undo the earlier.
-                Ok(_) if self.connecting_ha.is_some() => "already connecting to Home Assistant; wait for it to answer".into(),
-                Ok((typed, token)) => {
+                Ok((Some(typed), token)) => {
                     self.connect_ha(typed, token);
                     "connecting to Home Assistant…".into()
+                }
+                // A token with no address: the token isn't sent anywhere
+                // home only heard of, so this only says where HA is.
+                Ok((None, _)) => {
+                    self.find_ha();
+                    "looking for a Home Assistant announcing itself; the token isn't sent until you give its address…".into()
                 }
                 Err(e) => e,
             },
         }
     }
 
-    /// Reaches a Home Assistant, at `typed` or wherever one announces
-    /// itself, and lists what it has.
-    fn connect_ha(&mut self, typed: Option<String>, token: String) {
-        self.ha_attempts += 1;
-        let attempt = self.ha_attempts;
-        self.connecting_ha = Some(attempt);
+    /// Looks for a Home Assistant announcing itself on the LAN and says
+    /// where, for the person to connect to by typing it with the token.
+    /// Anything on the LAN can announce itself as HA, so the token never
+    /// goes to an address found this way.
+    fn find_ha(&mut self) {
+        let attempt = self.start_ha_attempt();
+        let me = self.me.clone();
+        thread::spawn(move || {
+            let _ = me.send(Request::HaConnected { attempt, result: Err(found_only(ha::find())) });
+        });
+    }
+
+    /// Reaches the Home Assistant at `typed` and lists what it has.
+    fn connect_ha(&mut self, typed: String, token: String) {
+        let attempt = self.start_ha_attempt();
         let me = self.me.clone();
         thread::spawn(move || {
             let result = (|| {
-                let url = match typed {
-                    Some(typed) => ha::url(&typed)?,
-                    None => ha::find().ok_or("no Home Assistant announces itself here; give its address: \
-                                              /home ha http://IP:8123 TOKEN")?,
-                };
-                let hub = ha::Hub { url, token };
+                let hub = ha::Hub { url: ha::url(&typed)?, token };
                 // Said only to the person at this machine: where it tried.
                 let tried = |e: String| format!("{e}; tried {}", hub.url);
                 let home = hub.check().map_err(tried)?;
@@ -91,6 +105,13 @@ impl Home {
             })();
             let _ = me.send(Request::HaConnected { attempt, result });
         });
+    }
+
+    /// Marks a `/home ha` attempt as the one on its way, and numbers it.
+    fn start_ha_attempt(&mut self) -> u64 {
+        self.ha_attempts += 1;
+        self.connecting_ha = Some(self.ha_attempts);
+        self.ha_attempts
     }
 
     /// What a `/home ha` connection came back with. Only the one connecting
@@ -210,6 +231,16 @@ impl Home {
             gone.len(),
             if gone.len() == 1 { "" } else { "s" },
         )
+    }
+}
+
+/// What `/home ha find`, or a token with no address, says: where a Home
+/// Assistant announces itself, to connect to by typing it. The token is
+/// never sent to an address home only heard of over the LAN.
+pub(in crate::home) fn found_only(found: Option<String>) -> String {
+    match found {
+        Some(url) => format!("found Home Assistant at {url}; connect to it with /home ha {url} TOKEN"),
+        None => "no Home Assistant announces itself here; give its address: /home ha http://IP:8123 TOKEN".into(),
     }
 }
 

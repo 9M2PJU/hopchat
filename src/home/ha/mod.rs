@@ -122,7 +122,9 @@ pub fn url(typed: &str) -> Result<String, String> {
 }
 
 /// The URL of a Home Assistant announcing itself on the LAN, if one does
-/// within a few seconds.
+/// within a few seconds. Only said back to the person, never connected to
+/// with their token: anything on the LAN can announce itself as HA, and
+/// the token mustn't go to an address home only heard of.
 pub fn find() -> Option<String> {
     let daemon = mdns_sd::ServiceDaemon::new().ok()?;
     let browse = daemon.browse(SERVICE).ok()?;
