@@ -9,10 +9,27 @@ use super::Home;
 
 /// Model turns per request: act, maybe act again on what it saw, then say.
 const MAX_TURNS: usize = 4;
+/// The most scenes the model is told of by name. A strip can list a
+/// hundred effects, and every one would be in every request's prompt.
+const MAX_SCENES_SAID: usize = 40;
+
+/// The scenes as the system prompt names them: the first few, and how
+/// many more there are, any of which `light_set` still takes by name.
+fn said_scenes(scenes: &[String]) -> String {
+    match scenes.len() {
+        0 => String::new(),
+        n if n <= MAX_SCENES_SAID => format!(" Light scenes: {}.", scenes.join(", ")),
+        n => format!(
+            " Light scenes include: {}, and {} more; use any scene name they ask for.",
+            scenes[..MAX_SCENES_SAID].join(", "),
+            n - MAX_SCENES_SAID,
+        ),
+    }
+}
 
 impl Home {
     pub(super) fn ask(&mut self, group: &str, from: &str, text: &str) -> String {
-        if self.lights().is_empty() && self.tvs().is_empty() {
+        if self.lights().is_empty() && self.tvs().is_empty() && self.switches().is_empty() {
             return "no devices are set up yet; whoever hosts home can add them with /devices.".into();
         }
         let mind = self.mind(group, Ollama::new(self.config.ollama.clone(), self.config.model.clone()));
@@ -66,10 +83,12 @@ impl Home {
     pub(super) fn system_prompt(&self) -> String {
         let lights = self.lights();
         let tvs = self.tvs();
+        let switches = self.switches();
         let devices: Vec<String> = lights
             .iter()
             .map(|(_, d)| d)
             .chain(tvs.iter().map(|(_, d)| d))
+            .chain(switches.iter().map(|(_, d)| d))
             .filter_map(|d| {
                 let backend = backend_of(d)?;
                 Some(format!("- {} \"{}\" ({})", backend.category().word(), d.name, backend.about(d)))
@@ -92,7 +111,7 @@ impl Home {
             } else {
                 ""
             },
-            if scenes.is_empty() { String::new() } else { format!(" Light scenes: {}.", scenes.join(", ")) },
+            said_scenes(&scenes),
         )
     }
 
@@ -100,6 +119,7 @@ impl Home {
     pub(super) fn tools(&self) -> Value {
         let mut tools = self.light_tools();
         tools.extend(self.tv_tools());
+        tools.extend(self.switch_tools());
         Value::Array(tools)
     }
 
@@ -107,6 +127,7 @@ impl Home {
         self.note(format!("home: {name} {args}"));
         self.run_light(name, args)
             .or_else(|| self.run_tv(name, args))
+            .or_else(|| self.run_switch(name, args))
             .unwrap_or_else(|| Err(format!("there's no tool called {name}")))
     }
 }

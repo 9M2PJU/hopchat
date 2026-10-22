@@ -4,14 +4,15 @@
 use serde_json::{json, Value};
 
 use super::assistant::{colour, flag, number, text, tool};
-use super::driver::backend_of;
+use super::driver::{backend_of, MAX_PARALLEL};
 use super::{Device, Home};
 
 /// What a light should change to; anything left `None` stays as it is.
 #[derive(Default, Debug, PartialEq)]
 pub struct Pilot {
     pub on: Option<bool>,
-    /// 10–100 %.
+    /// Percent, 0–100; each backend clamps it to what its lights take
+    /// (a Wiz bulb goes no lower than 10, HA no lower than 1).
     pub brightness: Option<u8>,
     /// 2200–6500 K.
     pub kelvin: Option<u16>,
@@ -40,10 +41,12 @@ impl Caps {
 pub trait LightDriver: Sync {
     fn caps(&self, d: &Device) -> Caps;
     /// The scenes it has built in, by the names people say.
-    fn scenes(&self) -> &'static [&'static str] {
-        &[]
+    fn scenes(&self, _d: &Device) -> Vec<String> {
+        Vec::new()
     }
-    fn set(&self, d: &Device, pilot: &Pilot) -> Result<(), String>;
+    /// Changes it, and says what it is doing now when the answer to the
+    /// change said so; `None` to ask with [`status`](Self::status).
+    fn set(&self, d: &Device, pilot: &Pilot) -> Result<Option<String>, String>;
     /// A one-line description of what it is doing now.
     fn status(&self, d: &Device) -> Result<String, String>;
 }
@@ -55,17 +58,21 @@ impl Home {
         self.config
             .devices
             .iter()
-            .filter_map(|d| Some((backend_of(d)?.as_light()?, d.clone())))
+            .filter_map(|d| Some((backend_of(d)?.as_light()?, self.reach(d))))
             .collect()
     }
 
-    /// Every scene some light here has.
-    pub(super) fn scenes(&self) -> Vec<&'static str> {
-        let mut scenes: Vec<&'static str> = Vec::new();
-        for (driver, _) in self.lights() {
-            for scene in driver.scenes() {
+    /// Every scene some light here has, taking each light's first, then
+    /// each one's second, and so on, so a strip with a hundred effects
+    /// doesn't push every other light's scenes to the end.
+    pub(super) fn scenes(&self) -> Vec<String> {
+        let each: Vec<Vec<String>> = self.lights().iter().map(|(driver, d)| driver.scenes(d)).collect();
+        let longest = each.iter().map(Vec::len).max().unwrap_or(0);
+        let mut scenes: Vec<String> = Vec::new();
+        for i in 0..longest {
+            for scene in each.iter().filter_map(|list| list.get(i)) {
                 if !scenes.contains(scene) {
-                    scenes.push(scene);
+                    scenes.push(scene.clone());
                 }
             }
         }
@@ -83,7 +90,7 @@ impl Home {
         let mut props = json!({
             "light": {"type": "string", "enum": names, "description": "which light; all for every one"},
             "on": {"type": "boolean", "description": "true to switch on, false to switch off"},
-            "brightness": {"type": "integer", "description": "percent, 10 to 100"},
+            "brightness": {"type": "integer", "description": "percent, 1 to 100"},
         });
         if !self.scenes().is_empty() {
             props["scene"] = json!({"type": "string", "description": "one of the light scene names"});
@@ -114,14 +121,11 @@ impl Home {
         match name {
             "light_set" => Some(self.light_set(args)),
             "light_status" => Some(self.pick_lights(text(args, "light").as_deref()).map(|lights| {
-                let results: Vec<String> = lights
-                    .iter()
-                    .map(|(l, d)| match l.status(d) {
-                        Ok(state) => format!("{} is {state}", d.name),
-                        Err(e) => format!("{}: {e}", d.name),
-                    })
-                    .collect();
-                results.join("; ")
+                each_light(&lights, |l, d| match l.status(d) {
+                    Ok(state) => format!("{} is {state}", d.name),
+                    Err(e) => format!("{}: {e}", d.name),
+                })
+                .join("; ")
             })),
             _ => None,
         }
@@ -136,7 +140,7 @@ impl Home {
         let scene = text(args, "scene");
         if let Some(s) = &scene {
             let wanted = scene_key(s);
-            if !lights.iter().any(|(l, _)| l.scenes().iter().any(|n| scene_key(n) == wanted)) {
+            if !lights.iter().any(|(l, d)| l.scenes(d).iter().any(|n| scene_key(n) == wanted)) {
                 return Err(format!("no scene called {s}"));
             }
         }
@@ -147,22 +151,20 @@ impl Home {
             rgb,
             scene,
         };
-        let results: Vec<String> = lights
-            .iter()
-            .map(|(l, d)| {
-                let caps = l.caps(d);
-                if pilot.rgb.is_some() && !caps.colour {
-                    return format!("{} only does white tones, not colours", d.name);
-                }
-                if pilot.kelvin.is_some() && !caps.white {
-                    return format!("{} only dims; it has no white temperature", d.name);
-                }
-                match l.set(d, &pilot).and_then(|()| l.status(d)) {
-                    Ok(state) => format!("{} is now {state}", d.name),
-                    Err(e) => format!("{}: {e}", d.name),
-                }
-            })
-            .collect();
+        let results = each_light(&lights, |l, d| {
+            let caps = l.caps(d);
+            if pilot.rgb.is_some() && !caps.colour {
+                return format!("{} only does white tones, not colours", d.name);
+            }
+            if pilot.kelvin.is_some() && !caps.white {
+                return format!("{} only dims; it has no white temperature", d.name);
+            }
+            let now = l.set(d, &pilot).and_then(|told| told.map_or_else(|| l.status(d), Ok));
+            match now {
+                Ok(state) => format!("{} is now {state}", d.name),
+                Err(e) => format!("{}: {e}", d.name),
+            }
+        });
         Ok(results.join("; "))
     }
 
@@ -189,6 +191,33 @@ impl Home {
         }
         Ok(picked)
     }
+}
+
+/// `f` on every light, [`MAX_PARALLEL`] at a time, its answers in the
+/// lights' order. Each light can take a few seconds to answer, or to time
+/// out when its hub is down, so "all" takes as long as the slowest light
+/// in each batch, not their sum: home answers nothing else meanwhile.
+fn each_light<F>(lights: &[Light], f: F) -> Vec<String>
+where
+    F: Fn(&dyn LightDriver, &Device) -> String + Sync,
+{
+    if let [(l, d)] = lights {
+        return vec![f(*l, d)];
+    }
+    std::thread::scope(|s| {
+        let f = &f;
+        lights
+            .chunks(MAX_PARALLEL)
+            .flat_map(|batch| {
+                let running: Vec<_> = batch.iter().map(|(l, d)| s.spawn(move || f(*l, d))).collect();
+                running
+                    .into_iter()
+                    .zip(batch)
+                    .map(|(r, (_, d))| r.join().unwrap_or_else(|_| format!("{}: something went wrong", d.name)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    })
 }
 
 /// A scene name as people say it: "Night-Light" is "night light".

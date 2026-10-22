@@ -354,7 +354,9 @@ impl Backend for WebOs {
             backend: "webos",
             ip,
             mac: mac_of(ip).map(|m| format_mac(&m)),
+            unit: None,
             data: Value::Null,
+            checked: None,
         })
     }
 

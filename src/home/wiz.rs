@@ -24,7 +24,7 @@ fn module(d: &Device) -> &str {
 
 fn found(ip: Ipv4Addr, mac: Option<String>, module: Option<String>) -> Found {
     let data = module.map(|m| json!({"module": m})).unwrap_or(Value::Null);
-    Found { backend: "wiz", ip, mac, data }
+    Found { backend: "wiz", ip, mac, unit: None, data, checked: None }
 }
 
 impl Backend for Wiz {
@@ -86,12 +86,12 @@ impl LightDriver for Wiz {
         caps_of(module(d))
     }
 
-    fn scenes(&self) -> &'static [&'static str] {
-        SCENE_NAMES
+    fn scenes(&self, _d: &Device) -> Vec<String> {
+        SCENE_NAMES.iter().map(|s| s.to_string()).collect()
     }
 
-    fn set(&self, d: &Device, pilot: &Pilot) -> Result<(), String> {
-        (Bulb { ip: d.ip }).set(pilot)
+    fn set(&self, d: &Device, pilot: &Pilot) -> Result<Option<String>, String> {
+        (Bulb { ip: d.ip }).set(pilot).map(|()| None)
     }
 
     fn status(&self, d: &Device) -> Result<String, String> {

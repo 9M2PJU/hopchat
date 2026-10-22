@@ -20,13 +20,15 @@ mod assistant;
 pub mod lend;
 mod discover;
 pub mod driver;
+pub mod ha;
 mod light;
 mod ollama;
+mod switch;
 mod tv;
 pub mod webos;
 pub mod wiz;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,6 +73,11 @@ pub struct Device {
     /// What identifies it when DHCP hands it a new address.
     #[serde(default)]
     pub mac: Option<String>,
+    /// Which of the things behind that address it is, for a hub that
+    /// drives many (a Home Assistant entity); `None` for a device that is
+    /// its own address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
     /// Whatever its backend keeps about it: a Wiz module name, a TV's
     /// client key and pinned certificate.
     #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -83,19 +90,48 @@ pub struct Device {
     key: Option<String>,
     #[serde(default, skip_serializing)]
     cert: Option<String>,
+    /// Whatever a newer hopchat wrote that this one doesn't know, kept so
+    /// saving here doesn't lose it.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
+    /// How to reach the hub that lists it, for a hub's entity. Home fills
+    /// it in from its one [`Config::ha`] each time it hands the device to
+    /// a backend, so a new token reaches every entity at once and none is
+    /// ever written into the device itself.
+    ///
+    /// Only [`Home::reach`] sets it: a device taken straight from
+    /// `config.devices` has none, and its backend answers that home isn't
+    /// connected. Hand every device to a backend through `reach`. Private
+    /// to home and its backends, so nothing outside can set it either.
+    #[serde(skip)]
+    hub: Option<ha::Hub>,
 }
 
 impl Device {
     pub fn new(backend: &str, name: String, ip: Ipv4Addr, mac: Option<String>, data: Value) -> Self {
-        Self { backend: backend.into(), name, ip, mac, data, model: None, key: None, cert: None }
+        Self { backend: backend.into(), name, ip, mac, unit: None, data, model: None, key: None, cert: None, extra: Default::default(), hub: None }
     }
 
+    /// A hub's entity is named by its unit alone, not by an address the
+    /// hub's name happens to resolve to, so it keeps its id when the hub
+    /// moves or doesn't resolve. Home talks to one hub at a time, so an
+    /// entity's id is unique.
     pub fn id(&self) -> String {
-        self.mac.clone().unwrap_or_else(|| self.ip.to_string())
+        match (&self.unit, &self.mac) {
+            (Some(unit), _) => unit.clone(),
+            (None, Some(mac)) => mac.clone(),
+            (None, None) => self.ip.to_string(),
+        }
     }
 
-    fn same(&self, backend: &str, ip: Ipv4Addr, mac: Option<&str>) -> bool {
+    fn same(&self, f: &driver::Found) -> bool {
+        let (backend, ip, mac) = (f.backend, f.ip, f.mac.as_deref());
+        if self.unit.is_some() {
+            // A hub's entity is itself wherever the hub moves to.
+            return self.backend == backend && self.unit == f.unit;
+        }
         self.backend == backend
+            && f.unit.is_none()
             && match (self.mac.as_deref(), mac) {
                 (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
                 _ => self.ip == ip,
@@ -137,6 +173,10 @@ pub struct Config {
     /// Whether group members may borrow this machine's model.
     #[serde(default = "yes")]
     pub share: bool,
+    /// The Home Assistant whose entities a scan lists and every HA device
+    /// is driven through: the one place its token is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ha: Option<ha::Hub>,
     // The single-bulb, single-TV settings of earlier versions, folded into
     // `devices` when read.
     #[serde(default, skip_serializing)]
@@ -149,6 +189,9 @@ pub struct Config {
     tv_key: Option<String>,
     #[serde(default, skip_serializing)]
     tv_cert: Option<String>,
+    /// Whatever a newer hopchat wrote that this one doesn't know.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
 fn yes() -> bool {
@@ -192,17 +235,23 @@ impl Default for Config {
             model: default_model(),
             ollama: default_ollama(),
             share: true,
+            ha: None,
             bulb: None,
             tv: None,
             tv_mac: None,
             tv_key: None,
             tv_cert: None,
+            extra: Default::default(),
         }
     }
 }
 
 impl Config {
-    fn migrate(&mut self) {
+    /// Brings settings from earlier versions up to date. Whether a token
+    /// was taken out of a device, so it is saved without it at once rather
+    /// than left on disk until something else is saved.
+    fn migrate(&mut self) -> bool {
+        let mut unstamped = false;
         if let Some(ip) = self.bulb.take() {
             self.devices.push(Device::new("wiz", "Light".into(), ip, None, Value::Null));
         }
@@ -214,7 +263,16 @@ impl Config {
         }
         for d in &mut self.devices {
             d.migrate();
+            // Listed by an earlier build, an entity kept the hub's URL and
+            // token itself.
+            if ha::drives(d)
+                && let Some(hub) = ha::unstamp(&mut d.data)
+            {
+                self.ha.get_or_insert(hub);
+                unstamped = true;
+            }
         }
+        unstamped
     }
 }
 
@@ -294,8 +352,21 @@ pub enum Request {
     SetGroup { group: String, on: bool },
     // Results from home's own worker threads.
     Found(driver::Found),
+    /// Everything `hub` listed, at once, and what to warn of about it.
+    /// Taken only while `hub` is still home's: a scan outlives `/home ha
+    /// forget` or a move, and the old hub's word mustn't stand for the new.
+    Listed { hub: ha::Hub, listing: ha::Listing },
     ScanDone,
     Checked { id: String, state: State, detail: String },
+    /// What `hub` says one of its devices is doing; taken on the same
+    /// terms as [`Request::Listed`].
+    HubChecked { hub: ha::Hub, id: String, state: State, detail: String },
+    /// `/home ha` reached a Home Assistant: the hub and what it has, or
+    /// why not.
+    HaConnected { attempt: u64, result: Result<(ha::Hub, String, ha::Listing), String> },
+    /// A test finished: the device with what it learned and what to say,
+    /// or why not; `before` is its data when the test began.
+    Tested { id: String, before: Value, result: Result<(Box<Device>, String), String> },
     /// A pairing finished: the device with what it learned, and its detail.
     Paired { id: String, result: Result<(Box<Device>, String), String> },
     ModelChecked(ModelState),
@@ -305,6 +376,11 @@ pub enum Request {
     /// A group member wants this machine's model to think.
     Lend { to: String, who: String, id: String, messages: Vec<serde_json::Value>, tools: serde_json::Value },
     Answered { question: ai::Question, asked: serde_json::Value, answer: Result<String, String> },
+}
+
+/// A device name as it may be kept: one line, not too long.
+fn clean_name(name: &str) -> String {
+    name.trim().chars().filter(|c| !c.is_control()).take(MAX_NAME_CHARS).collect::<String>().trim().to_string()
 }
 
 /// Whether `text` addresses home, and the request with the mention removed.
@@ -348,6 +424,10 @@ pub struct Home {
     /// Who was last told about borrowing this model, and when, so one
     /// request doesn't note every turn.
     lent_to: Option<(String, Instant)>,
+    /// The `/home ha` connection on its way, if one is.
+    connecting_ha: Option<u64>,
+    /// How many `/home ha` connections were started, to tell them apart.
+    ha_attempts: u64,
 }
 
 impl Home {
@@ -357,8 +437,8 @@ impl Home {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        config.migrate();
-        Self {
+        let unstamped = config.migrate();
+        let home = Self {
             path,
             config,
             engine,
@@ -373,7 +453,13 @@ impl Home {
             offered: None,
             lending: Arc::new(AtomicUsize::new(0)),
             lent_to: None,
+            connecting_ha: None,
+            ha_attempts: 0,
+        };
+        if unstamped {
+            home.save();
         }
+        home
     }
 
     pub fn enabled(&self, group: &str) -> bool {
@@ -498,8 +584,9 @@ impl Home {
                 }
             }
             Request::Test(id) => self.test(&id),
+            Request::Tested { id, before, result } => self.on_tested(&id, before, result),
             Request::Rename(id, name) => {
-                let name: String = name.trim().chars().filter(|c| !c.is_control()).take(MAX_NAME_CHARS).collect();
+                let name = clean_name(&name);
                 if name.is_empty() {
                     return;
                 }
@@ -520,13 +607,22 @@ impl Home {
                 self.note(reply);
             }
             Request::Found(found) => self.on_found(found),
-            Request::ScanDone => self.scanning = false,
-            Request::Checked { id, state, detail } => {
-                // A check finishing must not overwrite a pairing in progress.
-                if !matches!(self.live.get(&id), Some((State::Pairing { .. }, _))) {
-                    self.live.insert(id, (state, detail));
+            Request::Listed { hub, listing } => {
+                if self.config.ha.as_ref() == Some(&hub) {
+                    if let Some(warning) = listing.warning {
+                        self.note(format!("home: {warning}"));
+                    }
+                    self.on_listed(listing.found);
                 }
             }
+            Request::HubChecked { hub, id, state, detail } => {
+                if self.config.ha.as_ref() == Some(&hub) {
+                    self.checked(id, state, detail);
+                }
+            }
+            Request::HaConnected { attempt, result } => self.on_ha_connected(attempt, result),
+            Request::ScanDone => self.scanning = false,
+            Request::Checked { id, state, detail } => self.checked(id, state, detail),
             Request::Paired { id, result } => self.on_paired(&id, result),
             Request::ModelChecked(state) => {
                 self.model_state = state;
@@ -545,9 +641,16 @@ impl Home {
             return;
         }
         self.scanning = true;
+        let hub = self.config.ha.clone();
+        let mut listed_by_hub = Vec::new();
         for d in &self.config.devices {
             self.live.entry(d.id()).or_insert((State::Checking, String::new()));
-            self.check(d.clone());
+            // The hub's listing says what its devices are doing, in one call.
+            if hub.is_some() && ha::drives(d) {
+                listed_by_hub.push(self.reach(d));
+            } else {
+                self.check(d.clone());
+            }
         }
         let me = self.me.clone();
         let (url, model) = (self.config.ollama.clone(), self.config.model.clone());
@@ -559,13 +662,29 @@ impl Home {
                     let _ = me.send(Request::Found(found));
                 }
             };
+            let listing = hub.map(|hub| {
+                let me = me.clone();
+                thread::spawn(move || ha::connect::list_hub(&hub, listed_by_hub, &me))
+            });
             discover::scan(each);
+            if let Some(listing) = listing {
+                let _ = listing.join();
+            }
             let _ = me.send(Request::ScanDone);
         });
     }
 
+    /// Keeps what a check found a device doing.
+    fn checked(&mut self, id: String, state: State, detail: String) {
+        // A check finishing must not overwrite a pairing in progress.
+        if !matches!(self.live.get(&id), Some((State::Pairing { .. }, _))) {
+            self.live.insert(id, (state, detail));
+        }
+    }
+
     /// Looks at an added device in the background and reports its state.
     fn check(&self, d: Device) {
+        let d = self.reach(&d);
         let Some(backend) = backend_of(&d) else { return };
         let me = self.me.clone();
         thread::spawn(move || {
@@ -575,13 +694,57 @@ impl Home {
     }
 
     fn on_found(&mut self, f: driver::Found) {
-        let Some(backend) = driver::backend(f.backend) else { return };
+        if self.learn(f) {
+            self.save();
+        }
+    }
+
+    /// Everything a hub listed, saved once rather than once per entity.
+    fn on_listed(&mut self, found: Vec<driver::Found>) {
+        let listed = ha::listed(&found);
+        if self.learn_all(found) {
+            self.save();
+        }
+        self.drop_unlisted_offers(&listed);
+    }
+
+    /// Drops the hub's entities that were offered, never added, and that
+    /// `listed` doesn't have: hidden or gone in Home Assistant since. An
+    /// added one stays, and is checked on its own.
+    pub(super) fn drop_unlisted_offers(&mut self, listed: &HashSet<String>) {
+        let unlisted = |d: &Device| ha::drives(d) && !d.unit.as_ref().is_some_and(|u| listed.contains(u));
+        let gone: Vec<String> = self.found.iter().filter(|d| unlisted(d)).map(Device::id).collect();
+        self.found.retain(|d| !unlisted(d));
+        for id in gone {
+            self.live.remove(&id);
+        }
+    }
+
+    /// Takes in everything a hub listed; whether an added device changed,
+    /// for the caller to save.
+    fn learn_all(&mut self, found: Vec<driver::Found>) -> bool {
+        let mut changed = false;
+        for f in found {
+            changed |= self.learn(f);
+        }
+        changed
+    }
+
+    /// Takes in a found device: offers it, or updates the one already
+    /// here. Whether an added device changed, for the caller to save.
+    fn learn(&mut self, f: driver::Found) -> bool {
+        let Some(backend) = driver::backend(f.backend) else { return false };
         // Something we already have, perhaps at a new address.
-        if let Some(d) = self.config.devices.iter_mut().find(|d| d.same(f.backend, f.ip, f.mac.as_deref())) {
+        if let Some(d) = self.config.devices.iter_mut().find(|d| d.same(&f)) {
             let mut changed = false;
             let mut moved = None;
-            if d.ip != f.ip {
-                moved = Some(format!("{} moved to {}", d.name, f.ip));
+            // An unresolved hub says 0.0.0.0; that isn't a move.
+            if d.ip != f.ip && !f.ip.is_unspecified() {
+                // Every entity of a hub moves with it; one note per entity
+                // would only be noise.
+                if d.unit.is_none() {
+                    moved = Some(format!("{} moved to {}", d.name, f.ip));
+                }
                 d.ip = f.ip;
                 changed = true;
             }
@@ -595,35 +758,51 @@ impl Home {
                 }
                 changed = true;
             }
-            // Anything the backend learned that it didn't have yet.
+            // Anything the backend learned that it didn't have yet. What a
+            // hub lists is what the hub says now, so that replaces what an
+            // entity had: its effects and colour modes can change.
+            let current = f.unit.is_some();
             if let Value::Object(learned) = &f.data {
                 if !d.data.is_object() {
                     d.data = json!({});
                 }
                 for (key, value) in learned {
-                    if d.data.get(key).is_none_or(Value::is_null) {
+                    let stale = d.data.get(key).is_none_or(Value::is_null) || (current && d.data[key] != *value);
+                    if stale {
                         d.data[key] = value.clone();
                         changed = true;
                     }
                 }
             }
             let d = d.clone();
-            if changed {
-                self.save();
-            }
             if let Some(moved) = moved {
                 self.note(moved);
             }
-            self.check(d);
-            return;
+            match f.checked {
+                Some((state, detail)) => self.checked(d.id(), state, detail),
+                None => self.check(d),
+            }
+            return changed;
         }
-        if self.found.iter().any(|d| d.same(f.backend, f.ip, f.mac.as_deref())) {
-            return;
+        if let Some(d) = self.found.iter_mut().find(|d| d.same(&f)) {
+            // One waiting to be added keeps up with what its hub says too.
+            if f.unit.is_some() {
+                d.data = f.data;
+                if !f.ip.is_unspecified() {
+                    d.ip = f.ip;
+                }
+                if let Some((State::New, detail)) = self.live.get_mut(&d.id()) {
+                    *detail = backend.found_detail(d);
+                }
+            }
+            return false;
         }
-        let name = self.free_name(backend.category().noun());
-        let d = Device::new(f.backend, name, f.ip, f.mac, f.data);
+        let mut d = Device { unit: f.unit, ..Device::new(f.backend, String::new(), f.ip, f.mac, f.data) };
+        let called = backend.name(&d).map(|n| clean_name(&n)).filter(|n| !n.is_empty());
+        d.name = self.free_name(called.as_deref().unwrap_or(backend.category().noun()));
         self.live.insert(d.id(), (State::New, backend.found_detail(&d)));
         self.found.push(d);
+        false
     }
 
     /// `base`, or `base 2`, `base 3`… whichever no device, added or
@@ -699,19 +878,42 @@ impl Home {
         }
     }
 
+    /// Shows which device it is, on a worker thread: a blink takes a
+    /// second or more, and a hub that is down takes its whole timeout, and
+    /// home answers nothing else while it waits.
     fn test(&mut self, id: &str) {
-        let Some(d) = self.config.devices.iter().find(|d| d.id() == id).cloned() else {
+        let Some(d) = self.config.devices.iter().find(|d| d.id() == id).map(|d| self.reach(d)) else {
             return self.note("add it first, then test it".into());
         };
         let Some(backend) = backend_of(&d) else { return };
-        match self.drive(id, |d| backend.test(d)).unwrap_or_else(|| Err("it's gone".into())) {
-            Ok(text) => {
+        self.checked(id.to_string(), State::Checking, String::new());
+        let (me, id) = (self.me.clone(), id.to_string());
+        thread::spawn(move || {
+            let before = d.data.clone();
+            let mut d = d;
+            let result = backend.test(&mut d).map(|text| (Box::new(d), text));
+            let _ = me.send(Request::Tested { id, before, result });
+        });
+    }
+
+    /// A test finished: keeps what the backend learned doing it, unless
+    /// something else changed the device meanwhile.
+    fn on_tested(&mut self, id: &str, before: Value, result: Result<(Box<Device>, String), String>) {
+        let Some(at) = self.config.devices.iter().position(|d| d.id() == id) else { return };
+        match result {
+            Ok((tested, text)) => {
+                let d = &mut self.config.devices[at];
+                if tested.data != d.data && d.data == before {
+                    d.data = tested.data;
+                    self.save();
+                }
                 self.note(text);
-                self.check(d);
+                self.check(self.config.devices[at].clone());
             }
             Err(e) => {
-                self.live.insert(id.to_string(), (State::Failed(e.clone()), String::new()));
-                self.note(format!("{}: {e}", d.name));
+                let name = self.config.devices[at].name.clone();
+                self.checked(id.to_string(), State::Failed(e.clone()), String::new());
+                self.note(format!("{name}: {e}"));
             }
         }
     }
@@ -721,13 +923,22 @@ impl Home {
     /// device.
     fn drive<T>(&mut self, id: &str, f: impl FnOnce(&mut Device) -> T) -> Option<T> {
         let at = self.config.devices.iter().position(|d| d.id() == id)?;
-        let mut d = self.config.devices[at].clone();
+        let mut d = self.reach(&self.config.devices[at]);
         let out = f(&mut d);
         if d.data != self.config.devices[at].data {
             self.config.devices[at].data = d.data;
             self.save();
         }
         Some(out)
+    }
+
+    /// `d` as its backend needs it: a hub's entity with the hub to reach.
+    pub(super) fn reach(&self, d: &Device) -> Device {
+        let mut d = d.clone();
+        if ha::drives(&d) {
+            d.hub = self.config.ha.clone();
+        }
+        d
     }
 
     // ----- /home ---------------------------------------------------------
@@ -769,6 +980,7 @@ impl Home {
                 Ok(ip) => self.add_by_address(ip),
                 Err(_) => format!("{ip} isn't an IPv4 address"),
             },
+            ("ha", value) => self.ha_configure(value, words.next()),
             ("model", Some(model)) => {
                 self.config.model = model.to_string();
                 self.save();
@@ -879,12 +1091,58 @@ mod tests {
     use super::assistant::{colour, flag, number, text};
     use super::ollama::{self, Ollama, Turn};
     use super::*;
+    use super::ha::connect::{answered, found_only, ha_args, list_hub, looks_like_token};
 
-    fn home_with(devices: Vec<Device>) -> Home {
+    /// A settings directory of this test's own, so what one test saves (a
+    /// hub, with its token) is never what another test opens. It is
+    /// removed when dropped, so no settings outlive the test.
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new() -> Root {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::SeqCst);
+            let root = std::env::temp_dir().join(format!("hopchat-home-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            Root(root)
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A home opened in a [`Root`] of its own, which goes when it does.
+    struct TestHome {
+        home: Home,
+        _root: Root,
+    }
+
+    impl std::ops::Deref for TestHome {
+        type Target = Home;
+        fn deref(&self) -> &Home {
+            &self.home
+        }
+    }
+
+    impl std::ops::DerefMut for TestHome {
+        fn deref_mut(&mut self) -> &mut Home {
+            &mut self.home
+        }
+    }
+
+    fn open_home(engine: Sender<Input>, ui: Sender<Update>, me: Sender<Request>) -> TestHome {
+        let root = Root::new();
+        TestHome { home: Home::open(&root.0, engine, ui, me), _root: root }
+    }
+
+    fn home_with(devices: Vec<Device>) -> TestHome {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, _) = std::sync::mpsc::channel();
         let (me, _) = std::sync::mpsc::channel();
-        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        let mut home = open_home(engine, ui, me);
         home.config = Config { devices, ..Default::default() };
         home
     }
@@ -908,11 +1166,11 @@ mod tests {
     }
 
     /// A home whose messages to the engine can be read.
-    fn wired_home() -> (Home, std::sync::mpsc::Receiver<Input>) {
+    fn wired_home() -> (TestHome, std::sync::mpsc::Receiver<Input>) {
         let (engine, from_home) = std::sync::mpsc::channel();
         let (ui, _) = std::sync::mpsc::channel();
         let (me, _) = std::sync::mpsc::channel();
-        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        let mut home = open_home(engine, ui, me);
         home.config = Config::default();
         (home, from_home)
     }
@@ -1193,7 +1451,9 @@ mod tests {
             backend: "wiz",
             ip: [10, 0, 0, 6].into(),
             mac: Some("other".into()),
+            unit: None,
             data: json!({"module": "ESP01_SHRGB1C_31"}),
+            checked: None,
         });
         assert_eq!(home.found[0].name, "Light 2");
         assert_eq!(home.live[&home.found[0].id()].1, "Wiz · colour");
@@ -1202,10 +1462,624 @@ mod tests {
             backend: "wiz",
             ip: [10, 0, 0, 9].into(),
             mac: Some("mac-Light".into()),
+            unit: None,
             data: Value::Null,
+            checked: None,
         });
         assert_eq!(home.config.devices[0].ip, Ipv4Addr::new(10, 0, 0, 9));
         assert_eq!(home.found.len(), 1, "a known device is not offered again");
+    }
+
+    #[test]
+    fn things_behind_one_address_are_told_apart() {
+        let mut home = home_with(Vec::new());
+        let entity = |unit: &str| driver::Found {
+            backend: "wiz",
+            ip: [10, 0, 0, 4].into(),
+            mac: Some("hub".into()),
+            unit: Some(unit.into()),
+            data: Value::Null,
+            checked: None,
+        };
+        home.on_found(entity("light.desk"));
+        home.on_found(entity("light.strip"));
+        home.on_found(entity("light.desk"));
+        let ids: Vec<String> = home.found.iter().map(Device::id).collect();
+        assert_eq!(ids, ["light.desk", "light.strip"], "named by the entity alone, not the hub's address");
+        let saved = serde_json::to_value(&home.found[0]).unwrap();
+        assert_eq!(saved["unit"], "light.desk");
+        assert!(serde_json::to_value(light("Desk", [10, 0, 0, 5], "m")).unwrap().get("unit").is_none());
+    }
+
+    fn listing(found: driver::Found) -> ha::Listing {
+        ha::Listing { found: vec![found], warning: None }
+    }
+
+    fn hub(url: &str, token: &str) -> ha::Hub {
+        ha::Hub { url: url.into(), token: token.into() }
+    }
+
+    fn entity(backend: &'static str, unit: &str, data: Value) -> driver::Found {
+        driver::Found { backend, ip: [10, 0, 0, 4].into(), mac: None, unit: Some(unit.into()), data, checked: None }
+    }
+
+    /// The hub an added device would be driven through.
+    fn reached(home: &Home, at: usize) -> Option<ha::Hub> {
+        home.reach(&home.config.devices[at]).hub
+    }
+
+    #[test]
+    fn home_assistant_entities_are_named_and_go_through_the_hub() {
+        let mut home = home_with(Vec::new());
+        let strip = || entity("ha_light", "light.strip", json!({"name": "Kitchen strip", "colour": true, "white": false, "effects": []}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "old"), "Home".into(), listing(strip()))));
+        assert_eq!(home.found[0].name, "Kitchen strip");
+        assert_eq!(home.found[0].id(), "light.strip", "an entity is named by itself, not the hub's address");
+        let id = home.found[0].id();
+        home.add(&id);
+        assert!(home.tools().to_string().contains("\"color\""));
+        // A new token reaches the devices already added, and they aren't offered again.
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "new"), "Home".into(), listing(strip()))));
+        assert!(home.found.is_empty());
+        assert_eq!(reached(&home, 0), Some(hub("http://10.0.0.4:8123", "new")));
+    }
+
+    #[test]
+    fn a_new_token_reaches_devices_the_hub_no_longer_lists() {
+        let mut home = home_with(Vec::new());
+        let plug = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "old"), "Home".into(), listing(plug))));
+        home.add("switch.kettle");
+        // Hidden in HA since: the listing leaves it out, and it still gets the new token.
+        let empty = ha::Listing { found: Vec::new(), warning: None };
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "new"), "Home".into(), empty)));
+        assert_eq!(reached(&home, 0).map(|h| h.token), Some("new".into()));
+    }
+
+    #[test]
+    fn the_token_is_kept_once_and_shown_nowhere() {
+        let mut home = home_with(Vec::new());
+        let secret = "eyJsecret.eyJpc3Mi.sig";
+        let plug = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", secret), "Home".into(), listing(plug))));
+        home.add("switch.kettle");
+        let saved = serde_json::to_string(&home.config).unwrap();
+        assert_eq!(saved.matches(secret).count(), 1, "in the hub, not in its devices: {saved}");
+        assert!(!home.system_prompt().contains(secret) && !home.tools().to_string().contains(secret));
+        assert!(home.view().devices.iter().all(|d| !d.name.contains(secret) && !d.detail.contains(secret)));
+    }
+
+    #[test]
+    fn entities_listed_by_an_earlier_build_give_up_their_token() {
+        let old = json!({"devices": [{"backend": "ha_switch", "name": "Kettle", "ip": "10.0.0.4", "unit": "switch.kettle",
+                                      "data": {"name": "Kettle", "url": "http://10.0.0.4:8123", "token": "t"}}]});
+        let mut config: Config = serde_json::from_value(old).unwrap();
+        config.migrate();
+        assert_eq!(config.ha, Some(hub("http://10.0.0.4:8123", "t")));
+        assert_eq!(config.devices[0].data, json!({"name": "Kettle"}));
+    }
+
+    #[test]
+    fn a_token_taken_out_of_an_old_device_leaves_the_file_at_once() {
+        let root = std::env::temp_dir().join(format!("hopchat-home-unstamp-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let old = json!({"devices": [{"backend": "ha_switch", "name": "Kettle", "ip": "10.0.0.4", "unit": "switch.kettle",
+                                      "data": {"name": "Kettle", "url": "http://10.0.0.4:8123", "token": "eyJold.eyJ.sig"}}]});
+        std::fs::write(root.join("home.json"), old.to_string()).unwrap();
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, _) = std::sync::mpsc::channel();
+        let (me, _) = std::sync::mpsc::channel();
+        let home = Home::open(&root, engine, ui, me);
+        let saved = std::fs::read_to_string(root.join("home.json")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(home.config.ha, Some(hub("http://10.0.0.4:8123", "eyJold.eyJ.sig")));
+        assert_eq!(saved.matches("eyJold.eyJ.sig").count(), 1, "kept in the hub only: {saved}");
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["devices"][0]["data"], json!({"name": "Kettle"}));
+    }
+
+    #[test]
+    fn a_new_token_at_the_same_address_replaces_nothing() {
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, notes) = std::sync::mpsc::channel();
+        let (me, _) = std::sync::mpsc::channel();
+        let mut home = open_home(engine, ui, me);
+        home.config = Config::default();
+        let empty = || ha::Listing { found: Vec::new(), warning: None };
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "a"), "Home".into(), empty())));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "b"), "Home".into(), empty())));
+        let said: Vec<String> = notes.try_iter().filter_map(|u| match u { Update::Home(t) => Some(t), _ => None }).collect();
+        assert!(!said.iter().any(|t| t.contains("replaced")), "{said:?}");
+        home.ha_connected(Ok((hub("http://10.0.0.5:8123", "b"), "Home".into(), empty())));
+        let said: Vec<String> = notes.try_iter().filter_map(|u| match u { Update::Home(t) => Some(t), _ => None }).collect();
+        assert!(said.iter().any(|t| t.contains("http://10.0.0.4:8123 is replaced by the one at http://10.0.0.5:8123")), "{said:?}");
+    }
+
+    #[test]
+    fn a_strip_with_a_hundred_effects_doesnt_fill_the_prompt() {
+        let effects: Vec<String> = (0..100).map(|n| format!("Effect {n}")).collect();
+        let strip = Device {
+            unit: Some("light.strip".into()),
+            ..Device::new("ha_light", "Strip".into(), [10, 0, 0, 4].into(), None,
+                          json!({"name": "Strip", "colour": true, "white": true, "effects": effects}))
+        };
+        let desk = light("Desk", [10, 0, 0, 5], "ESP01_SHRGB1C_31");
+        let wiz_first = driver::Backend::as_light(&wiz::Wiz).unwrap().scenes(&desk)[0].clone();
+        let mut home = home_with(vec![strip, desk]);
+        let prompt = home.system_prompt();
+        assert!(prompt.contains("Effect 0") && prompt.contains(&wiz_first), "every light gets a share");
+        assert!(!prompt.contains("Effect 99") && prompt.contains("more; use any scene name"), "{prompt}");
+        // Left out of the prompt, but still a scene the strip has.
+        let e = home.run_tool("light_set", &json!({"light": "strip", "scene": "effect 99"}));
+        assert!(!matches!(&e, Err(e) if e.contains("no scene called")), "{e:?}");
+    }
+
+    #[test]
+    fn forgetting_home_assistant_forgets_what_it_only_offered() {
+        let mut home = home_with(Vec::new());
+        let kettle = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "t"), "Home".into(), listing(kettle))));
+        assert!(home.live.contains_key("switch.kettle"));
+        home.forget_ha();
+        assert!(home.found.is_empty() && !home.live.contains_key("switch.kettle"));
+    }
+
+    /// `/home ha URL TOKEN` against a real Home Assistant, through to the
+    /// tools the model calls. `HA_URL=… HA_TOKEN=… cargo test -- --ignored
+    /// live`, with HA's `demo:` integration.
+    #[test]
+    #[ignore = "needs a Home Assistant with the demo integration"]
+    fn live_home_assistant() {
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, _) = std::sync::mpsc::channel();
+        let (me, requests) = std::sync::mpsc::channel();
+        let mut home = open_home(engine, ui, me);
+        home.config = Config::default();
+        let (url, token) = (std::env::var("HA_URL").unwrap(), std::env::var("HA_TOKEN").unwrap());
+        assert_eq!(home.configure(None, &format!("ha {url} {token}")), "connecting to Home Assistant…");
+        let connected = requests.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(matches!(connected, Request::HaConnected { result: Ok(_), .. }));
+        home.handle(connected);
+        let names: Vec<String> = home.found.iter().map(|d| d.name.clone()).collect();
+        println!("found: {names:?}");
+        for name in ["Bed Light", "Lounge room", "AC"] {
+            let id = home.found.iter().find(|d| d.name == name).unwrap().id();
+            home.add(&id);
+        }
+        let tools = home.tools().to_string();
+        assert!(tools.contains("light_set") && tools.contains("tv_open_app") && tools.contains("switch_set"));
+        println!("{}", home.system_prompt());
+        let run = |home: &mut Home, tool: &str, args: Value| home.run_tool(tool, &args).unwrap();
+        assert_eq!(run(&mut home, "light_set", json!({"light": "bed light", "brightness": "25%", "color": "blue"})), "Bed Light is now on · 25% · #0000ff");
+        assert_eq!(run(&mut home, "light_set", json!({"light": "bed light", "scene": "Rainbow"})), "Bed Light is now on · 25% · rainbow");
+        assert_eq!(run(&mut home, "tv_open_app", json!({"app": "youtube"})), "Lounge room switched to youtube");
+        assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": true})), "AC is now on");
+        assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": false})), "AC is now off");
+    }
+
+    /// A home whose notes to the person at this machine can be read, and
+    /// whose own queue can be.
+    fn noted_home() -> (TestHome, std::sync::mpsc::Receiver<Update>, std::sync::mpsc::Receiver<Request>) {
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, notes) = std::sync::mpsc::channel();
+        let (me, requests) = std::sync::mpsc::channel();
+        let mut home = open_home(engine, ui, me);
+        home.config = Config::default();
+        (home, notes, requests)
+    }
+
+    fn said(notes: &std::sync::mpsc::Receiver<Update>) -> Vec<String> {
+        notes.try_iter().filter_map(|u| match u { Update::Home(t) => Some(t), _ => None }).collect()
+    }
+
+    #[test]
+    fn a_scan_that_couldnt_filter_says_so() {
+        // No registry: everything is listed, with a warning.
+        let fake = ha::fake::Fake::start("t", None, |_, _, _| {
+            (200, json!([{"entity_id": "switch.kettle", "state": "on", "attributes": {}}]).to_string())
+        });
+        let (me, requests) = std::sync::mpsc::channel();
+        list_hub(&hub(&fake.url, "t"), Vec::new(), &me);
+        drop(me);
+        let listed = requests.into_iter().find(|r| matches!(r, Request::Listed { .. })).expect("a listing");
+        let (mut home, notes, _) = noted_home();
+        home.config.ha = Some(hub(&fake.url, "t"));
+        home.handle(listed);
+        let said = said(&notes);
+        assert!(said.iter().any(|t| t.contains("entity registry")), "{said:?}");
+        assert_eq!(home.found.len(), 1, "still listed");
+    }
+
+    #[test]
+    fn another_home_assistant_at_the_same_address_is_not_trusted_blindly() {
+        let mut home = home_with(Vec::new());
+        let at = "http://10.0.0.4:8123";
+        let light = |name: &str| entity("ha_light", "light.kitchen", json!({"name": name, "colour": true, "white": true}));
+        let desk = entity("ha_switch", "switch.desk", json!({"name": "Desk"}));
+        home.ha_connected(Ok((hub(at, "a"), "Home".into(), ha::Listing { found: vec![light("Kitchen"), desk], warning: None })));
+        home.add("light.kitchen");
+        home.add("switch.desk");
+        // A reinstalled HA at the same address: its light.kitchen is
+        // something else, and it has no desk (hidden, perhaps).
+        home.ha_connected(Ok((hub(at, "b"), "Home".into(), listing(light("Garage strip")))));
+        let names: Vec<&str> = home.config.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Desk"], "the kitchen light isn't vouched for; the desk may only be hidden");
+        assert_eq!(home.found.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Garage strip"]);
+    }
+
+    #[test]
+    fn a_device_without_its_ha_name_is_kept_where_its_entity_is_listed() {
+        let unnamed = |unit: &str| Device { unit: Some(unit.into()), ..Device::new("ha_light", unit.into(), [10, 0, 0, 4].into(), None, json!({})) };
+        let mut home = home_with(vec![unnamed("light.kitchen"), unnamed("light.porch")]);
+        home.config.ha = Some(hub("http://10.0.0.4:8123", "a"));
+        let kitchen = entity("ha_light", "light.kitchen", json!({"name": "Kitchen"}));
+        home.ha_connected(Ok((hub("http://10.0.0.9:8123", "a"), "Home".into(), listing(kitchen))));
+        let units: Vec<&str> = home.config.devices.iter().filter_map(|d| d.unit.as_deref()).collect();
+        assert_eq!(units, ["light.kitchen"], "listed: kept; not listed by a hub that moved: forgotten");
+    }
+
+    #[test]
+    fn one_home_assistant_connection_at_a_time() {
+        let (mut home, notes, requests) = noted_home();
+        let token = "eyJhbGciOi.eyJpc3Mi.sig";
+        // Nothing listens on port 1, so this fails at once.
+        assert_eq!(home.configure(None, &format!("ha http://127.0.0.1:1 {token}")), "connecting to Home Assistant…");
+        assert!(home.configure(None, &format!("ha http://127.0.0.1:2 {token}")).starts_with("already connecting"));
+        let answered = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        home.handle(answered);
+        assert!(said(&notes).iter().any(|t| t.starts_with("home: can't reach Home Assistant")));
+        assert_eq!(home.connecting_ha, None, "a failure ends the attempt");
+        // A connection that answers after /home ha forget is dropped.
+        let kettle = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.configure(None, &format!("ha http://127.0.0.1:1 {token}"));
+        home.forget_ha();
+        let late = Request::HaConnected { attempt: home.ha_attempts, result: Ok((hub("http://10.0.0.4:8123", "t"), "Home".into(), listing(kettle))) };
+        home.handle(late);
+        assert!(home.config.ha.is_none() && home.found.is_empty());
+    }
+
+    #[test]
+    fn a_hub_entity_stays_put_and_keeps_up_with_the_hub() {
+        let strip = |ip: [u8; 4], effects: Value| driver::Found {
+            backend: "ha_light",
+            ip: ip.into(),
+            mac: None,
+            unit: Some("light.strip".into()),
+            data: json!({"name": "Strip", "colour": true, "white": false, "effects": effects}),
+            checked: None,
+        };
+        let mut home = home_with(Vec::new());
+        home.on_found(strip([10, 0, 0, 4], json!(["Rainbow"])));
+        home.add("light.strip");
+        // The hub's name didn't resolve this time: not a move.
+        home.on_found(strip([0, 0, 0, 0], json!(["Rainbow"])));
+        assert_eq!(home.config.devices[0].ip, Ipv4Addr::new(10, 0, 0, 4));
+        // A real move keeps the id, so its state isn't lost.
+        home.on_found(strip([10, 0, 0, 7], json!(["Rainbow"])));
+        assert_eq!(home.config.devices[0].ip, Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(home.config.devices[0].id(), "light.strip");
+        assert!(home.live.contains_key("light.strip"));
+        // What the hub says now replaces what it said before.
+        home.on_found(strip([10, 0, 0, 7], json!(["Fire", "Rainbow"])));
+        assert_eq!(home.config.devices[0].data["effects"], json!(["Fire", "Rainbow"]));
+        assert!(home.system_prompt().contains("Fire"));
+    }
+
+    #[test]
+    fn home_assistant_address_then_token() {
+        let (url, token) = ("http://10.0.0.4:8123", "eyJhbGciOi.eyJpc3Mi.sig");
+        assert_eq!(ha_args(url, Some(token)), Ok((Some(url.into()), token.into())));
+        assert_eq!(ha_args("homeassistant.local", Some(token)), Ok((Some("homeassistant.local".into()), token.into())));
+        assert_eq!(ha_args(token, None), Ok((None, token.into())));
+        // Mistakes are said back, and never echo the token.
+        // Two tokens: the first is never tried, or quoted, as an address.
+        for (first, second) in [
+            (token, Some(url)),
+            (token, Some("ha.home.lan")),
+            (token, Some(token)),
+            (url, None),
+            ("homeassistant.local", None),
+            ("10.0.0.4", None),
+            ("status", None),
+            ("help", None),
+        ] {
+            let e = ha_args(first, second).unwrap_err();
+            assert!(e.contains("/home ha URL TOKEN") && !e.contains(token), "{first} {second:?}: {e}");
+        }
+        assert!(looks_like_token(token) && !looks_like_token("ha.home.lan") && !looks_like_token("10.0.0.4"));
+    }
+
+    #[test]
+    fn a_lone_address_asks_for_the_token_and_connects_nowhere() {
+        let mut home = home_with(Vec::new());
+        assert!(home.configure(None, "ha http://10.0.0.4:8123").starts_with("give the token too"));
+    }
+
+    #[test]
+    fn an_attempt_that_panics_still_answers() {
+        let result: Result<(), String> = answered(|| panic!("the TLS stack fell over"));
+        assert!(result.unwrap_err().contains("went wrong"));
+        assert_eq!(answered(|| Ok::<_, String>(4)), Ok(4));
+    }
+
+    #[test]
+    fn a_word_that_isnt_a_token_looks_for_nothing() {
+        let mut home = home_with(Vec::new());
+        for word in ["status", "help", "eyJnot-quite"] {
+            let reply = home.configure(None, &format!("ha {word}"));
+            assert!(reply.starts_with("that isn't a Home Assistant token") && !reply.contains(word), "{word}: {reply}");
+        }
+        assert_eq!(home.connecting_ha, None, "no find was started");
+    }
+
+    #[test]
+    fn one_waiting_to_be_added_keeps_up_with_its_hub() {
+        let mut home = home_with(Vec::new());
+        let strip = |effects: Value| entity("ha_light", "light.strip", json!({"name": "Strip", "colour": true, "white": true, "effects": effects}));
+        home.on_listed(vec![strip(json!(["Rainbow"]))]);
+        home.on_listed(vec![strip(json!(["Fire", "Rainbow"]))]);
+        assert_eq!(home.found.len(), 1);
+        assert_eq!(home.found[0].data["effects"], json!(["Fire", "Rainbow"]));
+        home.add("light.strip");
+        assert!(home.system_prompt().contains("Fire"), "added with what the hub says now");
+    }
+
+    #[test]
+    fn a_listing_says_what_each_device_is_doing() {
+        let mut home = home_with(Vec::new());
+        let kettle = |checked| driver::Found {
+            backend: "ha_switch",
+            ip: [10, 0, 0, 4].into(),
+            mac: None,
+            unit: Some("switch.kettle".into()),
+            data: json!({"name": "Kettle"}),
+            checked,
+        };
+        home.on_found(kettle(None));
+        home.add("switch.kettle");
+        home.on_found(kettle(Some((State::Ready, "on".into()))));
+        assert_eq!(home.live["switch.kettle"], (State::Ready, "on".into()));
+    }
+
+    #[test]
+    fn home_has_one_hub_and_another_address_replaces_it() {
+        let mut home = home_with(Vec::new());
+        let (first, second) = (hub("http://10.0.0.4:8123", "a"), hub("http://10.0.0.5:8123", "b"));
+        let plug = |unit: &str| entity("ha_switch", unit, json!({"name": unit}));
+        home.ha_connected(Ok((first, "Home".into(), listing(plug("switch.kettle")))));
+        home.add("switch.kettle");
+        home.ha_connected(Ok((second.clone(), "Home".into(), listing(plug("switch.fan")))));
+        assert_eq!(home.config.ha, Some(second.clone()));
+        assert!(home.config.devices.is_empty(), "the new hub has no kettle, so it can't drive one");
+        assert_eq!(home.found.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["switch.fan"]);
+        assert!(!home.live.contains_key("switch.kettle"));
+    }
+
+    #[test]
+    fn another_homes_entity_of_the_same_id_is_not_driven() {
+        let mut home = home_with(Vec::new());
+        let light = |name: &str| entity("ha_light", "light.kitchen", json!({"name": name, "colour": true, "white": true}));
+        let desk = entity("ha_switch", "switch.desk", json!({"name": "Desk"}));
+        let first = ha::Listing { found: vec![light("Kitchen"), desk], warning: None };
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "a"), "Home".into(), first)));
+        home.add("light.kitchen");
+        home.add("switch.desk");
+        home.config.devices[0].name = "Kitchen ceiling".into();
+        // Same home's HA at a new address: the desk is still the Desk.
+        // Another HA's light.kitchen is someone's "Garage strip".
+        let second = ha::Listing { found: vec![light("Garage strip"), entity("ha_switch", "switch.desk", json!({"name": "Desk"}))], warning: None };
+        home.ha_connected(Ok((hub("http://10.0.0.9:8123", "b"), "Home".into(), second)));
+        let names: Vec<&str> = home.config.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Desk"], "kept where the new hub vouches for it, and only there");
+        assert_eq!(reached(&home, 0), Some(hub("http://10.0.0.9:8123", "b")));
+        assert_eq!(home.found.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Garage strip"], "offered, to add if wanted");
+    }
+
+    #[test]
+    fn a_test_runs_off_home_and_reports_back() {
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, notes) = std::sync::mpsc::channel();
+        let (me, requests) = std::sync::mpsc::channel();
+        let mut home = open_home(engine, ui, me);
+        let plug = Device { unit: Some("switch.fridge".into()), ..Device::new("ha_switch", "Fridge".into(), [10, 0, 0, 4].into(), None, json!({})) };
+        home.config = Config { devices: vec![plug], ..Default::default() };
+        home.handle(Request::Test("switch.fridge".into()));
+        assert_eq!(home.live["switch.fridge"].0, State::Checking, "home answers at once, the test still running");
+        let tested = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(tested, Request::Tested { .. }));
+        home.handle(tested);
+        assert!(matches!(home.live["switch.fridge"].0, State::Failed(_)), "no hub to test it through");
+        let said: Vec<String> = notes.try_iter().filter_map(|u| match u { Update::Home(t) => Some(t), _ => None }).collect();
+        assert!(said.iter().any(|t| t.starts_with("Fridge: home isn't connected")), "{said:?}");
+    }
+
+    #[test]
+    fn all_the_lights_take_as_long_as_the_slowest() {
+        let fake = ha::fake::Fake::start("t", None, |method, _, _| {
+            std::thread::sleep(Duration::from_millis(400));
+            match method {
+                "POST" => (200, "[]".into()),
+                _ => (200, json!({"state": "off", "attributes": {}}).to_string()),
+            }
+        });
+        let at = hub(&fake.url, "t");
+        let lamps: Vec<Device> = (0..8)
+            .map(|n| Device { unit: Some(format!("light.lamp_{n}")), ..Device::new("ha_light", format!("Lamp {n}"), [127, 0, 0, 1].into(), None, json!({})) })
+            .collect();
+        let mut home = home_with(lamps);
+        home.config.ha = Some(at);
+        let started = Instant::now();
+        let said = home.run_tool("light_set", &json!({"light": "all", "on": false})).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "eight lights side by side, not one after another: {:?}", started.elapsed());
+        assert!(said.starts_with("Lamp 0 is now off; Lamp 1 is now off"), "{said}");
+    }
+
+    /// What list_hub reported for each device, by id.
+    fn listed_states(hub: &ha::Hub, added: Vec<Device>) -> HashMap<String, State> {
+        let (me, requests) = std::sync::mpsc::channel();
+        list_hub(hub, added, &me);
+        drop(me);
+        requests
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::HubChecked { hub: by, id, state, .. } if by == *hub => Some((id, state)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_scan_that_outlived_its_hub_is_not_believed() {
+        let mut home = home_with(Vec::new());
+        let old = hub("http://10.0.0.4:8123", "a");
+        let kettle = || entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((old.clone(), "Home".into(), listing(kettle()))));
+        home.add("switch.kettle");
+        // Forgotten while a scan was still listing: the listing arrives late.
+        home.forget_ha();
+        home.handle(Request::Listed { hub: old.clone(), listing: listing(kettle()) });
+        home.handle(Request::HubChecked { hub: old.clone(), id: "switch.kettle".into(), state: State::Ready, detail: "on".into() });
+        assert!(home.found.is_empty() && home.config.devices.is_empty() && home.live.is_empty(), "nothing comes back from the dead");
+        // Replaced by another hub while scanning: the old one's entities aren't offered against the new.
+        let new = hub("http://10.0.0.9:8123", "b");
+        home.ha_connected(Ok((new.clone(), "Home".into(), listing(entity("ha_switch", "switch.fan", json!({"name": "Fan"}))))));
+        home.add("switch.fan");
+        home.handle(Request::Listed { hub: old.clone(), listing: listing(kettle()) });
+        home.handle(Request::HubChecked { hub: old, id: "switch.fan".into(), state: State::Offline, detail: "down".into() });
+        assert!(home.found.is_empty(), "the old hub's kettle isn't offered");
+        assert_ne!(home.live["switch.fan"].0, State::Offline, "the old hub doesn't speak for the new one's fan");
+        home.handle(Request::Listed { hub: new.clone(), listing: listing(entity("ha_switch", "switch.fan", json!({"name": "Fan"}))) });
+        home.handle(Request::HubChecked { hub: new, id: "switch.fan".into(), state: State::Offline, detail: "down".into() });
+        assert_eq!(home.live["switch.fan"].0, State::Offline, "the current hub does");
+    }
+
+    #[test]
+    fn the_same_hub_renaming_an_entity_is_a_rename() {
+        let mut home = home_with(Vec::new());
+        let at = hub("http://10.0.0.4:8123", "a");
+        let light = |name: &str| entity("ha_light", "light.kitchen", json!({"name": name, "colour": true, "white": true}));
+        home.ha_connected(Ok((at.clone(), "Home".into(), listing(light("Kitchen")))));
+        home.add("light.kitchen");
+        // Connected again to the same hub, same token: renamed in HA since.
+        home.ha_connected(Ok((at, "Home".into(), listing(light("Kitchen ceiling")))));
+        assert_eq!(home.config.devices.len(), 1, "kept: the hub that answers to this token is the one that listed it");
+        assert_eq!(home.config.devices[0].data["name"], "Kitchen ceiling", "and kept up with, as a scan would");
+        assert!(home.found.is_empty());
+    }
+
+    #[test]
+    fn an_offer_the_hub_stops_listing_goes() {
+        let mut home = home_with(Vec::new());
+        home.config.ha = Some(hub("http://10.0.0.4:8123", "a"));
+        let strip = entity("ha_light", "light.strip", json!({"name": "Strip", "colour": true, "white": true}));
+        let plug = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.on_listed(vec![strip, plug]);
+        home.add("switch.kettle");
+        // Hidden in HA since: the strip is withdrawn, the added kettle stays.
+        home.on_listed(vec![entity("ha_light", "light.desk", json!({"name": "Desk", "colour": false, "white": false}))]);
+        let offered: Vec<&str> = home.found.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(offered, ["Desk"]);
+        assert!(!home.live.contains_key("light.strip"));
+        assert_eq!(home.config.devices.len(), 1);
+    }
+
+    #[test]
+    fn finding_home_assistant_never_sends_the_token() {
+        let (mut home, notes, requests) = noted_home();
+        let token = "eyJhbGciOi.eyJpc3Mi.sig";
+        // A token alone only looks; the only way to send it is with an address typed.
+        let reply = home.configure(None, &format!("ha {token}"));
+        assert!(reply.starts_with("looking for"), "{reply}");
+        let answered = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        let Request::HaConnected { result: Err(e), .. } = &answered else { panic!("a find answers with where HA is, or isn't") };
+        assert!(!e.contains(token) && e.contains("TOKEN"), "{e}");
+        home.handle(answered);
+        assert!(home.config.ha.is_none() && home.connecting_ha.is_none());
+        assert!(said(&notes).iter().any(|t| t.starts_with("home: ") && !t.contains(token)));
+        assert!(home.configure(None, "ha find").starts_with("looking for"));
+        let url = "http://10.0.0.4:8123";
+        let e = found_only(Some(url.into()));
+        assert!(e.contains(&format!("/home ha {url} TOKEN")), "{e}");
+        assert!(found_only(None).contains("/home ha http://IP:8123 TOKEN"));
+    }
+
+    fn ha_device(backend: &str, unit: &str, hub: &ha::Hub) -> Device {
+        Device { unit: Some(unit.into()), hub: Some(hub.clone()), ..Device::new(backend, unit.into(), [127, 0, 0, 1].into(), None, json!({})) }
+    }
+
+    #[test]
+    fn a_hub_that_is_down_takes_its_devices_with_it_at_once() {
+        // Nothing listens on port 1: refused at once, as a hub that is off.
+        let down = hub("http://127.0.0.1:1", "t");
+        let added: Vec<Device> = (0..20).map(|n| ha_device("ha_switch", &format!("switch.plug_{n}"), &down)).collect();
+        let started = Instant::now();
+        let states = listed_states(&down, added);
+        assert!(started.elapsed() < Duration::from_secs(2), "one answer for all, not a wait each");
+        assert_eq!(states.len(), 20);
+        assert!(states.values().all(|s| *s == State::Offline));
+    }
+
+    #[test]
+    fn a_device_the_hub_no_longer_lists_is_checked_on_its_own() {
+        let fake = ha::fake::Fake::start("t", Some(json!([])), |_, path, _| match path {
+            "/api/states" => (200, json!([{"entity_id": "switch.kettle", "state": "on", "attributes": {}}]).to_string()),
+            _ => (200, json!({"entity_id": "switch.fan", "state": "off", "attributes": {}}).to_string()),
+        });
+        let at = hub(&fake.url, "t");
+        let states = listed_states(&at, vec![ha_device("ha_switch", "switch.kettle", &at), ha_device("ha_switch", "switch.fan", &at)]);
+        assert_eq!(states.into_iter().collect::<Vec<_>>(), [("switch.fan".to_string(), State::Ready)], "the kettle came with the listing");
+        assert!(fake.asked().contains(&"GET /api/states/switch.fan".to_string()));
+    }
+
+    #[test]
+    fn forgetting_home_assistant_drops_its_devices_and_token() {
+        let mut home = home_with(vec![light("Desk", [10, 0, 0, 5], "ESP01_SHTW1C_31")]);
+        assert!(home.configure(None, "ha forget").contains("isn't connected"));
+        let kettle = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "t"), "Home".into(), listing(kettle))));
+        home.add("switch.kettle");
+        assert_eq!(home.configure(None, "ha forget"), "disconnected Home Assistant at http://10.0.0.4:8123 and forgot its 1 device");
+        assert!(home.config.ha.is_none());
+        let names: Vec<&str> = home.config.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Desk"], "devices home drives itself stay");
+    }
+
+    #[test]
+    fn what_a_newer_hopchat_saved_survives_a_save_here() {
+        let newer = json!({"devices": [{"backend": "wiz", "name": "Desk", "ip": "10.0.0.5", "mac": "m", "room": "study"}],
+                           "hubs": [{"url": "x"}]});
+        let config: Config = serde_json::from_value(newer).unwrap();
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(saved["devices"][0]["room"], "study");
+        assert_eq!(saved["hubs"], json!([{"url": "x"}]));
+    }
+
+    #[test]
+    fn a_switch_never_claims_a_state_it_couldnt_see() {
+        // No hub to go through: setting fails before anything is claimed.
+        let plug = Device { unit: Some("switch.fridge".into()), ..Device::new("ha_switch", "Fridge".into(), [10, 0, 0, 4].into(), None, json!({})) };
+        let mut home = home_with(vec![plug]);
+        let e = home.run_tool("switch_set", &json!({"switch": "fridge", "on": false})).unwrap_err();
+        assert!(e.contains("isn't connected to Home Assistant"), "{e}");
+    }
+
+    #[test]
+    fn switches_are_named_never_all() {
+        let plug = |name: &str, entity: &str| Device {
+            unit: Some(entity.into()),
+            ..Device::new("ha_switch", name.into(), [10, 0, 0, 4].into(), None, json!({}))
+        };
+        let mut home = home_with(vec![plug("Kettle", "switch.kettle"), plug("Fridge plug", "switch.fridge")]);
+        let tools = home.tools().to_string();
+        assert!(tools.contains("switch_set") && tools.contains("\"Kettle\"") && !tools.contains("\"all\""));
+        assert!(home.system_prompt().contains("- switch \"Kettle\" (on or off)"));
+        let pick = |home: &Home, which: Option<&str>| {
+            home.pick_switch(&json!({"switch": which})).map(|(_, d)| d.name)
+        };
+        assert_eq!(pick(&home, Some("kettle")).as_deref(), Ok("Kettle"));
+        assert_eq!(pick(&home, Some("fridge")).as_deref(), Ok("Fridge plug"));
+        assert_eq!(pick(&home, None), Err("say which switch".into()));
+        assert!(home.run_tool("switch_set", &json!({"switch": "kettle"})).unwrap_err().contains("on or off"));
     }
 
     #[test]
@@ -1241,10 +2115,12 @@ mod tests {
     #[ignore = "needs a local Ollama with the model pulled"]
     fn model_picks_the_right_tools() {
         let tv = Device::new("webos", "Living room".into(), [10, 0, 0, 2].into(), None, json!({"key": "k"}));
+        let kettle = Device { unit: Some("switch.kettle".into()), ..Device::new("ha_switch", "Kettle".into(), [10, 0, 0, 4].into(), None, Value::Null) };
         let home = home_with(vec![
             light("Desk lamp", [10, 0, 0, 1], "ESP01_SHTW1C_31"),
             light("Strip", [10, 0, 0, 3], "ESP03_SHRGB1C_01"),
             tv,
+            kettle,
         ]);
         let model = Ollama::new(home.config.ollama.clone(), home.config.model.clone());
         let cases: &[(&str, &[&str])] = &[
@@ -1253,6 +2129,7 @@ mod tests {
             ("dim the desk lamp to 20% and put on netflix", &["light_set", "tv_open_app"]),
             ("turn the volume down a bit", &["tv_volume"]),
             ("is the tv on?", &["tv_status"]),
+            ("put the kettle on", &["switch_set"]),
         ];
         for (ask, want) in cases {
             let messages = vec![

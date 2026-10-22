@@ -4,7 +4,7 @@
 //! of tools for every light, whoever made it, so a small model isn't handed
 //! a tool per brand. A [`Backend`] (Wiz, LG webOS) is how one brand is
 //! found, paired and driven, and it implements its category's trait
-//! ([`LightDriver`], [`TvDriver`]) to take part in that category's tools.
+//! ([`LightDriver`], [`TvDriver`], [`SwitchDriver`]) to take part in that category's tools.
 //!
 //! A new brand of light or TV is one file implementing [`Backend`] and the
 //! category trait, plus a line in [`BACKENDS`]. A new category is a module
@@ -16,11 +16,16 @@ use std::net::Ipv4Addr;
 use serde_json::Value;
 
 use super::light::LightDriver;
+use super::switch::SwitchDriver;
 use super::tv::TvDriver;
-use super::{webos, wiz, Device, State};
+use super::{ha, webos, wiz, Device, State};
 
 /// Every backend home knows, in the order an address is probed.
-pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs];
+pub static BACKENDS: &[&dyn Backend] = &[&wiz::Wiz, &webos::WebOs, &ha::HaLight, &ha::HaTv, &ha::HaSwitch];
+
+/// The most devices home talks to at once when it has many to reach: a
+/// home can have a hundred lights, and each is a thread and a connection.
+pub const MAX_PARALLEL: usize = 16;
 
 /// The backend a device was added with; `None` for one written by a newer
 /// hopchat that knows a backend this one doesn't.
@@ -36,6 +41,7 @@ pub fn backend(id: &str) -> Option<&'static dyn Backend> {
 pub enum Category {
     Light,
     Tv,
+    Switch,
 }
 
 impl Category {
@@ -44,6 +50,7 @@ impl Category {
         match self {
             Category::Light => "Light",
             Category::Tv => "TV",
+            Category::Switch => "Switch",
         }
     }
 
@@ -52,6 +59,7 @@ impl Category {
         match self {
             Category::Light => "light",
             Category::Tv => "TV",
+            Category::Switch => "switch",
         }
     }
 
@@ -59,6 +67,7 @@ impl Category {
         match self {
             Category::Light => "💡",
             Category::Tv => "📺",
+            Category::Switch => "🔌",
         }
     }
 
@@ -67,6 +76,7 @@ impl Category {
         match self {
             Category::Light => format!("dim the {name}"),
             Category::Tv => format!("put netflix on the {name}"),
+            Category::Switch => format!("turn on the {name}"),
         }
     }
 }
@@ -76,8 +86,13 @@ pub struct Found {
     pub backend: &'static str,
     pub ip: Ipv4Addr,
     pub mac: Option<String>,
+    /// Which thing behind that address, as in [`Device::unit`].
+    pub unit: Option<String>,
     /// Whatever the backend keeps about it, as in [`Device::data`].
     pub data: Value,
+    /// What it is doing, when whatever found it knows already: a hub's
+    /// listing has every entity's state, so none needs asking again.
+    pub checked: Option<(State, String)>,
 }
 
 /// What the Devices panel says about pairing one of these.
@@ -96,13 +111,26 @@ pub trait Backend: Sync {
     fn label(&self) -> &'static str;
 
     /// Reports everything of this kind on the network as it answers. Runs
-    /// on its own thread, beside the other backends' scans.
-    fn discover(&self, each: &dyn Fn(Found));
+    /// on its own thread, beside the other backends' scans. Nothing, for
+    /// one a hub lists instead.
+    fn discover(&self, _each: &dyn Fn(Found)) {}
     /// What is at `ip`, if it is one of these: for a device the scan can't
     /// see (another subnet, broadcasts blocked). Must not change anything
     /// on the device.
-    fn probe(&self, ip: Ipv4Addr) -> Option<Found>;
+    fn probe(&self, _ip: Ipv4Addr) -> Option<Found> {
+        None
+    }
+    /// Whether a hub home connected to lists these, rather than a scan
+    /// finding them; such a device is handed its hub in [`Device::hub`].
+    fn listed_by_hub(&self) -> bool {
+        false
+    }
 
+    /// What it calls itself, to name it by when found; `None` to name it
+    /// after its category.
+    fn name(&self, _d: &Device) -> Option<String> {
+        None
+    }
     /// A few words for the model about one, e.g. "white tones".
     fn about(&self, d: &Device) -> String;
     /// What the Devices panel says about one it found.
@@ -136,6 +164,9 @@ pub trait Backend: Sync {
         None
     }
     fn as_tv(&self) -> Option<&dyn TvDriver> {
+        None
+    }
+    fn as_switch(&self) -> Option<&dyn SwitchDriver> {
         None
     }
 }
