@@ -342,6 +342,8 @@ pub enum Request {
     SetGroup { group: String, on: bool },
     // Results from home's own worker threads.
     Found(driver::Found),
+    /// Everything a hub listed, at once.
+    Listed(Vec<driver::Found>),
     ScanDone,
     Checked { id: String, state: State, detail: String },
     /// `/home ha` reached a Home Assistant: the hub and what it has, or
@@ -609,6 +611,7 @@ impl Home {
                 self.note(reply);
             }
             Request::Found(found) => self.on_found(found),
+            Request::Listed(found) => self.on_listed(found),
             Request::HaConnected(result) => self.ha_connected(result),
             Request::ScanDone => self.scanning = false,
             Request::Checked { id, state, detail } => self.checked(id, state, detail),
@@ -652,8 +655,8 @@ impl Home {
                 }
             };
             let listing = hub.map(|hub| {
-                let (each, me) = (each.clone(), me.clone());
-                thread::spawn(move || list_hub(&hub, listed_by_hub, &me, each))
+                let me = me.clone();
+                thread::spawn(move || list_hub(&hub, listed_by_hub, &me))
             });
             discover::scan(each);
             if let Some(listing) = listing {
@@ -683,7 +686,26 @@ impl Home {
     }
 
     fn on_found(&mut self, f: driver::Found) {
-        let Some(backend) = driver::backend(f.backend) else { return };
+        if self.learn(f) {
+            self.save();
+        }
+    }
+
+    /// Everything a hub listed, saved once rather than once per entity.
+    fn on_listed(&mut self, found: Vec<driver::Found>) {
+        let mut changed = false;
+        for f in found {
+            changed |= self.learn(f);
+        }
+        if changed {
+            self.save();
+        }
+    }
+
+    /// Takes in a found device: offers it, or updates the one already
+    /// here. Whether an added device changed, for the caller to save.
+    fn learn(&mut self, f: driver::Found) -> bool {
+        let Some(backend) = driver::backend(f.backend) else { return false };
         // Something we already have, perhaps at a new address.
         if let Some(d) = self.config.devices.iter_mut().find(|d| d.same(&f)) {
             let mut changed = false;
@@ -725,9 +747,6 @@ impl Home {
                 }
             }
             let d = d.clone();
-            if changed {
-                self.save();
-            }
             if let Some(moved) = moved {
                 self.note(moved);
             }
@@ -735,16 +754,27 @@ impl Home {
                 Some((state, detail)) => self.checked(d.id(), state, detail),
                 None => self.check(d),
             }
-            return;
+            return changed;
         }
-        if self.found.iter().any(|d| d.same(&f)) {
-            return;
+        if let Some(d) = self.found.iter_mut().find(|d| d.same(&f)) {
+            // One waiting to be added keeps up with what its hub says too.
+            if f.unit.is_some() {
+                d.data = f.data;
+                if !f.ip.is_unspecified() {
+                    d.ip = f.ip;
+                }
+                if let Some((State::New, detail)) = self.live.get_mut(&d.id()) {
+                    *detail = backend.found_detail(d);
+                }
+            }
+            return false;
         }
         let mut d = Device { unit: f.unit, ..Device::new(f.backend, String::new(), f.ip, f.mac, f.data) };
         let called = backend.name(&d).map(|n| clean_name(&n)).filter(|n| !n.is_empty());
         d.name = self.free_name(called.as_deref().unwrap_or(backend.category().noun()));
         self.live.insert(d.id(), (State::New, backend.found_detail(&d)));
         self.found.push(d);
+        false
     }
 
     /// `base`, or `base 2`, `base 3`… whichever no device, added or
@@ -971,11 +1001,9 @@ impl Home {
         if let Some(old) = before {
             self.note(format!("home: Home Assistant at {old} is replaced by the one at {url}"));
         }
-        self.save();
         let before = self.found.len();
-        for f in found {
-            self.on_found(f);
-        }
+        self.on_listed(found);
+        self.save();
         let new = self.found.len() - before;
         if let Some(warning) = warning {
             self.note(format!("home: {warning}"));
@@ -1094,7 +1122,7 @@ impl Home {
 /// "checking"; those checks run side by side, like any other device's.
 /// A hub that can't be listed can't drive anything either, so its
 /// devices are all offline at once rather than after a wait each.
-fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<Request>, each: impl Fn(driver::Found)) {
+fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<Request>) {
     let found = match hub.entities() {
         Ok(listing) => listing.found,
         Err(e) => {
@@ -1105,7 +1133,7 @@ fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<Request>, each: impl 
         }
     };
     let listed = ha::listed(&found);
-    found.into_iter().for_each(each);
+    let _ = me.send(Request::Listed(found));
     let checks: Vec<_> = added
         .into_iter()
         .filter(|d| !d.unit.as_ref().is_some_and(|u| listed.contains(u)))
@@ -1631,6 +1659,18 @@ mod tests {
     }
 
     #[test]
+    fn one_waiting_to_be_added_keeps_up_with_its_hub() {
+        let mut home = home_with(Vec::new());
+        let strip = |effects: Value| entity("ha_light", "light.strip", json!({"name": "Strip", "colour": true, "white": true, "effects": effects}));
+        home.on_listed(vec![strip(json!(["Rainbow"]))]);
+        home.on_listed(vec![strip(json!(["Fire", "Rainbow"]))]);
+        assert_eq!(home.found.len(), 1);
+        assert_eq!(home.found[0].data["effects"], json!(["Fire", "Rainbow"]));
+        home.add("light.strip");
+        assert!(home.system_prompt().contains("Fire"), "added with what the hub says now");
+    }
+
+    #[test]
     fn a_listing_says_what_each_device_is_doing() {
         let mut home = home_with(Vec::new());
         let kettle = |checked| driver::Found {
@@ -1662,7 +1702,7 @@ mod tests {
     /// What list_hub reported for each device, by id.
     fn listed_states(hub: &ha::Hub, added: Vec<Device>) -> HashMap<String, State> {
         let (me, requests) = std::sync::mpsc::channel();
-        list_hub(hub, added, &me, |_| {});
+        list_hub(hub, added, &me);
         drop(me);
         requests
             .into_iter()
