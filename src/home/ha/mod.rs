@@ -16,7 +16,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::OnceLock;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -24,11 +23,20 @@ use serde_json::{json, Value};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::Message;
 
-use super::driver::{backend_of, Backend, Category, Found};
-use super::light::{scene_key, Caps, LightDriver, Pilot};
-use super::switch::SwitchDriver;
-use super::tv::TvDriver;
+use super::driver::{backend_of, Found};
+use super::light::scene_key;
 use super::{Device, State};
+
+mod lights;
+mod switches;
+mod tvs;
+
+pub use lights::HaLight;
+pub use switches::HaSwitch;
+pub use tvs::HaTv;
+use lights::describe_light;
+use switches::describe_switch;
+use tvs::describe_tv;
 
 /// Where HA listens unless told otherwise.
 const PORT: u16 = 8123;
@@ -457,424 +465,13 @@ fn called(d: &Device) -> Option<String> {
     d.data.get("name").and_then(Value::as_str).map(str::to_string)
 }
 
-// ----- lights ---------------------------------------------------------------
-
-/// Lights Home Assistant drives, as a home backend.
-pub struct HaLight;
-
-impl Backend for HaLight {
-    fn id(&self) -> &'static str {
-        "ha_light"
-    }
-
-    fn category(&self) -> Category {
-        Category::Light
-    }
-
-    fn label(&self) -> &'static str {
-        "Home Assistant lights"
-    }
-
-    fn listed_by_hub(&self) -> bool {
-        true
-    }
-
-    fn name(&self, d: &Device) -> Option<String> {
-        called(d)
-    }
-
-    fn about(&self, d: &Device) -> String {
-        // Listed before "dims" was kept: assume it dims, as it used to.
-        let dims = d.data.get("dims").and_then(Value::as_bool).unwrap_or(true);
-        if dims { self.caps(d).describe().into() } else { "on or off only".into() }
-    }
-
-    fn found_detail(&self, d: &Device) -> String {
-        format!("Home Assistant · {}", self.about(d))
-    }
-
-    fn check(&self, d: &Device) -> (State, String) {
-        check_entity(d, describe_light)
-    }
-
-    /// Flashes it where HA can, else switches it the other way and back.
-    fn test(&self, d: &mut Device) -> Result<String, String> {
-        let hub = Hub::of(d)?;
-        let entity = entity(d)?;
-        let on = hub.state(entity)?.get("state").and_then(Value::as_str) == Some("on");
-        if on && flag(d, "flash") {
-            hub.call("light.turn_on", entity, json!({"flash": "short"}))?;
-            return Ok(format!("{} flashed", d.name));
-        }
-        let (first, then) = if on { ("light.turn_off", "light.turn_on") } else { ("light.turn_on", "light.turn_off") };
-        hub.call(first, entity, json!({}))?;
-        thread::sleep(Duration::from_secs(1));
-        hub.call(then, entity, json!({}))?;
-        Ok(format!("{} blinked", d.name))
-    }
-
-    fn test_help(&self) -> &'static str {
-        " blinks it so you can find it"
-    }
-
-    fn as_light(&self) -> Option<&dyn LightDriver> {
-        Some(self)
-    }
-}
-
-impl LightDriver for HaLight {
-    fn caps(&self, d: &Device) -> Caps {
-        Caps { colour: flag(d, "colour"), white: flag(d, "white") }
-    }
-
-    fn scenes(&self, d: &Device) -> Vec<String> {
-        let effects = d.data.get("effects").and_then(Value::as_array);
-        effects.into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
-    }
-
-    fn set(&self, d: &Device, pilot: &Pilot) -> Result<Option<String>, String> {
-        let Some((service, body)) = light_call(pilot, &self.scenes(d), flag(d, "stops"))
-            .map_err(|scene| format!("{} has no scene called {scene}", d.name))?
-        else {
-            return Ok(None);
-        };
-        let now = Hub::of(d)?.call(service, entity(d)?, body)?;
-        Ok(now.as_ref().map(describe_light))
-    }
-
-    fn status(&self, d: &Device) -> Result<String, String> {
-        let hub = Hub::of(d)?;
-        Ok(describe_light(&hub.state(entity(d)?)?))
-    }
-}
-
-/// The service call that makes a light do what `pilot` asks, given the
-/// effects it has and whether "off" stops one; `None` when it asks for
-/// nothing, and the scene asked for when the light has no such effect.
-/// Asked to switch off, it switches off, whatever else came with it.
-fn light_call(pilot: &Pilot, effects: &[String], stops: bool) -> Result<Option<(&'static str, Value)>, String> {
-    let changes = pilot.brightness.is_some() || pilot.kelvin.is_some() || pilot.rgb.is_some() || pilot.scene.is_some();
-    if pilot.on == Some(false) {
-        return Ok(Some(("light.turn_off", json!({}))));
-    }
-    if pilot.on.is_none() && !changes {
-        return Ok(None);
-    }
-    let mut body = json!({});
-    if let Some(b) = pilot.brightness {
-        body["brightness_pct"] = json!(b.clamp(1, 100));
-    }
-    if let Some(k) = pilot.kelvin {
-        body["color_temp_kelvin"] = json!(k);
-    }
-    if let Some((r, g, b)) = pilot.rgb {
-        body["rgb_color"] = json!([r, g, b]);
-    }
-    if let Some(scene) = &pilot.scene {
-        let wanted = scene_key(scene);
-        // HA wants the effect as the light spells it.
-        let effect = effects.iter().find(|e| scene_key(e) == wanted).ok_or_else(|| scene.clone())?;
-        body["effect"] = json!(effect);
-    } else if (pilot.kelvin.is_some() || pilot.rgb.is_some()) && stops {
-        // Or the colour asked for hides behind whatever effect is running.
-        body["effect"] = json!("off");
-    }
-    Ok(Some(("light.turn_on", body)))
-}
-
-/// A light's state as "on · 40% · 2700K".
-fn describe_light(state: &Value) -> String {
-    let on = state.get("state").and_then(Value::as_str) == Some("on");
-    if !on {
-        return "off".into();
-    }
-    let attrs = &state["attributes"];
-    let mut parts = vec!["on".to_string()];
-    if let Some(b) = attrs.get("brightness").and_then(Value::as_f64) {
-        parts.push(format!("{}%", (b * 100.0 / 255.0).round() as u8));
-    }
-    let effect = attrs.get("effect").and_then(Value::as_str).filter(|e| !e.is_empty() && !is_off(e));
-    let mode = attrs.get("color_mode").and_then(Value::as_str).unwrap_or_default();
-    if let Some(effect) = effect {
-        parts.push(effect.to_string());
-    } else if mode == "color_temp" {
-        if let Some(k) = attrs.get("color_temp_kelvin").and_then(Value::as_u64) {
-            parts.push(format!("{k}K"));
-        }
-    } else if let Some([r, g, b]) = attrs.get("rgb_color").and_then(Value::as_array).map(|c| {
-        let c: Vec<u8> = c.iter().filter_map(Value::as_u64).map(|v| v as u8).collect();
-        [c.first().copied().unwrap_or(0), c.get(1).copied().unwrap_or(0), c.get(2).copied().unwrap_or(0)]
-    }) {
-        parts.push(format!("#{r:02x}{g:02x}{b:02x}"));
-    }
-    parts.join(" · ")
-}
-
-// ----- TVs ------------------------------------------------------------------
-
-/// TVs Home Assistant drives, as media players.
-pub struct HaTv;
-
-impl Backend for HaTv {
-    fn id(&self) -> &'static str {
-        "ha_tv"
-    }
-
-    fn category(&self) -> Category {
-        Category::Tv
-    }
-
-    fn label(&self) -> &'static str {
-        "Home Assistant TVs"
-    }
-
-    fn listed_by_hub(&self) -> bool {
-        true
-    }
-
-    fn name(&self, d: &Device) -> Option<String> {
-        called(d)
-    }
-
-    fn about(&self, _d: &Device) -> String {
-        "through Home Assistant".into()
-    }
-
-    fn found_detail(&self, _d: &Device) -> String {
-        "Home Assistant · TV".into()
-    }
-
-    fn check(&self, d: &Device) -> (State, String) {
-        check_entity(d, describe_tv)
-    }
-
-    /// Nothing an HA media player does is a harmless hello, so this only
-    /// says what it is doing.
-    fn test(&self, d: &mut Device) -> Result<String, String> {
-        self.status(d).map(|state| format!("{} is {state}", d.name))
-    }
-
-    fn test_help(&self) -> &'static str {
-        " shows what it is doing"
-    }
-
-    fn as_tv(&self) -> Option<&dyn TvDriver> {
-        Some(self)
-    }
-}
-
-/// How to move a TV's volume by `change` percentage points.
-#[derive(Debug, PartialEq)]
-enum Volume {
-    /// To this level, 0 to 1, in one call.
-    Set(f64),
-    /// By this many of the integration's own steps, for one that can't be
-    /// set to a level.
-    Step(u8),
-}
-
-/// The same `change` means the same on every TV: points of volume, not
-/// whatever one `volume_up` happens to move by.
-fn volume_change(state: &Value, change: i8) -> Volume {
-    match state["attributes"].get("volume_level").and_then(Value::as_f64) {
-        Some(now) if features(state) & VOLUME_SET != 0 => {
-            Volume::Set((((now * 100.0).round() + f64::from(change)) / 100.0).clamp(0.0, 1.0))
-        }
-        _ => Volume::Step(change.unsigned_abs().div_ceil(VOLUME_STEP).max(1)),
-    }
-}
-
-impl TvDriver for HaTv {
-    fn power(&self, d: &mut Device, on: bool) -> Result<String, String> {
-        let service = if on { "media_player.turn_on" } else { "media_player.turn_off" };
-        Hub::of(d)?.call(service, entity(d)?, json!({}))?;
-        Ok(format!("{} is turning {}", d.name, if on { "on" } else { "off" }))
-    }
-
-    fn volume(&self, d: &mut Device, level: Option<u8>, change: Option<i8>, mute: Option<bool>) -> Result<String, String> {
-        let hub = Hub::of(d)?;
-        let entity = entity(d)?;
-        if let Some(mute) = mute {
-            hub.call("media_player.volume_mute", entity, json!({"is_volume_muted": mute}))?;
-        }
-        let set = |level: f64| hub.call("media_player.volume_set", entity, json!({"volume_level": level}));
-        if let Some(level) = level {
-            set(f64::from(level.min(100)) / 100.0)?;
-        } else if let Some(change) = change.filter(|c| *c != 0) {
-            match volume_change(&hub.state(entity)?, change) {
-                Volume::Set(level) => {
-                    set(level)?;
-                }
-                Volume::Step(steps) => {
-                    let service = if change > 0 { "media_player.volume_up" } else { "media_player.volume_down" };
-                    for _ in 0..steps {
-                        hub.call(service, entity, json!({}))?;
-                    }
-                }
-            }
-        }
-        self.status(d).map(|state| format!("{} is {state}", d.name))
-    }
-
-    fn status(&self, d: &mut Device) -> Result<String, String> {
-        Ok(describe_tv(&Hub::of(d)?.state(entity(d)?)?))
-    }
-
-    /// An app and an input are both a source to HA.
-    fn open_app(&self, d: &mut Device, app: &str) -> Result<String, String> {
-        self.source(d, app)
-    }
-
-    fn input(&self, d: &mut Device, input: &str) -> Result<String, String> {
-        self.source(d, input)
-    }
-
-    fn media(&self, d: &mut Device, action: &str) -> Result<String, String> {
-        let service = match action {
-            "play" => "media_player.media_play",
-            "pause" => "media_player.media_pause",
-            "stop" => "media_player.media_stop",
-            _ => return Err(format!("{} can't {action} through Home Assistant", d.name)),
-        };
-        Hub::of(d)?.call(service, entity(d)?, json!({}))?;
-        Ok(format!("{} did {action}", d.name))
-    }
-}
-
-impl HaTv {
-    /// Switches to the source whose name `wanted` is, or is part of.
-    fn source(&self, d: &mut Device, wanted: &str) -> Result<String, String> {
-        let hub = Hub::of(d)?;
-        let entity = entity(d)?;
-        let state = hub.state(entity)?;
-        let sources: Vec<&str> = state["attributes"]
-            .get("source_list")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        let Some(source) = pick_source(&sources, wanted) else {
-            return Err(if sources.is_empty() {
-                format!("{} has no sources to switch to", d.name)
-            } else {
-                format!("{} has no {wanted}; it has {}", d.name, sources.join(", "))
-            });
-        };
-        hub.call("media_player.select_source", entity, json!({"source": source}))?;
-        Ok(format!("{} switched to {source}", d.name))
-    }
-}
-
-/// The source `wanted` means: the same name, else the one it is part of,
-/// ignoring case, spaces and punctuation ("hdmi 1" is "HDMI_1").
-fn pick_source<'a>(sources: &[&'a str], wanted: &str) -> Option<&'a str> {
-    let key = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
-    let wanted = key(wanted);
-    if wanted.is_empty() {
-        return None;
-    }
-    sources
-        .iter()
-        .find(|s| key(s) == wanted)
-        .or_else(|| sources.iter().find(|s| key(s).contains(&wanted)))
-        .copied()
-}
-
-/// A TV's state as "on · Netflix · volume 20".
-fn describe_tv(state: &Value) -> String {
-    let power = state.get("state").and_then(Value::as_str).unwrap_or("unknown");
-    if matches!(power, "off" | "standby" | "unavailable") {
-        return power.into();
-    }
-    let attrs = &state["attributes"];
-    let mut parts = vec![power.to_string()];
-    let showing = ["media_title", "app_name", "source"]
-        .iter()
-        .find_map(|k| attrs.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()));
-    if let Some(showing) = showing {
-        parts.push(showing.to_string());
-    }
-    if attrs.get("is_volume_muted").and_then(Value::as_bool) == Some(true) {
-        parts.push("muted".into());
-    } else if let Some(v) = attrs.get("volume_level").and_then(Value::as_f64) {
-        parts.push(format!("volume {}", (v * 100.0).round() as u8));
-    }
-    parts.join(" · ")
-}
-
-// ----- switches -------------------------------------------------------------
-
-/// Plugs and switches Home Assistant drives.
-pub struct HaSwitch;
-
-impl Backend for HaSwitch {
-    fn id(&self) -> &'static str {
-        "ha_switch"
-    }
-
-    fn category(&self) -> Category {
-        Category::Switch
-    }
-
-    fn label(&self) -> &'static str {
-        "Home Assistant switches"
-    }
-
-    fn listed_by_hub(&self) -> bool {
-        true
-    }
-
-    fn name(&self, d: &Device) -> Option<String> {
-        called(d)
-    }
-
-    fn about(&self, _d: &Device) -> String {
-        "on or off".into()
-    }
-
-    fn found_detail(&self, _d: &Device) -> String {
-        "Home Assistant · switch".into()
-    }
-
-    fn check(&self, d: &Device) -> (State, String) {
-        check_entity(d, describe_switch)
-    }
-
-    /// Flipping an unknown plug to find it could switch off the fridge, so
-    /// this only says whether it is on.
-    fn test(&self, d: &mut Device) -> Result<String, String> {
-        SwitchDriver::status(self, d).map(|state| format!("{} is {state}", d.name))
-    }
-
-    fn test_help(&self) -> &'static str {
-        " shows whether it is on"
-    }
-
-    fn as_switch(&self) -> Option<&dyn SwitchDriver> {
-        Some(self)
-    }
-}
-
-impl SwitchDriver for HaSwitch {
-    fn set(&self, d: &Device, on: bool) -> Result<Option<String>, String> {
-        let service = if on { "switch.turn_on" } else { "switch.turn_off" };
-        let now = Hub::of(d)?.call(service, entity(d)?, json!({}))?;
-        Ok(now.as_ref().map(describe_switch))
-    }
-
-    fn status(&self, d: &Device) -> Result<String, String> {
-        Ok(describe_switch(&Hub::of(d)?.state(entity(d)?)?))
-    }
-}
-
-fn describe_switch(state: &Value) -> String {
-    state.get("state").and_then(Value::as_str).unwrap_or("unknown").to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::home::driver::Backend;
+    use crate::home::light::{Caps, LightDriver, Pilot};
+    use crate::home::switch::SwitchDriver;
+    use crate::home::tv::TvDriver;
 
     #[test]
     fn urls_as_typed() {
@@ -935,16 +532,6 @@ mod tests {
     }
 
     #[test]
-    fn an_on_off_light_says_it_only_switches() {
-        let state = json!({"state": "off", "attributes": {"supported_color_modes": ["onoff"]}});
-        let (backend, data) = describe("light.porch", &state).unwrap();
-        let d = Device::new(backend, "Porch".into(), Ipv4Addr::UNSPECIFIED, None, data);
-        assert_eq!(HaLight.about(&d), "on or off only");
-        let older = Device::new("ha_light", "Hall".into(), Ipv4Addr::UNSPECIFIED, None, json!({}));
-        assert_eq!(HaLight.about(&older), "dimmable", "listed before dims was kept");
-    }
-
-    #[test]
     fn listings_carry_each_entitys_state() {
         let off = json!({"state": "off", "attributes": {}});
         assert_eq!(checked(&off, state_of("ha_light")), (State::Ready, "off".into()));
@@ -952,19 +539,6 @@ mod tests {
         assert_eq!(checked(&gone, state_of("ha_switch")).0, State::Offline);
         let tv = json!({"state": "playing", "attributes": {"source": "Netflix"}});
         assert_eq!(checked(&tv, state_of("ha_tv")).1, "playing · Netflix");
-    }
-
-    #[test]
-    fn light_states_read_like_wiz() {
-        let warm = json!({"state": "on", "attributes": {"brightness": 102, "color_mode": "color_temp", "color_temp_kelvin": 2700}});
-        assert_eq!(describe_light(&warm), "on · 40% · 2700K");
-        let red = json!({"state": "on", "attributes": {"brightness": 255, "color_mode": "hs", "rgb_color": [255, 0, 0]}});
-        assert_eq!(describe_light(&red), "on · 100% · #ff0000");
-        let effect = json!({"state": "on", "attributes": {"color_mode": "hs", "effect": "Rainbow"}});
-        assert_eq!(describe_light(&effect), "on · Rainbow");
-        let stopped = json!({"state": "on", "attributes": {"color_mode": "color_temp", "effect": "off", "color_temp_kelvin": 3000}});
-        assert_eq!(describe_light(&stopped), "on · 3000K");
-        assert_eq!(describe_light(&json!({"state": "off", "attributes": {}})), "off");
     }
 
     #[test]
@@ -1004,71 +578,10 @@ mod tests {
     }
 
     #[test]
-    fn light_calls() {
-        let effects = vec!["Rainbow".to_string(), "Night-Light".to_string()];
-        let call = |pilot: Pilot, stops: bool| light_call(&pilot, &effects, stops);
-        assert_eq!(call(Pilot::default(), false), Ok(None), "nothing asked, nothing sent");
-        assert_eq!(call(Pilot { on: Some(false), ..Default::default() }, false), Ok(Some(("light.turn_off", json!({})))));
-        assert_eq!(
-            call(Pilot { on: Some(false), brightness: Some(30), ..Default::default() }, false),
-            Ok(Some(("light.turn_off", json!({})))),
-            "off means off, as it does on a Wiz",
-        );
-        assert_eq!(call(Pilot { on: Some(true), ..Default::default() }, false), Ok(Some(("light.turn_on", json!({})))));
-        assert_eq!(
-            call(Pilot { scene: Some("night light".into()), ..Default::default() }, true),
-            Ok(Some(("light.turn_on", json!({"effect": "Night-Light"})))),
-            "the effect as the light spells it",
-        );
-        assert_eq!(call(Pilot { scene: Some("fire".into()), ..Default::default() }, true), Err("fire".into()));
-        assert_eq!(
-            call(Pilot { rgb: Some((255, 0, 0)), brightness: Some(0), ..Default::default() }, true),
-            Ok(Some(("light.turn_on", json!({"rgb_color": [255, 0, 0], "brightness_pct": 1, "effect": "off"})))),
-            "a colour stops a running effect",
-        );
-        assert_eq!(
-            call(Pilot { kelvin: Some(2700), ..Default::default() }, false),
-            Ok(Some(("light.turn_on", json!({"color_temp_kelvin": 2700})))),
-            "no \"off\" to send when the light has none",
-        );
-    }
-
-    #[test]
-    fn volume_moves_by_points_on_every_tv() {
-        let tv = |level: f64, features: u64| json!({"attributes": {"volume_level": level, "supported_features": features}});
-        assert_eq!(volume_change(&tv(0.2, VOLUME_SET), -3), Volume::Set(0.17));
-        assert_eq!(volume_change(&tv(0.98, VOLUME_SET | 8), 5), Volume::Set(1.0));
-        assert_eq!(volume_change(&tv(0.01, VOLUME_SET), -5), Volume::Set(0.0));
-        // Without a level to set, HA's own steps, a tenth each.
-        assert_eq!(volume_change(&tv(0.2, 0), -3), Volume::Step(1));
-        assert_eq!(volume_change(&tv(0.2, 0), 15), Volume::Step(2));
-        assert_eq!(volume_change(&json!({"attributes": {"supported_features": VOLUME_SET}}), 1), Volume::Step(1));
-    }
-
-    #[test]
     fn which_devices_are_home_assistants() {
         let d = |backend: &str| Device::new(backend, "x".into(), Ipv4Addr::UNSPECIFIED, None, Value::Null);
         assert!(drives(&d("ha_light")) && drives(&d("ha_tv")) && drives(&d("ha_switch")));
         assert!(!drives(&d("wiz")) && !drives(&d("webos")) && !drives(&d("ha_something_newer")));
-    }
-
-    #[test]
-    fn sources_by_what_people_say() {
-        let sources = ["HDMI_1", "HDMI 2", "Netflix", "YouTube TV"];
-        assert_eq!(pick_source(&sources, "hdmi 1"), Some("HDMI_1"));
-        assert_eq!(pick_source(&sources, "netflix"), Some("Netflix"));
-        assert_eq!(pick_source(&sources, "youtube"), Some("YouTube TV"));
-        assert_eq!(pick_source(&sources, "disney+"), None);
-        assert_eq!(pick_source(&sources, "+"), None);
-    }
-
-    #[test]
-    fn tv_states() {
-        let on = json!({"state": "playing", "attributes": {"source": "Netflix", "volume_level": 0.2, "is_volume_muted": false}});
-        assert_eq!(describe_tv(&on), "playing · Netflix · volume 20");
-        let muted = json!({"state": "on", "attributes": {"app_name": "YouTube", "is_volume_muted": true}});
-        assert_eq!(describe_tv(&muted), "on · YouTube · muted");
-        assert_eq!(describe_tv(&json!({"state": "off", "attributes": {}})), "off");
     }
 
     /// Lists and drives a real Home Assistant. `HA_URL=… HA_TOKEN=… cargo
