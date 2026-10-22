@@ -11,6 +11,24 @@ use serde_json::Value;
 use crate::home::driver::{backend_of, Found, MAX_PARALLEL};
 use crate::home::{ha, Device, Home, Request, State};
 
+/// How the hub `/home ha` just reached relates to the one home had, which
+/// decides what vouches for the devices home already has from it.
+#[derive(Clone, Copy, PartialEq)]
+enum Reconnect {
+    /// The same address and token: the hub a scan has been listing all
+    /// along. A device it lists is kept, and a changed name is a rename
+    /// in HA, kept up with as a scan would.
+    Same,
+    /// The first hub, or a new token at the same address. A device it
+    /// leaves out stays, as it may only be hidden in HA since; one it
+    /// lists under another name goes, since another Home Assistant may
+    /// answer there now, and is added again knowingly.
+    NewToken,
+    /// Another address. A device stays only where the new hub lists its
+    /// entity id under the same HA name.
+    Moved,
+}
+
 /// The address and token typed after `/home ha`: `[URL] TOKEN`, in that
 /// order. Anything else is said back as a mistake rather than guessed
 /// at, so a token is never tried as an address, shown back as one, or
@@ -133,12 +151,15 @@ impl Home {
         // this one moved, or a replacement for it.
         let url = hub.url.clone();
         let before = self.config.ha.replace(hub);
-        let same = before.as_ref() == self.config.ha.as_ref();
-        let moved = before.map(|h| h.url).filter(|old| *old != url);
-        if let Some(old) = &moved {
-            self.note(format!("home: Home Assistant at {old} is replaced by the one at {url}"));
-        }
-        let gone = self.keep_what_the_hub_vouches_for(&found, moved.is_some(), same);
+        let reconnect = match before {
+            Some(old) if self.config.ha.as_ref() == Some(&old) => Reconnect::Same,
+            Some(old) if old.url != url => {
+                self.note(format!("home: Home Assistant at {} is replaced by the one at {url}", old.url));
+                Reconnect::Moved
+            }
+            _ => Reconnect::NewToken,
+        };
+        let gone = self.keep_what_the_hub_vouches_for(&found, reconnect);
         self.drop_unlisted_offers(&ha::listed(&found));
         if !gone.is_empty() {
             let one = gone.len() == 1;
@@ -167,20 +188,11 @@ impl Home {
     /// listed doesn't vouch for, and says which added ones went. An entity
     /// id is only unique within one Home Assistant: another one's
     /// `light.kitchen` may be a different light, and the device people
-    /// call "Kitchen" mustn't silently drive it.
-    ///
-    /// The `same` hub as before, address and token alike, is the one a
-    /// scan has been listing all along, and a changed name is a rename in
-    /// HA, kept up with as a scan would. Otherwise: when the hub `moved`
-    /// to another address, a device stays only where the new one lists
-    /// its entity id under the same HA name. At the same address with a
-    /// new token, one the listing leaves out stays (it may be hidden in
-    /// HA since), and only one listed under another name goes: another
-    /// Home Assistant answers there now, or the entity was renamed, and
-    /// either way it is added again knowingly. A device whose HA name was
-    /// never kept can't be told apart that way, so it stays wherever its
-    /// entity id is listed. Saving is left to the caller.
-    fn keep_what_the_hub_vouches_for(&mut self, listed: &[Found], moved: bool, same: bool) -> Vec<String> {
+    /// call "Kitchen" mustn't silently drive it. What vouches for a device
+    /// depends on the [`Reconnect`]. A device whose HA name was never kept
+    /// can't be told apart by name, so it stays wherever its entity id is
+    /// listed. Saving is left to the caller.
+    fn keep_what_the_hub_vouches_for(&mut self, listed: &[Found], reconnect: Reconnect) -> Vec<String> {
         let names: HashMap<&str, Option<&str>> = listed
             .iter()
             .filter_map(|f| Some((f.unit.as_deref()?, f.data.get("name").and_then(Value::as_str))))
@@ -189,13 +201,15 @@ impl Home {
             if !ha::drives(d) {
                 return true;
             }
-            match d.unit.as_deref().and_then(|u| names.get(u)) {
-                None => !moved,
-                Some(_) if same => true,
-                Some(listed) => match d.data.get("name").and_then(Value::as_str) {
-                    None => true,
-                    Some(named) => *listed == Some(named),
-                },
+            let Some(listed) = d.unit.as_deref().and_then(|u| names.get(u)) else {
+                return reconnect != Reconnect::Moved;
+            };
+            if reconnect == Reconnect::Same {
+                return true;
+            }
+            match d.data.get("name").and_then(Value::as_str) {
+                None => true,
+                Some(named) => *listed == Some(named),
             }
         };
         let (kept, gone): (Vec<Device>, Vec<Device>) = std::mem::take(&mut self.config.devices).into_iter().partition(keep);
