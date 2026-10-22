@@ -82,7 +82,7 @@ fn volume_change(state: &Value, change: i8) -> Volume {
 impl TvDriver for HaTv {
     fn power(&self, d: &mut Device, on: bool) -> Result<String, String> {
         let service = if on { "media_player.turn_on" } else { "media_player.turn_off" };
-        Hub::of(d)?.call(service, entity(d)?, json!({}))?;
+        Hub::of(d)?.drive(service, entity(d)?, json!({}), describe_tv)?;
         Ok(format!("{} is turning {}", d.name, if on { "on" } else { "off" }))
     }
 
@@ -131,7 +131,7 @@ impl TvDriver for HaTv {
             "stop" => "media_player.media_stop",
             _ => return Err(format!("{} can't {action} through Home Assistant", d.name)),
         };
-        Hub::of(d)?.call(service, entity(d)?, json!({}))?;
+        Hub::of(d)?.drive(service, entity(d)?, json!({}), describe_tv)?;
         Ok(format!("{} did {action}", d.name))
     }
 }
@@ -156,7 +156,7 @@ impl HaTv {
                 format!("{} has no {wanted}; it has {}", d.name, sources.join(", "))
             });
         };
-        hub.call("media_player.select_source", entity, json!({"source": source}))?;
+        hub.drive("media_player.select_source", entity, json!({"source": source}), describe_tv)?;
         Ok(format!("{} switched to {source}", d.name))
     }
 }

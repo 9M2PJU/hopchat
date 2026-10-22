@@ -89,8 +89,7 @@ impl LightDriver for HaLight {
         else {
             return Ok(None);
         };
-        let now = Hub::of(d)?.call(service, entity(d)?, body)?;
-        Ok(now.as_ref().map(describe_light))
+        Hub::of(d)?.drive(service, entity(d)?, body, describe_light)
     }
 
     fn status(&self, d: &Device) -> Result<String, String> {

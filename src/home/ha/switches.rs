@@ -61,8 +61,7 @@ impl Backend for HaSwitch {
 impl SwitchDriver for HaSwitch {
     fn set(&self, d: &Device, on: bool) -> Result<Option<String>, String> {
         let service = if on { "switch.turn_on" } else { "switch.turn_off" };
-        let now = Hub::of(d)?.call(service, entity(d)?, json!({}))?;
-        Ok(now.as_ref().map(describe_switch))
+        Hub::of(d)?.drive(service, entity(d)?, json!({}), describe_switch)
     }
 
     fn status(&self, d: &Device) -> Result<String, String> {

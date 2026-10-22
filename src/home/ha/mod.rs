@@ -44,9 +44,15 @@ use tvs::describe_tv;
 
 /// Where HA listens unless told otherwise.
 const PORT: u16 = 8123;
-/// How long to wait for HA to answer a call that drives something, and
-/// to connect at all.
+/// How long to wait to connect at all, and for HA to answer a question
+/// about what something is doing.
 const WAIT: Duration = Duration::from_secs(5);
+/// How long to wait for HA to answer a call that drives something. HA
+/// answers once the integration has done it, and one that goes through
+/// a cloud can take well over five seconds.
+const DRIVE: Duration = Duration::from_secs(20);
+/// What a call that ran out of time says.
+const SLOW: &str = "Home Assistant took too long to answer";
 /// How long a listing may take: a big home's states and entity registry
 /// run to megabytes, which HA takes a while to put together and send.
 const LISTING: Duration = Duration::from_secs(60);
@@ -219,14 +225,40 @@ impl Hub {
     /// the entity's new state if HA's answer has it. HA answers with every
     /// state the call changed; one that changes later, as a polled or
     /// cloud device may, isn't in it.
-    fn call(&self, service: &str, entity: &str, mut body: Value) -> Result<Option<Value>, String> {
+    fn call(&self, service: &str, entity: &str, body: Value) -> Result<Option<Value>, String> {
+        self.call_within(service, entity, body, DRIVE)
+    }
+
+    fn call_within(&self, service: &str, entity: &str, mut body: Value, wait: Duration) -> Result<Option<Value>, String> {
         let (domain, service) = service.split_once('.').unwrap_or((service, ""));
         body["entity_id"] = json!(entity);
         let sent = Self::agent()
             .post(format!("{}/api/services/{domain}/{service}", self.url))
             .header("Authorization", format!("Bearer {}", self.token))
+            .config()
+            .timeout_global(Some(wait))
+            .build()
             .send_json(&body);
         Ok(changed(&self.answer(sent)?, entity))
+    }
+
+    /// Calls a service on one entity, and says what it is doing now when
+    /// HA's answer has it. When HA takes too long to answer, the call was
+    /// still sent and HA carries on with it, so this never says it failed:
+    /// it says what the entity is doing so far, and that it may yet change.
+    fn drive(&self, service: &str, entity: &str, body: Value, describe: Says) -> Result<Option<String>, String> {
+        self.drive_within(service, entity, body, describe, DRIVE)
+    }
+
+    fn drive_within(&self, service: &str, entity: &str, body: Value, describe: Says, wait: Duration) -> Result<Option<String>, String> {
+        match self.call_within(service, entity, body, wait) {
+            Ok(now) => Ok(now.as_ref().map(describe)),
+            Err(e) if e == SLOW => Err(match self.state(entity) {
+                Ok(state) => format!("Home Assistant is still on it; so far it is {}", describe(&state)),
+                Err(_) => "Home Assistant took too long to say whether it worked; it may still happen".into(),
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     /// One entity's state and attributes.
@@ -341,7 +373,7 @@ fn registry_of(answer: Value) -> Result<HashMap<String, Value>, String> {
 /// the rest can quote the URL, so those are said in fixed words.
 fn unreached(e: ureq::Error) -> String {
     match e {
-        ureq::Error::Timeout(_) => "Home Assistant took too long to answer".into(),
+        ureq::Error::Timeout(_) => SLOW.into(),
         ureq::Error::Io(e) => format!("can't reach Home Assistant: {}", e.kind()),
         ureq::Error::Tls(_) => "can't reach Home Assistant: its certificate isn't one this machine trusts".into(),
         _ => "can't reach Home Assistant".into(),
@@ -725,6 +757,25 @@ mod tests {
         let hub = hub_at(&fake, "t");
         assert_eq!(hub.entities().map(|l| l.found.len()), Ok(4), "a listing gets its own budget");
         assert_eq!(hub.state("light.desk").unwrap_err(), "Home Assistant took too long to answer");
+    }
+
+    #[test]
+    fn a_call_that_outlasts_its_wait_says_what_it_did_so_far() {
+        let fake = fake::Fake::start("t", None, |method, _, _| match method {
+            "POST" => {
+                std::thread::sleep(Duration::from_secs(1));
+                (200, "[]".into())
+            }
+            _ => (200, json!({"entity_id": "switch.kettle", "state": "on", "attributes": {}}).to_string()),
+        });
+        let hub = hub_at(&fake, "t");
+        let wait = Duration::from_millis(300);
+        let e = hub.drive_within("switch.turn_on", "switch.kettle", json!({}), describe_switch, wait).unwrap_err();
+        assert_eq!(e, "Home Assistant is still on it; so far it is on", "never told it failed");
+        assert!(fake.asked().iter().any(|a| a.starts_with("POST /api/services/switch/turn_on")), "the call was sent");
+        let down = Hub { url: "http://127.0.0.1:1".into(), token: "t".into() };
+        let e = down.drive_within("switch.turn_on", "switch.kettle", json!({}), describe_switch, wait).unwrap_err();
+        assert!(e.starts_with("can't reach Home Assistant"), "never sent, so said plainly: {e}");
     }
 
     #[test]
