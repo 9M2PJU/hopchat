@@ -98,6 +98,10 @@ pub struct Device {
     /// it in from its one [`Config::ha`] each time it hands the device to
     /// a backend, so a new token reaches every entity at once and none is
     /// ever written into the device itself.
+    ///
+    /// Only [`Home::reach`] sets it: a device taken straight from
+    /// `config.devices` has none, and its backend answers that home isn't
+    /// connected. Hand every device to a backend through `reach`.
     #[serde(skip)]
     pub hub: Option<ha::Hub>,
 }
@@ -1476,6 +1480,16 @@ mod tests {
         // Left out of the prompt, but still a scene the strip has.
         let e = home.run_tool("light_set", &json!({"light": "strip", "scene": "effect 99"}));
         assert!(!matches!(&e, Err(e) if e.contains("no scene called")), "{e:?}");
+    }
+
+    #[test]
+    fn forgetting_home_assistant_forgets_what_it_only_offered() {
+        let mut home = home_with(Vec::new());
+        let kettle = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "t"), "Home".into(), listing(kettle))));
+        assert!(home.live.contains_key("switch.kettle"));
+        home.forget_ha();
+        assert!(home.found.is_empty() && !home.live.contains_key("switch.kettle"));
     }
 
     /// `/home ha URL TOKEN` against a real Home Assistant, through to the

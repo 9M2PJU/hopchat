@@ -117,7 +117,7 @@ pub trait Backend: Sync {
         None
     }
     /// Whether a hub home connected to lists these, rather than a scan
-    /// finding them; such a device keeps how to reach its hub in its data.
+    /// finding them; such a device is handed its hub in [`Device::hub`].
     fn listed_by_hub(&self) -> bool {
         false
     }

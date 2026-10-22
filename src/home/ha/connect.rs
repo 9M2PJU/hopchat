@@ -117,9 +117,11 @@ impl Home {
             return "home isn't connected to Home Assistant".into();
         };
         let gone: Vec<String> = self.config.devices.iter().filter(|d| ha::drives(d)).map(Device::id).collect();
+        // Found ones, never added, have a line in the panel too.
+        let offered: Vec<String> = self.found.iter().filter(|d| ha::drives(d)).map(Device::id).collect();
         self.config.devices.retain(|d| !ha::drives(d));
         self.found.retain(|d| !ha::drives(d));
-        for id in &gone {
+        for id in gone.iter().chain(&offered) {
             self.live.remove(id);
         }
         self.save();
