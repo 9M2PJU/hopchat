@@ -243,7 +243,11 @@ impl Default for Config {
 }
 
 impl Config {
-    fn migrate(&mut self) {
+    /// Brings settings from earlier versions up to date. Whether a token
+    /// was taken out of a device, so it is saved without it at once rather
+    /// than left on disk until something else is saved.
+    fn migrate(&mut self) -> bool {
+        let mut unstamped = false;
         if let Some(ip) = self.bulb.take() {
             self.devices.push(Device::new("wiz", "Light".into(), ip, None, Value::Null));
         }
@@ -261,8 +265,10 @@ impl Config {
                 && let Some(hub) = ha::unstamp(&mut d.data)
             {
                 self.ha.get_or_insert(hub);
+                unstamped = true;
             }
         }
+        unstamped
     }
 }
 
@@ -415,8 +421,8 @@ impl Home {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        config.migrate();
-        Self {
+        let unstamped = config.migrate();
+        let home = Self {
             path,
             config,
             engine,
@@ -431,7 +437,11 @@ impl Home {
             offered: None,
             lending: Arc::new(AtomicUsize::new(0)),
             lent_to: None,
+        };
+        if unstamped {
+            home.save();
         }
+        home
     }
 
     pub fn enabled(&self, group: &str) -> bool {
@@ -1428,6 +1438,25 @@ mod tests {
         config.migrate();
         assert_eq!(config.ha, Some(hub("http://10.0.0.4:8123", "t")));
         assert_eq!(config.devices[0].data, json!({"name": "Kettle"}));
+    }
+
+    #[test]
+    fn a_token_taken_out_of_an_old_device_leaves_the_file_at_once() {
+        let root = std::env::temp_dir().join(format!("hopchat-home-unstamp-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let old = json!({"devices": [{"backend": "ha_switch", "name": "Kettle", "ip": "10.0.0.4", "unit": "switch.kettle",
+                                      "data": {"name": "Kettle", "url": "http://10.0.0.4:8123", "token": "eyJold.eyJ.sig"}}]});
+        std::fs::write(root.join("home.json"), old.to_string()).unwrap();
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, _) = std::sync::mpsc::channel();
+        let (me, _) = std::sync::mpsc::channel();
+        let home = Home::open(&root, engine, ui, me);
+        let saved = std::fs::read_to_string(root.join("home.json")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(home.config.ha, Some(hub("http://10.0.0.4:8123", "eyJold.eyJ.sig")));
+        assert_eq!(saved.matches("eyJold.eyJ.sig").count(), 1, "kept in the hub only: {saved}");
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["devices"][0]["data"], json!({"name": "Kettle"}));
     }
 
     /// `/home ha URL TOKEN` against a real Home Assistant, through to the
