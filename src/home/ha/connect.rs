@@ -181,8 +181,8 @@ impl Home {
 /// A hub that can't be listed can't drive anything either, so its
 /// devices are all offline at once rather than after a wait each.
 pub(in crate::home) fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<Request>) {
-    let found = match hub.entities() {
-        Ok(listing) => listing.found,
+    let listing = match hub.entities() {
+        Ok(listing) => listing,
         Err(e) => {
             for d in added {
                 let _ = me.send(Request::Checked { id: d.id(), state: State::Offline, detail: e.clone() });
@@ -190,8 +190,10 @@ pub(in crate::home) fn list_hub(hub: &ha::Hub, added: Vec<Device>, me: &Sender<R
             return;
         }
     };
-    let listed = ha::listed(&found);
-    let _ = me.send(Request::Listed(found));
+    let listed = ha::listed(&listing.found);
+    // Sent whole: a listing the registry couldn't filter says so, as
+    // `/home ha` does, rather than offering hidden entities unannounced.
+    let _ = me.send(Request::Listed(listing));
     let checks: Vec<_> = added
         .into_iter()
         .filter(|d| !d.unit.as_ref().is_some_and(|u| listed.contains(u)))

@@ -352,8 +352,8 @@ pub enum Request {
     SetGroup { group: String, on: bool },
     // Results from home's own worker threads.
     Found(driver::Found),
-    /// Everything a hub listed, at once.
-    Listed(Vec<driver::Found>),
+    /// Everything a hub listed, at once, and what to warn of about it.
+    Listed(ha::Listing),
     ScanDone,
     Checked { id: String, state: State, detail: String },
     /// `/home ha` reached a Home Assistant: the hub and what it has, or
@@ -596,7 +596,12 @@ impl Home {
                 self.note(reply);
             }
             Request::Found(found) => self.on_found(found),
-            Request::Listed(found) => self.on_listed(found),
+            Request::Listed(ha::Listing { found, warning }) => {
+                if let Some(warning) = warning {
+                    self.note(format!("home: {warning}"));
+                }
+                self.on_listed(found);
+            }
             Request::HaConnected(result) => self.ha_connected(result),
             Request::ScanDone => self.scanning = false,
             Request::Checked { id, state, detail } => self.checked(id, state, detail),
@@ -1567,6 +1572,38 @@ mod tests {
         assert_eq!(run(&mut home, "tv_open_app", json!({"app": "youtube"})), "Lounge room switched to youtube");
         assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": true})), "AC is now on");
         assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": false})), "AC is now off");
+    }
+
+    /// A home whose notes to the person at this machine can be read, and
+    /// whose own queue can be.
+    fn noted_home() -> (Home, std::sync::mpsc::Receiver<Update>, std::sync::mpsc::Receiver<Request>) {
+        let (engine, _) = std::sync::mpsc::channel();
+        let (ui, notes) = std::sync::mpsc::channel();
+        let (me, requests) = std::sync::mpsc::channel();
+        let mut home = Home::open(&std::env::temp_dir().join("hopchat-home-test-none"), engine, ui, me);
+        home.config = Config::default();
+        (home, notes, requests)
+    }
+
+    fn said(notes: &std::sync::mpsc::Receiver<Update>) -> Vec<String> {
+        notes.try_iter().filter_map(|u| match u { Update::Home(t) => Some(t), _ => None }).collect()
+    }
+
+    #[test]
+    fn a_scan_that_couldnt_filter_says_so() {
+        // No registry: everything is listed, with a warning.
+        let fake = ha::fake::Fake::start("t", None, |_, _, _| {
+            (200, json!([{"entity_id": "switch.kettle", "state": "on", "attributes": {}}]).to_string())
+        });
+        let (me, requests) = std::sync::mpsc::channel();
+        list_hub(&hub(&fake.url, "t"), Vec::new(), &me);
+        drop(me);
+        let listed = requests.into_iter().find(|r| matches!(r, Request::Listed(_))).expect("a listing");
+        let (mut home, notes, _) = noted_home();
+        home.handle(listed);
+        let said = said(&notes);
+        assert!(said.iter().any(|t| t.contains("entity registry")), "{said:?}");
+        assert_eq!(home.found.len(), 1, "still listed");
     }
 
     #[test]
