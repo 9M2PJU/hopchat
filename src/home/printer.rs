@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 
-use super::assistant::{text, tool};
+use super::assistant::{pick, tool};
 use super::driver::backend_of;
 use super::{Device, Home};
 
@@ -49,23 +49,6 @@ impl Home {
 
     /// The printer a request names, or the only one.
     fn pick_printer(&self, args: &Value) -> Result<Printer, String> {
-        let mut printers = self.printers();
-        let Some(n) = text(args, "printer").map(|n| n.to_ascii_lowercase()) else {
-            return match printers.len() {
-                0 => Err("no printers are set up".into()),
-                1 => Ok(printers.remove(0)),
-                _ => Err("say which printer".into()),
-            };
-        };
-        if let Some(at) = printers.iter().position(|(_, d)| d.name.eq_ignore_ascii_case(&n)) {
-            return Ok(printers.remove(at));
-        }
-        let mut close: Vec<Printer> =
-            printers.into_iter().filter(|(_, d)| d.name.to_ascii_lowercase().contains(&n)).collect();
-        match close.len() {
-            0 => Err(format!("there's no printer called {n}")),
-            1 => Ok(close.remove(0)),
-            _ => Err(format!("which {n}? {}", close.iter().map(|(_, d)| d.name.as_str()).collect::<Vec<_>>().join(", "))),
-        }
+        pick(self.printers(), args, "printer", "printers")
     }
 }

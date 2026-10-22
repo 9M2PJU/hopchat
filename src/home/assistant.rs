@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use super::driver::backend_of;
 use super::ollama::{Ollama, Turn};
-use super::Home;
+use super::{Device, Home};
 
 /// Model turns per request: act, maybe act again on what it saw, then say.
 const MAX_TURNS: usize = 4;
@@ -168,6 +168,28 @@ pub(super) fn flag(args: &Value, key: &str) -> Option<bool> {
 
 pub(super) fn text(args: &Value, key: &str) -> Option<String> {
     args.get(key)?.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// The device a request names under `one` (e.g. "switch"), or the only
+/// one there is: an exact name first, then a part of one. `many` is what
+/// several are called, for saying none are set up.
+pub(super) fn pick<T>(mut all: Vec<(T, Device)>, args: &Value, one: &str, many: &str) -> Result<(T, Device), String> {
+    let Some(n) = text(args, one).map(|n| n.to_ascii_lowercase()) else {
+        return match all.len() {
+            0 => Err(format!("no {many} are set up")),
+            1 => Ok(all.remove(0)),
+            _ => Err(format!("say which {one}")),
+        };
+    };
+    if let Some(at) = all.iter().position(|(_, d)| d.name.eq_ignore_ascii_case(&n)) {
+        return Ok(all.remove(at));
+    }
+    let mut close: Vec<(T, Device)> = all.into_iter().filter(|(_, d)| d.name.to_ascii_lowercase().contains(&n)).collect();
+    match close.len() {
+        0 => Err(format!("there's no {one} called {n}")),
+        1 => Ok(close.remove(0)),
+        _ => Err(format!("which {n}? {}", close.iter().map(|(_, d)| d.name.as_str()).collect::<Vec<_>>().join(", "))),
+    }
 }
 
 pub(super) fn colour(name: &str) -> Option<(u8, u8, u8)> {

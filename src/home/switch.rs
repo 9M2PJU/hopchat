@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use super::assistant::{flag, text, tool};
+use super::assistant::{flag, pick, tool};
 use super::driver::backend_of;
 use super::{Device, Home};
 
@@ -71,23 +71,6 @@ impl Home {
 
     /// The switch a request names, or the only one.
     pub(super) fn pick_switch(&self, args: &Value) -> Result<Switch, String> {
-        let mut switches = self.switches();
-        let Some(n) = text(args, "switch").map(|n| n.to_ascii_lowercase()) else {
-            return match switches.len() {
-                0 => Err("no switches are set up".into()),
-                1 => Ok(switches.remove(0)),
-                _ => Err("say which switch".into()),
-            };
-        };
-        if let Some(at) = switches.iter().position(|(_, d)| d.name.eq_ignore_ascii_case(&n)) {
-            return Ok(switches.remove(at));
-        }
-        let mut close: Vec<Switch> =
-            switches.into_iter().filter(|(_, d)| d.name.to_ascii_lowercase().contains(&n)).collect();
-        match close.len() {
-            0 => Err(format!("there's no switch called {n}")),
-            1 => Ok(close.remove(0)),
-            _ => Err(format!("which {n}? {}", close.iter().map(|(_, d)| d.name.as_str()).collect::<Vec<_>>().join(", "))),
-        }
+        pick(self.switches(), args, "switch", "switches")
     }
 }
