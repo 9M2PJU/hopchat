@@ -94,16 +94,23 @@ pub struct Device {
     /// saving here doesn't lose it.
     #[serde(flatten)]
     extra: serde_json::Map<String, Value>,
+    /// How to reach the hub that lists it, for a hub's entity. Home fills
+    /// it in from its one [`Config::ha`] each time it hands the device to
+    /// a backend, so a new token reaches every entity at once and none is
+    /// ever written into the device itself.
+    #[serde(skip)]
+    pub hub: Option<ha::Hub>,
 }
 
 impl Device {
     pub fn new(backend: &str, name: String, ip: Ipv4Addr, mac: Option<String>, data: Value) -> Self {
-        Self { backend: backend.into(), name, ip, mac, unit: None, data, model: None, key: None, cert: None, extra: Default::default() }
+        Self { backend: backend.into(), name, ip, mac, unit: None, data, model: None, key: None, cert: None, extra: Default::default(), hub: None }
     }
 
     /// A hub's entity is named by its unit, not by an address the hub's
     /// name happens to resolve to, so it keeps its id when the hub moves
-    /// or doesn't resolve.
+    /// or doesn't resolve. Home talks to one hub at a time, so an
+    /// entity's id is unique.
     pub fn id(&self) -> String {
         match (&self.unit, &self.mac) {
             (Some(unit), Some(mac)) => format!("{mac}/{unit}"),
@@ -162,7 +169,8 @@ pub struct Config {
     /// Whether group members may borrow this machine's model.
     #[serde(default = "yes")]
     pub share: bool,
-    /// The Home Assistant whose entities a scan lists.
+    /// The Home Assistant whose entities a scan lists and every HA device
+    /// is driven through: the one place its token is kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ha: Option<ha::Hub>,
     // The single-bulb, single-TV settings of earlier versions, folded into
@@ -247,6 +255,13 @@ impl Config {
         }
         for d in &mut self.devices {
             d.migrate();
+            // Listed by an earlier build, an entity kept the hub's URL and
+            // token itself.
+            if ha::drives(d)
+                && let Some(hub) = ha::unstamp(&mut d.data)
+            {
+                self.ha.get_or_insert(hub);
+            }
         }
     }
 }
@@ -625,7 +640,7 @@ impl Home {
             self.live.entry(d.id()).or_insert((State::Checking, String::new()));
             // The hub's listing says what its devices are doing, in one call.
             if hub.is_some() && ha::drives(d) {
-                listed_by_hub.push(d.clone());
+                listed_by_hub.push(self.reach(d));
             } else {
                 self.check(d.clone());
             }
@@ -654,6 +669,7 @@ impl Home {
 
     /// Looks at an added device in the background and reports its state.
     fn check(&self, d: Device) {
+        let d = self.reach(&d);
         let Some(backend) = backend_of(&d) else { return };
         let me = self.me.clone();
         thread::spawn(move || {
@@ -822,13 +838,22 @@ impl Home {
     /// device.
     fn drive<T>(&mut self, id: &str, f: impl FnOnce(&mut Device) -> T) -> Option<T> {
         let at = self.config.devices.iter().position(|d| d.id() == id)?;
-        let mut d = self.config.devices[at].clone();
+        let mut d = self.reach(&self.config.devices[at]);
         let out = f(&mut d);
         if d.data != self.config.devices[at].data {
             self.config.devices[at].data = d.data;
             self.save();
         }
         Some(out)
+    }
+
+    /// `d` as its backend needs it: a hub's entity with the hub to reach.
+    pub(super) fn reach(&self, d: &Device) -> Device {
+        let mut d = d.clone();
+        if ha::drives(&d) {
+            d.hub = self.config.ha.clone();
+        }
+        d
     }
 
     // ----- /home ---------------------------------------------------------
@@ -930,18 +955,14 @@ impl Home {
             Ok(connected) => connected,
             Err(e) => return self.note(format!("home: {e}")),
         };
-        // A new token or address reaches every device this hub lists, added
-        // or still waiting in /devices to be added. One it doesn't list may
-        // belong to another hub, and keeps the one it had.
-        let listed = ha::listed(&found);
-        for d in self.config.devices.iter_mut().chain(&mut self.found) {
-            let has = d.unit.as_ref().is_some_and(|u| listed.iter().any(|(b, l)| *b == d.backend && l == u));
-            if ha::drives(d) && has {
-                hub.stamp(&mut d.data);
-            }
-        }
+        // Every HA device goes through the one hub, so a new token or
+        // address reaches them all. Home has one hub: another address is
+        // this one moved, or a replacement for it.
         let url = hub.url.clone();
-        self.config.ha = Some(hub);
+        let before = self.config.ha.replace(hub).map(|h| h.url).filter(|old| *old != url);
+        if let Some(old) = before {
+            self.note(format!("home: Home Assistant at {old} is replaced by the one at {url}"));
+        }
         self.save();
         let before = self.found.len();
         for f in found {
@@ -958,6 +979,7 @@ impl Home {
     }
 
     /// `/home ha forget`: drops the hub, its token, and every device from it.
+    /// Every HA device is the one hub's.
     fn forget_ha(&mut self) -> String {
         let Some(hub) = self.config.ha.take() else {
             return "home isn't connected to Home Assistant".into();
@@ -1440,26 +1462,68 @@ mod tests {
         ha::Listing { found: vec![found], warning: None }
     }
 
+    fn hub(url: &str, token: &str) -> ha::Hub {
+        ha::Hub { url: url.into(), token: token.into() }
+    }
+
+    fn entity(backend: &'static str, unit: &str, data: Value) -> driver::Found {
+        driver::Found { backend, ip: [10, 0, 0, 4].into(), mac: None, unit: Some(unit.into()), data, checked: None }
+    }
+
+    /// The hub an added device would be driven through.
+    fn reached(home: &Home, at: usize) -> Option<ha::Hub> {
+        home.reach(&home.config.devices[at]).hub
+    }
+
     #[test]
-    fn home_assistant_entities_are_named_and_keep_its_token() {
+    fn home_assistant_entities_are_named_and_go_through_the_hub() {
         let mut home = home_with(Vec::new());
-        let hub = |token: &str| ha::Hub { url: "http://10.0.0.4:8123".into(), token: token.into() };
-        let strip = |hub: &ha::Hub| {
-            let mut data = json!({"name": "Kitchen strip", "colour": true, "white": false, "effects": []});
-            hub.stamp(&mut data);
-            driver::Found { backend: "ha_light", ip: [10, 0, 0, 4].into(), mac: None, unit: Some("light.strip".into()), data, checked: None }
-        };
-        home.ha_connected(Ok((hub("old"), "Home".into(), listing(strip(&hub("old"))))));
+        let strip = || entity("ha_light", "light.strip", json!({"name": "Kitchen strip", "colour": true, "white": false, "effects": []}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "old"), "Home".into(), listing(strip()))));
         assert_eq!(home.found[0].name, "Kitchen strip");
         assert_eq!(home.found[0].id(), "light.strip", "an entity is named by itself, not the hub's address");
         let id = home.found[0].id();
         home.add(&id);
         assert!(home.tools().to_string().contains("\"color\""));
         // A new token reaches the devices already added, and they aren't offered again.
-        home.ha_connected(Ok((hub("new"), "Home".into(), listing(strip(&hub("new"))))));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "new"), "Home".into(), listing(strip()))));
         assert!(home.found.is_empty());
-        assert_eq!(home.config.devices[0].data["token"], "new");
-        assert_eq!(home.config.ha, Some(hub("new")));
+        assert_eq!(reached(&home, 0), Some(hub("http://10.0.0.4:8123", "new")));
+    }
+
+    #[test]
+    fn a_new_token_reaches_devices_the_hub_no_longer_lists() {
+        let mut home = home_with(Vec::new());
+        let plug = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "old"), "Home".into(), listing(plug))));
+        home.add("switch.kettle");
+        // Hidden in HA since: the listing leaves it out, and it still gets the new token.
+        let empty = ha::Listing { found: Vec::new(), warning: None };
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "new"), "Home".into(), empty)));
+        assert_eq!(reached(&home, 0).map(|h| h.token), Some("new".into()));
+    }
+
+    #[test]
+    fn the_token_is_kept_once_and_shown_nowhere() {
+        let mut home = home_with(Vec::new());
+        let secret = "eyJsecret.eyJpc3Mi.sig";
+        let plug = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", secret), "Home".into(), listing(plug))));
+        home.add("switch.kettle");
+        let saved = serde_json::to_string(&home.config).unwrap();
+        assert_eq!(saved.matches(secret).count(), 1, "in the hub, not in its devices: {saved}");
+        assert!(!home.system_prompt().contains(secret) && !home.tools().to_string().contains(secret));
+        assert!(home.view().devices.iter().all(|d| !d.name.contains(secret) && !d.detail.contains(secret)));
+    }
+
+    #[test]
+    fn entities_listed_by_an_earlier_build_give_up_their_token() {
+        let old = json!({"devices": [{"backend": "ha_switch", "name": "Kettle", "ip": "10.0.0.4", "unit": "switch.kettle",
+                                      "data": {"name": "Kettle", "url": "http://10.0.0.4:8123", "token": "t"}}]});
+        let mut config: Config = serde_json::from_value(old).unwrap();
+        config.migrate();
+        assert_eq!(config.ha, Some(hub("http://10.0.0.4:8123", "t")));
+        assert_eq!(config.devices[0].data, json!({"name": "Kettle"}));
     }
 
     /// `/home ha URL TOKEN` against a real Home Assistant, through to the
@@ -1493,22 +1557,6 @@ mod tests {
         assert_eq!(run(&mut home, "tv_open_app", json!({"app": "youtube"})), "Lounge room switched to youtube");
         assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": true})), "AC is now on");
         assert_eq!(run(&mut home, "switch_set", json!({"switch": "ac", "on": false})), "AC is now off");
-    }
-
-    #[test]
-    fn a_new_token_reaches_devices_not_yet_added() {
-        let mut home = home_with(Vec::new());
-        let hub = |token: &str| ha::Hub { url: "http://10.0.0.4:8123".into(), token: token.into() };
-        let plug = |hub: &ha::Hub| {
-            let mut data = json!({"name": "Kettle"});
-            hub.stamp(&mut data);
-            driver::Found { backend: "ha_switch", ip: [10, 0, 0, 4].into(), mac: None, unit: Some("switch.kettle".into()), data, checked: None }
-        };
-        home.ha_connected(Ok((hub("old"), "Home".into(), listing(plug(&hub("old"))))));
-        home.ha_connected(Ok((hub("new"), "Home".into(), listing(plug(&hub("new"))))));
-        assert_eq!(home.found.len(), 1);
-        home.add("switch.kettle");
-        assert_eq!(home.config.devices[0].data["token"], "new");
     }
 
     #[test]
@@ -1571,31 +1619,23 @@ mod tests {
     }
 
     #[test]
-    fn another_hub_leaves_what_it_doesnt_list_alone() {
+    fn home_has_one_hub_and_another_address_replaces_it() {
         let mut home = home_with(Vec::new());
-        let at = |url: &str| ha::Hub { url: url.into(), token: url.into() };
-        let plug = |hub: &ha::Hub, entity: &str| {
-            let mut data = json!({"name": entity});
-            hub.stamp(&mut data);
-            driver::Found { backend: "ha_switch", ip: [10, 0, 0, 4].into(), mac: None, unit: Some(entity.into()), data, checked: None }
-        };
-        let (first, second) = (at("http://10.0.0.4:8123"), at("http://10.0.0.5:8123"));
-        home.ha_connected(Ok((first.clone(), "Home".into(), listing(plug(&first, "switch.kettle")))));
+        let (first, second) = (hub("http://10.0.0.4:8123", "a"), hub("http://10.0.0.5:8123", "b"));
+        let plug = |unit: &str| entity("ha_switch", unit, json!({"name": unit}));
+        home.ha_connected(Ok((first, "Home".into(), listing(plug("switch.kettle")))));
         home.add("switch.kettle");
-        home.ha_connected(Ok((second.clone(), "Flat".into(), listing(plug(&second, "switch.fan")))));
-        assert_eq!(home.config.devices[0].data["url"], "http://10.0.0.4:8123", "the kettle keeps its own hub");
-        assert_eq!(home.found[0].data["url"], "http://10.0.0.5:8123");
+        home.ha_connected(Ok((second.clone(), "Home".into(), listing(plug("switch.fan")))));
+        assert_eq!(home.config.ha, Some(second.clone()));
+        assert_eq!(reached(&home, 0), Some(second), "every entity goes through the one hub");
     }
 
     #[test]
     fn forgetting_home_assistant_drops_its_devices_and_token() {
         let mut home = home_with(vec![light("Desk", [10, 0, 0, 5], "ESP01_SHTW1C_31")]);
         assert!(home.configure(None, "ha forget").contains("isn't connected"));
-        let hub = ha::Hub { url: "http://10.0.0.4:8123".into(), token: "t".into() };
-        let mut data = json!({"name": "Kettle"});
-        hub.stamp(&mut data);
-        let kettle = driver::Found { backend: "ha_switch", ip: [10, 0, 0, 4].into(), mac: None, unit: Some("switch.kettle".into()), data, checked: None };
-        home.ha_connected(Ok((hub, "Home".into(), listing(kettle))));
+        let kettle = entity("ha_switch", "switch.kettle", json!({"name": "Kettle"}));
+        home.ha_connected(Ok((hub("http://10.0.0.4:8123", "t"), "Home".into(), listing(kettle))));
         home.add("switch.kettle");
         assert_eq!(home.configure(None, "ha forget"), "disconnected Home Assistant at http://10.0.0.4:8123 and forgot its 1 device");
         assert!(home.config.ha.is_none());
@@ -1615,11 +1655,11 @@ mod tests {
 
     #[test]
     fn a_switch_never_claims_a_state_it_couldnt_see() {
-        // No hub in its data: setting fails before anything is claimed.
+        // No hub to go through: setting fails before anything is claimed.
         let plug = Device { unit: Some("switch.fridge".into()), ..Device::new("ha_switch", "Fridge".into(), [10, 0, 0, 4].into(), None, json!({})) };
         let mut home = home_with(vec![plug]);
         let e = home.run_tool("switch_set", &json!({"switch": "fridge", "on": false})).unwrap_err();
-        assert!(e.contains("lost its Home Assistant"), "{e}");
+        assert!(e.contains("isn't connected to Home Assistant"), "{e}");
     }
 
     #[test]

@@ -57,7 +57,7 @@ impl Home {
         self.config
             .devices
             .iter()
-            .filter_map(|d| Some((backend_of(d)?.as_light()?, d.clone())))
+            .filter_map(|d| Some((backend_of(d)?.as_light()?, self.reach(d))))
             .collect()
     }
 

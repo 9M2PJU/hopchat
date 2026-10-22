@@ -4,8 +4,9 @@
 //!
 //! Connecting takes a long-lived access token (`/home ha [URL] TOKEN`),
 //! made under the HA user's profile, Security tab. The hub is kept in the
-//! settings so a scan can list its entities again, and each device added
-//! from it keeps the URL and token too, so it can be driven on its own.
+//! settings, the one place its token is kept: a scan lists its entities
+//! again from it, and home hands it to each entity it drives. Home talks
+//! to one Home Assistant at a time.
 //! Each entity is a backend of its category: an HA light is driven through
 //! the same `light_set` as a Wiz bulb.
 //!
@@ -133,22 +134,9 @@ pub fn find() -> Option<String> {
 }
 
 impl Hub {
-    /// The hub a device added from it keeps in its data.
+    /// The hub home handed a device to reach it through.
     fn of(d: &Device) -> Result<Hub, String> {
-        let field = |k: &str| d.data.get(k).and_then(Value::as_str).map(str::to_string);
-        match (field("url"), field("token")) {
-            (Some(url), Some(token)) => Ok(Hub { url, token }),
-            _ => Err(format!("{} lost its Home Assistant; connect again with /home ha", d.name)),
-        }
-    }
-
-    /// What a device keeps to reach this hub.
-    pub fn stamp(&self, data: &mut Value) {
-        if !data.is_object() {
-            *data = json!({});
-        }
-        data["url"] = json!(self.url);
-        data["token"] = json!(self.token);
+        d.hub.clone().ok_or_else(|| "home isn't connected to Home Assistant; connect it with /home ha".to_string())
     }
 
     /// `host:port`, without the scheme.
@@ -268,8 +256,7 @@ impl Hub {
                 if registry.get(entity).is_some_and(|entry| !wanted(entry)) {
                     return None;
                 }
-                let (backend, mut data) = describe(entity, state)?;
-                self.stamp(&mut data);
+                let (backend, data) = describe(entity, state)?;
                 let checked = Some(checked(state, state_of(backend)));
                 Some(Found { backend, ip, mac: None, unit: Some(entity.to_string()), data, checked })
             })
@@ -342,7 +329,18 @@ fn changed(states: &Value, entity: &str) -> Option<Value> {
     states.as_array()?.iter().find(|s| s.get("entity_id").and_then(Value::as_str) == Some(entity)).cloned()
 }
 
-/// Whether a device is one of Home Assistant's, and so keeps its URL and token.
+/// The hub an earlier build kept in an entity's data, taken out of it.
+pub fn unstamp(data: &mut Value) -> Option<Hub> {
+    let fields = data.as_object_mut()?;
+    let url = fields.remove("url");
+    let token = fields.remove("token");
+    match (url?, token?) {
+        (Value::String(url), Value::String(token)) => Some(Hub { url, token }),
+        _ => None,
+    }
+}
+
+/// Whether a device is one of Home Assistant's, driven through the hub.
 pub fn drives(d: &Device) -> bool {
     backend_of(d).is_some_and(|b| b.listed_by_hub())
 }
@@ -654,7 +652,7 @@ mod tests {
         let device = |entity: &str| {
             let f = found.iter().find(|f| f.unit.as_deref() == Some(entity)).unwrap_or_else(|| panic!("{entity} not listed"));
             assert!(f.checked.is_some(), "{entity} is listed with its state");
-            Device { unit: f.unit.clone(), ..Device::new(f.backend, entity.into(), f.ip, None, f.data.clone()) }
+            Device { unit: f.unit.clone(), hub: Some(hub.clone()), ..Device::new(f.backend, entity.into(), f.ip, None, f.data.clone()) }
         };
         let units: Vec<&str> = found.iter().filter_map(|f| f.unit.as_deref()).collect();
         println!("listed: {units:?}");

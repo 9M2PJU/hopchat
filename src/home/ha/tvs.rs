@@ -212,11 +212,10 @@ mod tests {
                                   "attributes": {"volume_level": 0.2, "supported_features": 0}}).to_string()),
             _ => (200, "[]".into()),
         });
-        let mut data = json!({"name": "TV"});
-        Hub { url: fake.url.clone(), token: "t".into() }.stamp(&mut data);
         let mut tv = Device {
             unit: Some("media_player.tv".into()),
-            ..Device::new("ha_tv", "TV".into(), Ipv4Addr::LOCALHOST, None, data)
+            hub: Some(Hub { url: fake.url.clone(), token: "t".into() }),
+            ..Device::new("ha_tv", "TV".into(), Ipv4Addr::LOCALHOST, None, json!({"name": "TV"}))
         };
         assert_eq!(HaTv.volume(&mut tv, None, Some(-15), Some(false)).unwrap(), "TV is on · volume 20");
         let asked = fake.asked();

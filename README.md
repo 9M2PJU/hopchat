@@ -202,7 +202,7 @@ A local model turns the request into device actions, and home replies in the con
 
 If a device is on another subnet, add it with `/home add 192.168.1.40`. `/home scan` searches again, and a bare `/home` shows the current status.
 
-**Home Assistant.** If you run Home Assistant, hopchat can drive anything it has an integration for. Make a long-lived access token under your HA profile (Security tab), then type `/home ha TOKEN` (or `/home ha http://IP:8123 TOKEN` if HA doesn't announce itself over mDNS). Its devices show up in `/devices` under their HA names, to add like any other. Hidden, disabled and settings entities are left out, as are Wiz and LG TVs, which hopchat drives directly. `https://` works too, with a certificate this machine trusts. An HA integration may itself go through the cloud. `/home ha forget` disconnects HA and removes its devices.
+**Home Assistant.** If you run Home Assistant, hopchat can drive anything it has an integration for. Make a long-lived access token under your HA profile (Security tab), then type `/home ha TOKEN` (or `/home ha http://IP:8123 TOKEN` if HA doesn't announce itself over mDNS). Its devices show up in `/devices` under their HA names, to add like any other. Hidden, disabled and settings entities are left out, as are Wiz and LG TVs, which hopchat drives directly. `https://` works too, with a certificate this machine trusts. An HA integration may itself go through the cloud. hopchat talks to one Home Assistant at a time: connecting again with a new token or address updates every HA device. `/home ha forget` disconnects HA and removes its devices.
 
 **Supported devices**
 

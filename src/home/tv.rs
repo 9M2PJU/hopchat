@@ -39,7 +39,7 @@ impl Home {
             .iter()
             .filter_map(|d| {
                 let backend = backend_of(d)?;
-                backend.ready(d).then_some((backend.as_tv()?, d.clone()))
+                backend.ready(d).then_some((backend.as_tv()?, self.reach(d)))
             })
             .collect()
     }

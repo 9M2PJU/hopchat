@@ -26,7 +26,7 @@ impl Home {
         self.config
             .devices
             .iter()
-            .filter_map(|d| Some((backend_of(d)?.as_switch()?, d.clone())))
+            .filter_map(|d| Some((backend_of(d)?.as_switch()?, self.reach(d))))
             .collect()
     }
 
