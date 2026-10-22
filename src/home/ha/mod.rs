@@ -53,6 +53,11 @@ const WAIT: Duration = Duration::from_secs(5);
 const DRIVE: Duration = Duration::from_secs(20);
 /// What a call that ran out of time says.
 const SLOW: &str = "Home Assistant took too long to answer";
+/// The longest effect or source name passed on to the model; a longer one
+/// is nothing anyone would say, and would only fill the prompt.
+const MAX_LABEL: usize = 48;
+/// The most sources named back when the one asked for isn't there.
+const MAX_SOURCES_SAID: usize = 20;
 /// How long a listing may take: a big home's states and entity registry
 /// run to megabytes, which HA takes a while to put together and send.
 const LISTING: Duration = Duration::from_secs(60);
@@ -458,6 +463,12 @@ fn features(state: &Value) -> u64 {
 /// How a backend puts an entity's state into words.
 type Says = fn(&Value) -> String;
 
+/// Whether a label HA gives (an effect, a source) is one to pass on: one
+/// line, and short enough that someone might say it.
+fn sayable(label: &str) -> bool {
+    !label.trim().is_empty() && label.chars().count() <= MAX_LABEL && !label.chars().any(char::is_control)
+}
+
 /// Which backend drives an entity, what it keeps about it, and how its
 /// state is put into words; `None` for one home has no category for.
 fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value, Says)> {
@@ -493,7 +504,7 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value, Says)> 
                 .filter_map(Value::as_str)
                 .collect();
             let stops = effects.iter().any(|e| is_off(e));
-            let effects: Vec<&str> = effects.into_iter().filter(|e| !is_off(e)).collect();
+            let effects: Vec<&str> = effects.into_iter().filter(|e| !is_off(e) && sayable(e)).collect();
             let flash = features(state) & LIGHT_FLASH != 0;
             Some((
                 "ha_light",
@@ -776,6 +787,14 @@ mod tests {
         let down = Hub { url: "http://127.0.0.1:1".into(), token: "t".into() };
         let e = down.drive_within("switch.turn_on", "switch.kettle", json!({}), describe_switch, wait).unwrap_err();
         assert!(e.starts_with("can't reach Home Assistant"), "never sent, so said plainly: {e}");
+    }
+
+    #[test]
+    fn labels_nobody_would_say_are_left_out() {
+        let long = "x".repeat(MAX_LABEL + 1);
+        let state = json!({"state": "on", "attributes": {"supported_color_modes": ["hs"], "effect_list": ["Rainbow", long, "two\nlines", ""]}});
+        let (_, data, _) = describe("light.strip", &state).unwrap();
+        assert_eq!(data["effects"], json!(["Rainbow"]));
     }
 
     #[test]

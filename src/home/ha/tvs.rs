@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use super::{features, VOLUME_SET, VOLUME_STEP, called, check_entity, entity, Hub};
+use super::{features, sayable, MAX_SOURCES_SAID, VOLUME_SET, VOLUME_STEP, called, check_entity, entity, Hub};
 use crate::home::driver::{Backend, Category};
 use crate::home::{Device, State};
 use crate::home::tv::TvDriver;
@@ -148,16 +148,25 @@ impl HaTv {
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
+            .filter(|s| sayable(s))
             .collect();
         let Some(source) = pick_source(&sources, wanted) else {
             return Err(if sources.is_empty() {
                 format!("{} has no sources to switch to", d.name)
             } else {
-                format!("{} has no {wanted}; it has {}", d.name, sources.join(", "))
+                format!("{} has no {wanted}; it has {}", d.name, said_sources(&sources))
             });
         };
         hub.drive("media_player.select_source", entity, json!({"source": source}), describe_tv)?;
         Ok(format!("{} switched to {source}", d.name))
+    }
+}
+
+/// The sources as named back to someone: the first few, and how many more.
+fn said_sources(sources: &[&str]) -> String {
+    match sources.len() {
+        n if n <= MAX_SOURCES_SAID => sources.join(", "),
+        n => format!("{} and {} more", sources[..MAX_SOURCES_SAID].join(", "), n - MAX_SOURCES_SAID),
     }
 }
 
@@ -250,6 +259,15 @@ mod tests {
         assert_eq!(pick_source(&sources, "youtube"), Some("YouTube TV"));
         assert_eq!(pick_source(&sources, "disney+"), None);
         assert_eq!(pick_source(&sources, "+"), None);
+    }
+
+    #[test]
+    fn a_long_source_list_is_cut_short() {
+        let names: Vec<String> = (0..25).map(|n| format!("HDMI {n}")).collect();
+        let sources: Vec<&str> = names.iter().map(String::as_str).collect();
+        let said = said_sources(&sources);
+        assert!(said.ends_with("HDMI 19 and 5 more") && !said.contains("HDMI 20"), "{said}");
+        assert_eq!(said_sources(&["Netflix", "HDMI 1"]), "Netflix, HDMI 1");
     }
 
     #[test]
