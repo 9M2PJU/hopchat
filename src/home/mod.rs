@@ -683,13 +683,19 @@ impl Home {
 
     /// Everything a hub listed, saved once rather than once per entity.
     fn on_listed(&mut self, found: Vec<driver::Found>) {
+        if self.learn_all(found) {
+            self.save();
+        }
+    }
+
+    /// Takes in everything a hub listed; whether an added device changed,
+    /// for the caller to save.
+    fn learn_all(&mut self, found: Vec<driver::Found>) -> bool {
         let mut changed = false;
         for f in found {
             changed |= self.learn(f);
         }
-        if changed {
-            self.save();
-        }
+        changed
     }
 
     /// Takes in a found device: offers it, or updates the one already
@@ -1604,6 +1610,34 @@ mod tests {
         let said = said(&notes);
         assert!(said.iter().any(|t| t.contains("entity registry")), "{said:?}");
         assert_eq!(home.found.len(), 1, "still listed");
+    }
+
+    #[test]
+    fn another_home_assistant_at_the_same_address_is_not_trusted_blindly() {
+        let mut home = home_with(Vec::new());
+        let at = "http://10.0.0.4:8123";
+        let light = |name: &str| entity("ha_light", "light.kitchen", json!({"name": name, "colour": true, "white": true}));
+        let desk = entity("ha_switch", "switch.desk", json!({"name": "Desk"}));
+        home.ha_connected(Ok((hub(at, "a"), "Home".into(), ha::Listing { found: vec![light("Kitchen"), desk], warning: None })));
+        home.add("light.kitchen");
+        home.add("switch.desk");
+        // A reinstalled HA at the same address: its light.kitchen is
+        // something else, and it has no desk (hidden, perhaps).
+        home.ha_connected(Ok((hub(at, "b"), "Home".into(), listing(light("Garage strip")))));
+        let names: Vec<&str> = home.config.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Desk"], "the kitchen light isn't vouched for; the desk may only be hidden");
+        assert_eq!(home.found.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Garage strip"]);
+    }
+
+    #[test]
+    fn a_device_without_its_ha_name_is_kept_where_its_entity_is_listed() {
+        let unnamed = |unit: &str| Device { unit: Some(unit.into()), ..Device::new("ha_light", unit.into(), [10, 0, 0, 4].into(), None, json!({})) };
+        let mut home = home_with(vec![unnamed("light.kitchen"), unnamed("light.porch")]);
+        home.config.ha = Some(hub("http://10.0.0.4:8123", "a"));
+        let kitchen = entity("ha_light", "light.kitchen", json!({"name": "Kitchen"}));
+        home.ha_connected(Ok((hub("http://10.0.0.9:8123", "a"), "Home".into(), listing(kitchen))));
+        let units: Vec<&str> = home.config.devices.iter().filter_map(|d| d.unit.as_deref()).collect();
+        assert_eq!(units, ["light.kitchen"], "listed: kept; not listed by a hub that moved: forgotten");
     }
 
     #[test]
