@@ -390,8 +390,14 @@ impl Attributes {
         if !supplies.is_empty() {
             parts.push(supplies.join(", "));
         }
-        let mut wrong: Vec<String> = self.texts("printer-state-reasons").filter_map(reason).collect();
-        wrong.dedup();
+        // Several keywords can say the same thing ("media-empty" and
+        // "media-needed"), and not always side by side: say each once.
+        let mut wrong: Vec<String> = Vec::new();
+        for said in self.texts("printer-state-reasons").filter_map(reason) {
+            if !wrong.contains(&said) {
+                wrong.push(said);
+            }
+        }
         if !wrong.is_empty() {
             parts.push(wrong.join(", "));
         }
@@ -760,6 +766,30 @@ mod tests {
         assert!(Ipp.status(&device(port)).is_err());
         target.set_nonblocking(true).unwrap();
         assert!(target.accept().is_err(), "home never went where the redirect pointed");
+    }
+
+    #[test]
+    fn a_reason_said_twice_is_said_once_even_apart() {
+        let (_, attrs) = parse(&answer(0, &[
+            (0x23, "printer-state", &3i32.to_be_bytes()),
+            (0x44, "printer-state-reasons", b"media-empty-error"),
+            (0x44, "", b"marker-supply-low-warning"),
+            (0x44, "", b"media-needed-warning"),
+        ]))
+        .unwrap();
+        assert_eq!(attrs.summary(), "idle · out of paper, ink low");
+    }
+
+    #[test]
+    fn a_supply_with_no_level_is_left_out() {
+        let (_, attrs) = parse(&answer(0, &[
+            (0x23, "printer-state", &3i32.to_be_bytes()),
+            (0x41, "marker-names", b"Black"),
+            (0x41, "", b"Cyan"),
+            (0x21, "marker-levels", &50i32.to_be_bytes()),
+        ]))
+        .unwrap();
+        assert_eq!(attrs.summary(), "idle · black 50%");
     }
 
     /// Lists the printers on this network and what each says: run with
