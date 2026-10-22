@@ -1093,20 +1093,55 @@ mod tests {
     use super::ha::connect::{found_only, ha_args, list_hub, looks_like_token};
 
     /// A settings directory of this test's own, so what one test saves (a
-    /// hub, with its token) is never what another test opens.
-    fn test_root() -> PathBuf {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let n = N.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!("hopchat-home-test-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    /// hub, with its token) is never what another test opens. It is
+    /// removed when dropped, so no settings outlive the test.
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new() -> Root {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::SeqCst);
+            let root = std::env::temp_dir().join(format!("hopchat-home-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            Root(root)
+        }
     }
 
-    fn home_with(devices: Vec<Device>) -> Home {
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A home opened in a [`Root`] of its own, which goes when it does.
+    struct TestHome {
+        home: Home,
+        _root: Root,
+    }
+
+    impl std::ops::Deref for TestHome {
+        type Target = Home;
+        fn deref(&self) -> &Home {
+            &self.home
+        }
+    }
+
+    impl std::ops::DerefMut for TestHome {
+        fn deref_mut(&mut self) -> &mut Home {
+            &mut self.home
+        }
+    }
+
+    fn open_home(engine: Sender<Input>, ui: Sender<Update>, me: Sender<Request>) -> TestHome {
+        let root = Root::new();
+        TestHome { home: Home::open(&root.0, engine, ui, me), _root: root }
+    }
+
+    fn home_with(devices: Vec<Device>) -> TestHome {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, _) = std::sync::mpsc::channel();
         let (me, _) = std::sync::mpsc::channel();
-        let mut home = Home::open(&test_root(), engine, ui, me);
+        let mut home = open_home(engine, ui, me);
         home.config = Config { devices, ..Default::default() };
         home
     }
@@ -1130,11 +1165,11 @@ mod tests {
     }
 
     /// A home whose messages to the engine can be read.
-    fn wired_home() -> (Home, std::sync::mpsc::Receiver<Input>) {
+    fn wired_home() -> (TestHome, std::sync::mpsc::Receiver<Input>) {
         let (engine, from_home) = std::sync::mpsc::channel();
         let (ui, _) = std::sync::mpsc::channel();
         let (me, _) = std::sync::mpsc::channel();
-        let mut home = Home::open(&test_root(), engine, ui, me);
+        let mut home = open_home(engine, ui, me);
         home.config = Config::default();
         (home, from_home)
     }
@@ -1547,7 +1582,7 @@ mod tests {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, notes) = std::sync::mpsc::channel();
         let (me, _) = std::sync::mpsc::channel();
-        let mut home = Home::open(&test_root(), engine, ui, me);
+        let mut home = open_home(engine, ui, me);
         home.config = Config::default();
         let empty = || ha::Listing { found: Vec::new(), warning: None };
         home.ha_connected(Ok((hub("http://10.0.0.4:8123", "a"), "Home".into(), empty())));
@@ -1597,7 +1632,7 @@ mod tests {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, _) = std::sync::mpsc::channel();
         let (me, requests) = std::sync::mpsc::channel();
-        let mut home = Home::open(&test_root(), engine, ui, me);
+        let mut home = open_home(engine, ui, me);
         home.config = Config::default();
         let (url, token) = (std::env::var("HA_URL").unwrap(), std::env::var("HA_TOKEN").unwrap());
         assert_eq!(home.configure(None, &format!("ha {url} {token}")), "connecting to Home Assistant…");
@@ -1623,11 +1658,11 @@ mod tests {
 
     /// A home whose notes to the person at this machine can be read, and
     /// whose own queue can be.
-    fn noted_home() -> (Home, std::sync::mpsc::Receiver<Update>, std::sync::mpsc::Receiver<Request>) {
+    fn noted_home() -> (TestHome, std::sync::mpsc::Receiver<Update>, std::sync::mpsc::Receiver<Request>) {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, notes) = std::sync::mpsc::channel();
         let (me, requests) = std::sync::mpsc::channel();
-        let mut home = Home::open(&test_root(), engine, ui, me);
+        let mut home = open_home(engine, ui, me);
         home.config = Config::default();
         (home, notes, requests)
     }
@@ -1817,7 +1852,7 @@ mod tests {
         let (engine, _) = std::sync::mpsc::channel();
         let (ui, notes) = std::sync::mpsc::channel();
         let (me, requests) = std::sync::mpsc::channel();
-        let mut home = Home::open(&test_root(), engine, ui, me);
+        let mut home = open_home(engine, ui, me);
         let plug = Device { unit: Some("switch.fridge".into()), ..Device::new("ha_switch", "Fridge".into(), [10, 0, 0, 4].into(), None, json!({})) };
         home.config = Config { devices: vec![plug], ..Default::default() };
         home.handle(Request::Test("switch.fridge".into()));
