@@ -111,14 +111,13 @@ impl Device {
         Self { backend: backend.into(), name, ip, mac, unit: None, data, model: None, key: None, cert: None, extra: Default::default(), hub: None }
     }
 
-    /// A hub's entity is named by its unit, not by an address the hub's
-    /// name happens to resolve to, so it keeps its id when the hub moves
-    /// or doesn't resolve. Home talks to one hub at a time, so an
+    /// A hub's entity is named by its unit alone, not by an address the
+    /// hub's name happens to resolve to, so it keeps its id when the hub
+    /// moves or doesn't resolve. Home talks to one hub at a time, so an
     /// entity's id is unique.
     pub fn id(&self) -> String {
         match (&self.unit, &self.mac) {
-            (Some(unit), Some(mac)) => format!("{mac}/{unit}"),
-            (Some(unit), None) => unit.clone(),
+            (Some(unit), _) => unit.clone(),
             (None, Some(mac)) => mac.clone(),
             (None, None) => self.ip.to_string(),
         }
@@ -1414,7 +1413,7 @@ mod tests {
         home.on_found(entity("light.strip"));
         home.on_found(entity("light.desk"));
         let ids: Vec<String> = home.found.iter().map(Device::id).collect();
-        assert_eq!(ids, ["hub/light.desk", "hub/light.strip"]);
+        assert_eq!(ids, ["light.desk", "light.strip"], "named by the entity alone, not the hub's address");
         let saved = serde_json::to_value(&home.found[0]).unwrap();
         assert_eq!(saved["unit"], "light.desk");
         assert!(serde_json::to_value(light("Desk", [10, 0, 0, 5], "m")).unwrap().get("unit").is_none());
