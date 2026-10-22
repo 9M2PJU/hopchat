@@ -52,10 +52,15 @@ impl Home {
         Some(match name {
             "switch_set" => match flag(args, "on") {
                 Some(on) => self.pick_switch(args).and_then(|(s, d)| {
-                    let told = s.set(&d, on)?;
-                    let asked = || s.status(&d).unwrap_or_else(|_| if on { "on" } else { "off" }.into());
-                    let state = told.unwrap_or_else(asked);
-                    Ok(format!("{} is now {state}", d.name))
+                    // Never say it is off when that couldn't be seen: it may run the fridge.
+                    let state = match s.set(&d, on)? {
+                        Some(told) => Ok(told),
+                        None => s.status(&d),
+                    };
+                    Ok(match state {
+                        Ok(state) => format!("{} is now {state}", d.name),
+                        Err(e) => format!("switched {} {}, but couldn't read it back: {e}", d.name, if on { "on" } else { "off" }),
+                    })
                 }),
                 None => Err("say whether to switch it on or off".into()),
             },

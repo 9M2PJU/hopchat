@@ -9,10 +9,11 @@
 //! Each entity is a backend of its category: an HA light is driven through
 //! the same `light_set` as a Wiz bulb.
 //!
-//! Only plain `http://` for now: HA on a LAN usually answers there, and
-//! hopchat's HTTP client is built without TLS.
+//! `http://` and `https://` both work. Over https, HA's certificate has to
+//! be one this machine trusts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::thread;
@@ -23,7 +24,7 @@ use serde_json::{json, Value};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::Message;
 
-use super::driver::{Backend, Category, Found};
+use super::driver::{backend_of, Backend, Category, Found};
 use super::light::{scene_key, Caps, LightDriver, Pilot};
 use super::switch::SwitchDriver;
 use super::tv::TvDriver;
@@ -38,27 +39,55 @@ const SERVICE: &str = "_home-assistant._tcp.local.";
 /// Integrations home drives itself: their entities would be the same
 /// device twice.
 const NATIVE: &[&str] = &["wiz", "webostv"];
+/// The most of an answer to read. A big home's `/api/states` runs to
+/// megabytes, past the HTTP client's own 10 MB default.
+const MAX_ANSWER: u64 = 64 * 1024 * 1024;
+/// `LightEntityFeature::FLASH`.
+const LIGHT_FLASH: u64 = 8;
+/// `MediaPlayerEntityFeature::VOLUME_SET`.
+const VOLUME_SET: u64 = 4;
+/// What one `volume_up` moves by, as a percentage, when an integration
+/// doesn't say otherwise.
+const VOLUME_STEP: u8 = 10;
 
 /// A Home Assistant to talk to.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hub {
     pub url: String,
     pub token: String,
 }
 
-/// The `http://host:port` someone typed, with the scheme and port filled
-/// in when left out.
+/// Never prints the token.
+impl fmt::Debug for Hub {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hub").field("url", &self.url).field("token", &"<redacted>").finish()
+    }
+}
+
+/// What a Home Assistant lists, and a warning when it couldn't be filtered.
+pub struct Listing {
+    pub found: Vec<Found>,
+    pub warning: Option<String>,
+}
+
+/// The `http://host:port` or `https://host:port` someone typed, with the
+/// scheme and port filled in when left out.
 pub fn url(typed: &str) -> Result<String, String> {
     let typed = typed.trim().trim_end_matches('/');
-    if typed.starts_with("https://") {
-        return Err("use Home Assistant's http:// address; hopchat can't speak https to it yet".into());
-    }
-    let rest = typed.strip_prefix("http://").unwrap_or(typed);
+    let (scheme, rest) = match typed.split_once("://") {
+        Some((scheme @ ("http" | "https"), rest)) => (scheme, rest),
+        Some((other, _)) => return Err(format!("{other}:// isn't how to reach Home Assistant; use http:// or https://")),
+        None => ("http", typed),
+    };
     if rest.is_empty() || rest.contains('/') {
         return Err(format!("{typed} isn't an address like http://homeassistant.local:8123"));
     }
+    // Unbracketed, an IPv6 address's last group would read as a port.
+    if !rest.starts_with('[') && rest.matches(':').count() > 1 {
+        return Err(format!("put an IPv6 address in brackets, like http://[{rest}]:8123"));
+    }
     let has_port = rest.rsplit_once(':').is_some_and(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-    Ok(if has_port { format!("http://{rest}") } else { format!("http://{rest}:{PORT}") })
+    Ok(if has_port { format!("{scheme}://{rest}") } else { format!("{scheme}://{rest}:{PORT}") })
 }
 
 /// The URL of a Home Assistant announcing itself on the LAN, if one does
@@ -112,13 +141,27 @@ impl Hub {
         data["token"] = json!(self.token);
     }
 
+    /// `host:port`, without the scheme.
+    fn host(&self) -> &str {
+        self.url.split_once("://").map_or(self.url.as_str(), |(_, host)| host)
+    }
+
+    fn secure(&self) -> bool {
+        self.url.starts_with("https://")
+    }
+
     /// One client for every call, so its connections to HA are kept and
     /// reused rather than opened per request.
     fn agent() -> &'static ureq::Agent {
         static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
         AGENT.get_or_init(|| {
+            let tls = ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build();
             ureq::Agent::config_builder()
                 .timeout_global(Some(WAIT))
+                .tls_config(tls)
                 // An HTTP error from HA says why in its body; keep it.
                 .http_status_as_error(false)
                 .build()
@@ -130,11 +173,16 @@ impl Hub {
     fn answer(&self, sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value, String> {
         let mut response = sent.map_err(|e| match e {
             ureq::Error::Timeout(_) => "Home Assistant took too long to answer".to_string(),
-            _ => format!("can't reach Home Assistant at {}", self.url),
+            e => format!("can't reach Home Assistant at {}: {e}", self.url),
         })?;
         let code = response.status().as_u16();
-        let body: Value = response.body_mut().read_json().unwrap_or_default();
-        outcome(code, body)
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_ANSWER)
+            .read_to_string()
+            .map_err(|e| format!("couldn't read Home Assistant's answer: {e}"))?;
+        outcome(code, &body)
     }
 
     fn get(&self, path: &str) -> Result<Value, String> {
@@ -166,16 +214,16 @@ impl Hub {
         })
     }
 
-    /// The name of the home it runs, as a check that the URL and token work.
+    /// The name of the home it runs, as a check that the URL and token work
+    /// and that what answers is a Home Assistant.
     pub fn check(&self) -> Result<String, String> {
-        let config = self.get("/api/config")?;
-        Ok(config.get("location_name").and_then(Value::as_str).unwrap_or("Home").to_string())
+        home_name(&self.get("/api/config")?).ok_or_else(|| format!("{} answers, but not as Home Assistant", self.url))
     }
 
     /// The address devices from it are listed at in the panel.
     fn ip(&self) -> Ipv4Addr {
-        let host = self.url.trim_start_matches("http://");
-        host.to_socket_addrs()
+        self.host()
+            .to_socket_addrs()
             .ok()
             .and_then(|mut addrs| {
                 addrs.find_map(|a| match a {
@@ -186,11 +234,20 @@ impl Hub {
             .unwrap_or(Ipv4Addr::UNSPECIFIED)
     }
 
-    /// Every entity home can drive, as found devices.
-    pub fn entities(&self) -> Result<Vec<Found>, String> {
+    /// Every entity home can drive, as found devices, each with its state.
+    pub fn entities(&self) -> Result<Listing, String> {
         let states = self.get("/api/states")?;
         // Without the registry, nothing is filtered out; still worth listing.
-        let registry = self.registry().unwrap_or_default();
+        let (registry, warning) = match self.registry() {
+            Ok(registry) => (registry, None),
+            Err(e) => (
+                HashMap::new(),
+                Some(format!(
+                    "couldn't read Home Assistant's entity registry ({e}), so its hidden and settings \
+                     entities, and its own copies of Wiz and LG devices, are listed too"
+                )),
+            ),
+        };
         let ip = self.ip();
         let found = states
             .as_array()
@@ -203,25 +260,26 @@ impl Hub {
                 }
                 let (backend, mut data) = describe(entity, state)?;
                 self.stamp(&mut data);
-                Some(Found { backend, ip, mac: None, unit: Some(entity.to_string()), data })
+                let checked = Some(checked(state, state_of(backend)));
+                Some(Found { backend, ip, mac: None, unit: Some(entity.to_string()), data, checked })
             })
             .collect();
-        Ok(found)
+        Ok(Listing { found, warning })
     }
 
     /// The entity registry, by entity id: what the REST API doesn't say,
     /// such as which integration made an entity and whether it is hidden.
     fn registry(&self) -> Result<HashMap<String, Value>, String> {
-        let address = self.url.trim_start_matches("http://");
+        let address = self.host();
         let stream = address
             .to_socket_addrs()
             .ok()
             .and_then(|mut addrs| addrs.find_map(|a| TcpStream::connect_timeout(&a, WAIT).ok()))
             .ok_or_else(|| format!("can't reach Home Assistant at {}", self.url))?;
         stream.set_read_timeout(Some(WAIT)).map_err(|e| e.to_string())?;
-        let ws_url = format!("ws://{address}/api/websocket");
-        let (mut ws, _) =
-            tungstenite::client(ws_url.as_str(), MaybeTlsStream::Plain(stream)).map_err(|e| e.to_string())?;
+        let scheme = if self.secure() { "wss" } else { "ws" };
+        let ws_url = format!("{scheme}://{address}/api/websocket");
+        let (mut ws, _) = tungstenite::client_tls(ws_url.as_str(), stream).map_err(|e| e.to_string())?;
         read(&mut ws)?; // auth_required
         let auth = json!({"type": "auth", "access_token": self.token});
         ws.send(Message::text(auth.to_string())).map_err(|e| e.to_string())?;
@@ -245,13 +303,24 @@ impl Hub {
     }
 }
 
+/// The home's name from `/api/config`, if that is what HA answers there.
+fn home_name(config: &Value) -> Option<String> {
+    let name = config.get("location_name").and_then(Value::as_str);
+    if name.is_none() && config.get("version").is_none() {
+        return None;
+    }
+    Some(name.unwrap_or("Home").to_string())
+}
+
 /// What HA's answer means: its JSON, or why not, in its own words when it
 /// gives them, as in "Entity … does not support action media_player.volume_set".
-fn outcome(code: u16, body: Value) -> Result<Value, String> {
+/// A success that isn't JSON is something else answering at that address.
+fn outcome(code: u16, body: &str) -> Result<Value, String> {
+    let json = serde_json::from_str::<Value>(body);
     match code {
-        200..=299 => Ok(body),
+        200..=299 => json.map_err(|_| "that address answers, but not as Home Assistant".into()),
         401 => Err("Home Assistant refused the token; make a new one under your HA profile, Security".into()),
-        _ => Err(match body.get("message").and_then(Value::as_str) {
+        _ => Err(match json.ok().as_ref().and_then(|b| b.get("message")).and_then(Value::as_str) {
             Some(message) => format!("Home Assistant: {message}"),
             None => format!("Home Assistant answered HTTP {code}"),
         }),
@@ -265,7 +334,12 @@ fn changed(states: &Value, entity: &str) -> Option<Value> {
 
 /// Whether a device is one of Home Assistant's, and so keeps its URL and token.
 pub fn drives(d: &Device) -> bool {
-    [HaLight.id(), HaTv.id(), HaSwitch.id()].contains(&d.backend.as_str())
+    backend_of(d).is_some_and(|b| b.listed_by_hub())
+}
+
+/// The entities a listing has, by backend and entity id.
+pub fn listed(listing: &[Found]) -> HashSet<(&'static str, String)> {
+    listing.iter().filter_map(|f| Some((f.backend, f.unit.clone()?))).collect()
 }
 
 /// The next JSON message on a WebSocket.
@@ -288,6 +362,10 @@ fn wanted(entry: &Value) -> bool {
     !set("hidden_by") && !set("disabled_by") && !set("entity_category") && !NATIVE.contains(&platform)
 }
 
+fn features(state: &Value) -> u64 {
+    state["attributes"].get("supported_features").and_then(Value::as_u64).unwrap_or(0)
+}
+
 /// Which backend drives an entity, and what it keeps about it; `None` for
 /// one home has no category for.
 fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
@@ -305,6 +383,8 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
                 .collect();
             let colour = modes.iter().any(|m| matches!(*m, "hs" | "rgb" | "rgbw" | "rgbww" | "xy"));
             let white = modes.contains(&"color_temp");
+            // Every mode but "onoff" has a brightness.
+            let dims = modes.iter().any(|m| *m != "onoff");
             // HA lists "off" among the effects, as the way to stop one.
             let effects: Vec<&str> = attrs
                 .get("effect_list")
@@ -315,11 +395,14 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
                 .collect();
             let stops = effects.iter().any(|e| is_off(e));
             let effects: Vec<&str> = effects.into_iter().filter(|e| !is_off(e)).collect();
-            let mut data = json!({"name": name, "colour": colour, "white": white, "effects": effects});
-            if stops {
-                data["stops"] = json!(true);
-            }
-            Some(("ha_light", data))
+            let flash = features(state) & LIGHT_FLASH != 0;
+            Some((
+                "ha_light",
+                json!({
+                    "name": name, "colour": colour, "white": white, "dims": dims,
+                    "effects": effects, "stops": stops, "flash": flash,
+                }),
+            ))
         }
         // A speaker or receiver is a media player too, but not a TV.
         "media_player" if attrs.get("device_class").and_then(Value::as_str) == Some("tv") => {
@@ -327,6 +410,15 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
         }
         "switch" => Some(("ha_switch", json!({"name": name}))),
         _ => None,
+    }
+}
+
+/// How each backend puts an entity's state into words.
+fn state_of(backend: &str) -> fn(&Value) -> String {
+    match backend {
+        "ha_light" => describe_light,
+        "ha_tv" => describe_tv,
+        _ => describe_switch,
     }
 }
 
@@ -343,16 +435,26 @@ fn entity(d: &Device) -> Result<&str, String> {
     d.unit.as_deref().ok_or_else(|| format!("{} names no Home Assistant entity", d.name))
 }
 
+/// What an entity is doing, for the Devices panel.
+fn checked(state: &Value, describe: fn(&Value) -> String) -> (State, String) {
+    if state.get("state").and_then(Value::as_str) == Some("unavailable") {
+        (State::Offline, "unavailable in Home Assistant".into())
+    } else {
+        (State::Ready, describe(state))
+    }
+}
+
 /// What every HA backend says about the same things.
 fn check_entity(d: &Device, describe: fn(&Value) -> String) -> (State, String) {
-    let state = Hub::of(d).and_then(|hub| hub.state(entity(d)?));
-    match state {
-        Ok(s) if s.get("state").and_then(Value::as_str) == Some("unavailable") => {
-            (State::Offline, "unavailable in Home Assistant".into())
-        }
-        Ok(s) => (State::Ready, describe(&s)),
+    match Hub::of(d).and_then(|hub| hub.state(entity(d)?)) {
+        Ok(state) => checked(&state, describe),
         Err(e) => (State::Offline, e),
     }
+}
+
+/// The name HA gave an entity.
+fn called(d: &Device) -> Option<String> {
+    d.data.get("name").and_then(Value::as_str).map(str::to_string)
 }
 
 // ----- lights ---------------------------------------------------------------
@@ -373,19 +475,18 @@ impl Backend for HaLight {
         "Home Assistant lights"
     }
 
-    /// Listed by home from the hub it connected to, not found by looking.
-    fn discover(&self, _each: &dyn Fn(Found)) {}
-
-    fn probe(&self, _ip: Ipv4Addr) -> Option<Found> {
-        None
+    fn listed_by_hub(&self) -> bool {
+        true
     }
 
     fn name(&self, d: &Device) -> Option<String> {
-        d.data.get("name").and_then(Value::as_str).map(str::to_string)
+        called(d)
     }
 
     fn about(&self, d: &Device) -> String {
-        self.caps(d).describe().into()
+        // Listed before "dims" was kept: assume it dims, as it used to.
+        let dims = d.data.get("dims").and_then(Value::as_bool).unwrap_or(true);
+        if dims { self.caps(d).describe().into() } else { "on or off only".into() }
     }
 
     fn found_detail(&self, d: &Device) -> String {
@@ -396,22 +497,24 @@ impl Backend for HaLight {
         check_entity(d, describe_light)
     }
 
+    /// Flashes it where HA can, else switches it the other way and back.
     fn test(&self, d: &mut Device) -> Result<String, String> {
         let hub = Hub::of(d)?;
         let entity = entity(d)?;
         let on = hub.state(entity)?.get("state").and_then(Value::as_str) == Some("on");
-        if on {
+        if on && flag(d, "flash") {
             hub.call("light.turn_on", entity, json!({"flash": "short"}))?;
-        } else {
-            hub.call("light.turn_on", entity, json!({}))?;
-            thread::sleep(Duration::from_secs(1));
-            hub.call("light.turn_off", entity, json!({}))?;
+            return Ok(format!("{} flashed", d.name));
         }
-        Ok(format!("{} flashed", d.name))
+        let (first, then) = if on { ("light.turn_off", "light.turn_on") } else { ("light.turn_on", "light.turn_off") };
+        hub.call(first, entity, json!({}))?;
+        thread::sleep(Duration::from_secs(1));
+        hub.call(then, entity, json!({}))?;
+        Ok(format!("{} blinked", d.name))
     }
 
     fn test_help(&self) -> &'static str {
-        " flashes it so you can find it"
+        " blinks it so you can find it"
     }
 
     fn as_light(&self) -> Option<&dyn LightDriver> {
@@ -448,9 +551,10 @@ impl LightDriver for HaLight {
 /// The service call that makes a light do what `pilot` asks, given the
 /// effects it has and whether "off" stops one; `None` when it asks for
 /// nothing, and the scene asked for when the light has no such effect.
+/// Asked to switch off, it switches off, whatever else came with it.
 fn light_call(pilot: &Pilot, effects: &[String], stops: bool) -> Result<Option<(&'static str, Value)>, String> {
     let changes = pilot.brightness.is_some() || pilot.kelvin.is_some() || pilot.rgb.is_some() || pilot.scene.is_some();
-    if pilot.on == Some(false) && !changes {
+    if pilot.on == Some(false) {
         return Ok(Some(("light.turn_off", json!({}))));
     }
     if pilot.on.is_none() && !changes {
@@ -524,15 +628,12 @@ impl Backend for HaTv {
         "Home Assistant TVs"
     }
 
-    /// Listed by home from the hub it connected to, not found by looking.
-    fn discover(&self, _each: &dyn Fn(Found)) {}
-
-    fn probe(&self, _ip: Ipv4Addr) -> Option<Found> {
-        None
+    fn listed_by_hub(&self) -> bool {
+        true
     }
 
     fn name(&self, d: &Device) -> Option<String> {
-        d.data.get("name").and_then(Value::as_str).map(str::to_string)
+        called(d)
     }
 
     fn about(&self, _d: &Device) -> String {
@@ -562,6 +663,27 @@ impl Backend for HaTv {
     }
 }
 
+/// How to move a TV's volume by `change` percentage points.
+#[derive(Debug, PartialEq)]
+enum Volume {
+    /// To this level, 0 to 1, in one call.
+    Set(f64),
+    /// By this many of the integration's own steps, for one that can't be
+    /// set to a level.
+    Step(u8),
+}
+
+/// The same `change` means the same on every TV: points of volume, not
+/// whatever one `volume_up` happens to move by.
+fn volume_change(state: &Value, change: i8) -> Volume {
+    match state["attributes"].get("volume_level").and_then(Value::as_f64) {
+        Some(now) if features(state) & VOLUME_SET != 0 => {
+            Volume::Set((((now * 100.0).round() + f64::from(change)) / 100.0).clamp(0.0, 1.0))
+        }
+        _ => Volume::Step(change.unsigned_abs().div_ceil(VOLUME_STEP).max(1)),
+    }
+}
+
 impl TvDriver for HaTv {
     fn power(&self, d: &mut Device, on: bool) -> Result<String, String> {
         let service = if on { "media_player.turn_on" } else { "media_player.turn_off" };
@@ -575,12 +697,20 @@ impl TvDriver for HaTv {
         if let Some(mute) = mute {
             hub.call("media_player.volume_mute", entity, json!({"is_volume_muted": mute}))?;
         }
+        let set = |level: f64| hub.call("media_player.volume_set", entity, json!({"volume_level": level}));
         if let Some(level) = level {
-            hub.call("media_player.volume_set", entity, json!({"volume_level": f64::from(level.min(100)) / 100.0}))?;
-        } else if let Some(change) = change {
-            let service = if change > 0 { "media_player.volume_up" } else { "media_player.volume_down" };
-            for _ in 0..change.unsigned_abs() {
-                hub.call(service, entity, json!({}))?;
+            set(f64::from(level.min(100)) / 100.0)?;
+        } else if let Some(change) = change.filter(|c| *c != 0) {
+            match volume_change(&hub.state(entity)?, change) {
+                Volume::Set(level) => {
+                    set(level)?;
+                }
+                Volume::Step(steps) => {
+                    let service = if change > 0 { "media_player.volume_up" } else { "media_player.volume_down" };
+                    for _ in 0..steps {
+                        hub.call(service, entity, json!({}))?;
+                    }
+                }
             }
         }
         self.status(d).map(|state| format!("{} is {state}", d.name))
@@ -691,15 +821,12 @@ impl Backend for HaSwitch {
         "Home Assistant switches"
     }
 
-    /// Listed by home from the hub it connected to, not found by looking.
-    fn discover(&self, _each: &dyn Fn(Found)) {}
-
-    fn probe(&self, _ip: Ipv4Addr) -> Option<Found> {
-        None
+    fn listed_by_hub(&self) -> bool {
+        true
     }
 
     fn name(&self, d: &Device) -> Option<String> {
-        d.data.get("name").and_then(Value::as_str).map(str::to_string)
+        called(d)
     }
 
     fn about(&self, _d: &Device) -> String {
@@ -754,8 +881,28 @@ mod tests {
         assert_eq!(url("homeassistant.local").unwrap(), "http://homeassistant.local:8123");
         assert_eq!(url("http://10.0.0.4:8123/").unwrap(), "http://10.0.0.4:8123");
         assert_eq!(url("10.0.0.4:80").unwrap(), "http://10.0.0.4:80");
-        assert!(url("https://ha.example.com").is_err());
+        assert_eq!(url("https://ha.example.com").unwrap(), "https://ha.example.com:8123");
+        assert_eq!(url("https://ha.example.com:443").unwrap(), "https://ha.example.com:443");
+        assert_eq!(url("[fd00::4]").unwrap(), "http://[fd00::4]:8123");
+        assert_eq!(url("http://[fd00::4]:8123").unwrap(), "http://[fd00::4]:8123");
+        assert!(url("fd00::4").unwrap_err().contains("brackets"));
+        assert!(url("ftp://10.0.0.4").is_err());
         assert!(url("http://10.0.0.4:8123/lovelace").is_err());
+    }
+
+    #[test]
+    fn hosts_without_their_scheme() {
+        let hub = |url: &str| Hub { url: url.into(), token: "t".into() };
+        assert_eq!(hub("http://10.0.0.4:8123").host(), "10.0.0.4:8123");
+        assert_eq!(hub("https://ha.lan:8123").host(), "ha.lan:8123");
+        assert!(hub("https://ha.lan:8123").secure() && !hub("http://ha.lan:8123").secure());
+    }
+
+    #[test]
+    fn a_hub_never_prints_its_token() {
+        let hub = Hub { url: "http://10.0.0.4:8123".into(), token: "eyJsecret".into() };
+        let printed = format!("{hub:?}");
+        assert!(!printed.contains("eyJsecret") && printed.contains("10.0.0.4"), "{printed}");
     }
 
     #[test]
@@ -771,18 +918,40 @@ mod tests {
     fn lights_say_what_they_can_do() {
         let state = json!({"entity_id": "light.strip", "state": "on", "attributes": {
             "friendly_name": "Strip", "supported_color_modes": ["color_temp", "hs"],
-            "effect_list": ["Rainbow", "Night-Light", "off"],
+            "effect_list": ["Rainbow", "Night-Light", "off"], "supported_features": 44,
         }});
         let (backend, data) = describe("light.strip", &state).unwrap();
         assert_eq!(backend, "ha_light");
         assert_eq!(
             data,
-            json!({"name": "Strip", "colour": true, "white": true, "effects": ["Rainbow", "Night-Light"], "stops": true})
+            json!({"name": "Strip", "colour": true, "white": true, "dims": true,
+                   "effects": ["Rainbow", "Night-Light"], "stops": true, "flash": true})
         );
         let dimmer = json!({"state": "off", "attributes": {"supported_color_modes": ["brightness"]}});
         let (_, data) = describe("light.hall", &dimmer).unwrap();
         assert_eq!((data["name"].as_str(), data["colour"].as_bool(), data["white"].as_bool()), (Some("light.hall"), Some(false), Some(false)));
+        assert_eq!((data["dims"].as_bool(), data["stops"].as_bool(), data["flash"].as_bool()), (Some(true), Some(false), Some(false)));
         assert!(describe("sensor.temperature", &state).is_none());
+    }
+
+    #[test]
+    fn an_on_off_light_says_it_only_switches() {
+        let state = json!({"state": "off", "attributes": {"supported_color_modes": ["onoff"]}});
+        let (backend, data) = describe("light.porch", &state).unwrap();
+        let d = Device::new(backend, "Porch".into(), Ipv4Addr::UNSPECIFIED, None, data);
+        assert_eq!(HaLight.about(&d), "on or off only");
+        let older = Device::new("ha_light", "Hall".into(), Ipv4Addr::UNSPECIFIED, None, json!({}));
+        assert_eq!(HaLight.about(&older), "dimmable", "listed before dims was kept");
+    }
+
+    #[test]
+    fn listings_carry_each_entitys_state() {
+        let off = json!({"state": "off", "attributes": {}});
+        assert_eq!(checked(&off, state_of("ha_light")), (State::Ready, "off".into()));
+        let gone = json!({"state": "unavailable", "attributes": {}});
+        assert_eq!(checked(&gone, state_of("ha_switch")).0, State::Offline);
+        let tv = json!({"state": "playing", "attributes": {"source": "Netflix"}});
+        assert_eq!(checked(&tv, state_of("ha_tv")).1, "playing · Netflix");
     }
 
     #[test]
@@ -810,11 +979,20 @@ mod tests {
 
     #[test]
     fn answers_say_why_not() {
-        assert_eq!(outcome(200, json!([])), Ok(json!([])));
-        assert!(outcome(401, Value::Null).unwrap_err().contains("refused the token"));
-        let refused = json!({"message": "Entity media_player.tv does not support action media_player.volume_set"});
+        assert_eq!(outcome(200, "[]"), Ok(json!([])));
+        assert!(outcome(401, "401: Unauthorized").unwrap_err().contains("refused the token"));
+        let refused = r#"{"message": "Entity media_player.tv does not support action media_player.volume_set"}"#;
         assert_eq!(outcome(400, refused).unwrap_err(), "Home Assistant: Entity media_player.tv does not support action media_player.volume_set");
-        assert_eq!(outcome(500, Value::Null).unwrap_err(), "Home Assistant answered HTTP 500");
+        assert_eq!(outcome(500, "").unwrap_err(), "Home Assistant answered HTTP 500");
+    }
+
+    #[test]
+    fn something_else_answering_isnt_home_assistant() {
+        assert!(outcome(200, "<html>Sign in</html>").unwrap_err().contains("not as Home Assistant"));
+        assert_eq!(home_name(&json!({"location_name": "Flat", "version": "2026.10.1"})), Some("Flat".into()));
+        assert_eq!(home_name(&json!({"version": "2026.10.1"})), Some("Home".into()));
+        assert_eq!(home_name(&json!({"status": "ok"})), None);
+        assert_eq!(home_name(&Value::Null), None);
     }
 
     #[test]
@@ -831,6 +1009,11 @@ mod tests {
         let call = |pilot: Pilot, stops: bool| light_call(&pilot, &effects, stops);
         assert_eq!(call(Pilot::default(), false), Ok(None), "nothing asked, nothing sent");
         assert_eq!(call(Pilot { on: Some(false), ..Default::default() }, false), Ok(Some(("light.turn_off", json!({})))));
+        assert_eq!(
+            call(Pilot { on: Some(false), brightness: Some(30), ..Default::default() }, false),
+            Ok(Some(("light.turn_off", json!({})))),
+            "off means off, as it does on a Wiz",
+        );
         assert_eq!(call(Pilot { on: Some(true), ..Default::default() }, false), Ok(Some(("light.turn_on", json!({})))));
         assert_eq!(
             call(Pilot { scene: Some("night light".into()), ..Default::default() }, true),
@@ -848,6 +1031,18 @@ mod tests {
             Ok(Some(("light.turn_on", json!({"color_temp_kelvin": 2700})))),
             "no \"off\" to send when the light has none",
         );
+    }
+
+    #[test]
+    fn volume_moves_by_points_on_every_tv() {
+        let tv = |level: f64, features: u64| json!({"attributes": {"volume_level": level, "supported_features": features}});
+        assert_eq!(volume_change(&tv(0.2, VOLUME_SET), -3), Volume::Set(0.17));
+        assert_eq!(volume_change(&tv(0.98, VOLUME_SET | 8), 5), Volume::Set(1.0));
+        assert_eq!(volume_change(&tv(0.01, VOLUME_SET), -5), Volume::Set(0.0));
+        // Without a level to set, HA's own steps, a tenth each.
+        assert_eq!(volume_change(&tv(0.2, 0), -3), Volume::Step(1));
+        assert_eq!(volume_change(&tv(0.2, 0), 15), Volume::Step(2));
+        assert_eq!(volume_change(&json!({"attributes": {"supported_features": VOLUME_SET}}), 1), Volume::Step(1));
     }
 
     #[test]
@@ -884,9 +1079,12 @@ mod tests {
     fn live() {
         let hub = Hub { url: url(&std::env::var("HA_URL").unwrap()).unwrap(), token: std::env::var("HA_TOKEN").unwrap() };
         println!("home: {}", hub.check().unwrap());
-        let found = hub.entities().unwrap();
+        let listing = hub.entities().unwrap();
+        assert_eq!(listing.warning, None, "the registry was read");
+        let found = listing.found;
         let device = |entity: &str| {
             let f = found.iter().find(|f| f.unit.as_deref() == Some(entity)).unwrap_or_else(|| panic!("{entity} not listed"));
+            assert!(f.checked.is_some(), "{entity} is listed with its state");
             Device { unit: f.unit.clone(), ..Device::new(f.backend, entity.into(), f.ip, None, f.data.clone()) }
         };
         let units: Vec<&str> = found.iter().filter_map(|f| f.unit.as_deref()).collect();

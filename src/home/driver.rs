@@ -86,6 +86,9 @@ pub struct Found {
     pub unit: Option<String>,
     /// Whatever the backend keeps about it, as in [`Device::data`].
     pub data: Value,
+    /// What it is doing, when whatever found it knows already: a hub's
+    /// listing has every entity's state, so none needs asking again.
+    pub checked: Option<(State, String)>,
 }
 
 /// What the Devices panel says about pairing one of these.
@@ -104,12 +107,20 @@ pub trait Backend: Sync {
     fn label(&self) -> &'static str;
 
     /// Reports everything of this kind on the network as it answers. Runs
-    /// on its own thread, beside the other backends' scans.
-    fn discover(&self, each: &dyn Fn(Found));
+    /// on its own thread, beside the other backends' scans. Nothing, for
+    /// one a hub lists instead.
+    fn discover(&self, _each: &dyn Fn(Found)) {}
     /// What is at `ip`, if it is one of these: for a device the scan can't
     /// see (another subnet, broadcasts blocked). Must not change anything
     /// on the device.
-    fn probe(&self, ip: Ipv4Addr) -> Option<Found>;
+    fn probe(&self, _ip: Ipv4Addr) -> Option<Found> {
+        None
+    }
+    /// Whether a hub home connected to lists these, rather than a scan
+    /// finding them; such a device keeps how to reach its hub in its data.
+    fn listed_by_hub(&self) -> bool {
+        false
+    }
 
     /// What it calls itself, to name it by when found; `None` to name it
     /// after its category.
