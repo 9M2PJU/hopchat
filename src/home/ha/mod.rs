@@ -105,7 +105,9 @@ pub fn url(typed: &str) -> Result<String, String> {
         return Err(format!("put an IPv6 address in brackets, like http://[{rest}]:8123"));
     }
     let has_port = rest.rsplit_once(':').is_some_and(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-    Ok(if has_port { format!("{scheme}://{rest}") } else { format!("{scheme}://{rest}:{PORT}") })
+    // HA itself listens on 8123 over http. Over https it is behind a proxy
+    // or Nabu Casa, on https's own 443, so the scheme's default is left be.
+    Ok(if has_port || scheme == "https" { format!("{scheme}://{rest}") } else { format!("{scheme}://{rest}:{PORT}") })
 }
 
 /// The URL of a Home Assistant announcing itself on the LAN, if one does
@@ -146,9 +148,16 @@ impl Hub {
         d.hub.clone().ok_or_else(|| "home isn't connected to Home Assistant; connect it with /home ha".to_string())
     }
 
-    /// `host:port`, without the scheme.
-    fn host(&self) -> &str {
-        self.url.split_once("://").map_or(self.url.as_str(), |(_, host)| host)
+    /// `host:port`, without the scheme, with https's 443 filled in when the
+    /// URL leaves it to the scheme.
+    fn host(&self) -> String {
+        let host = self.url.split_once("://").map_or(self.url.as_str(), |(_, host)| host);
+        let has_port = host.rsplit_once(':').is_some_and(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        match (has_port, self.secure()) {
+            (true, _) => host.to_string(),
+            (false, true) => format!("{host}:443"),
+            (false, false) => format!("{host}:{PORT}"),
+        }
     }
 
     fn secure(&self) -> bool {
@@ -504,7 +513,8 @@ mod tests {
         assert_eq!(url("homeassistant.local").unwrap(), "http://homeassistant.local:8123");
         assert_eq!(url("http://10.0.0.4:8123/").unwrap(), "http://10.0.0.4:8123");
         assert_eq!(url("10.0.0.4:80").unwrap(), "http://10.0.0.4:80");
-        assert_eq!(url("https://ha.example.com").unwrap(), "https://ha.example.com:8123");
+        assert_eq!(url("https://ha.example.com").unwrap(), "https://ha.example.com", "https is on 443, not 8123");
+        assert_eq!(url("https://abc.ui.nabu.casa/").unwrap(), "https://abc.ui.nabu.casa");
         assert_eq!(url("https://ha.example.com:443").unwrap(), "https://ha.example.com:443");
         assert_eq!(url("[fd00::4]").unwrap(), "http://[fd00::4]:8123");
         assert_eq!(url("http://[fd00::4]:8123").unwrap(), "http://[fd00::4]:8123");
@@ -521,6 +531,8 @@ mod tests {
         let hub = |url: &str| Hub { url: url.into(), token: "t".into() };
         assert_eq!(hub("http://10.0.0.4:8123").host(), "10.0.0.4:8123");
         assert_eq!(hub("https://ha.lan:8123").host(), "ha.lan:8123");
+        assert_eq!(hub("https://abc.ui.nabu.casa").host(), "abc.ui.nabu.casa:443", "a socket needs the port https implies");
+        assert_eq!(hub("https://[fd00::4]").host(), "[fd00::4]:443");
         assert!(hub("https://ha.lan:8123").secure() && !hub("http://ha.lan:8123").secure());
     }
 
