@@ -280,8 +280,8 @@ impl Hub {
                 if registry.get(entity).is_some_and(|entry| !wanted(entry)) {
                     return None;
                 }
-                let (backend, data) = describe(entity, state)?;
-                let checked = Some(checked(state, state_of(backend)));
+                let (backend, data, says) = describe(entity, state)?;
+                let checked = Some(checked(state, says));
                 Some(Found { backend, ip, mac: None, unit: Some(entity.to_string()), data, checked })
             })
             .collect();
@@ -423,9 +423,12 @@ fn features(state: &Value) -> u64 {
     state["attributes"].get("supported_features").and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// Which backend drives an entity, and what it keeps about it; `None` for
-/// one home has no category for.
-fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
+/// How a backend puts an entity's state into words.
+type Says = fn(&Value) -> String;
+
+/// Which backend drives an entity, what it keeps about it, and how its
+/// state is put into words; `None` for one home has no category for.
+fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value, Says)> {
     let attrs = state.get("attributes").cloned().unwrap_or_default();
     let name = attrs.get("friendly_name").and_then(Value::as_str).unwrap_or(entity);
     let (domain, _) = entity.split_once('.')?;
@@ -466,23 +469,15 @@ fn describe(entity: &str, state: &Value) -> Option<(&'static str, Value)> {
                     "name": name, "colour": colour, "white": white, "dims": dims,
                     "effects": effects, "stops": stops, "flash": flash,
                 }),
+                describe_light,
             ))
         }
         // A speaker or receiver is a media player too, but not a TV.
         "media_player" if attrs.get("device_class").and_then(Value::as_str) == Some("tv") => {
-            Some(("ha_tv", json!({"name": name})))
+            Some(("ha_tv", json!({"name": name}), describe_tv))
         }
-        "switch" => Some(("ha_switch", json!({"name": name}))),
+        "switch" => Some(("ha_switch", json!({"name": name}), describe_switch)),
         _ => None,
-    }
-}
-
-/// How each backend puts an entity's state into words.
-fn state_of(backend: &str) -> fn(&Value) -> String {
-    match backend {
-        "ha_light" => describe_light,
-        "ha_tv" => describe_tv,
-        _ => describe_switch,
     }
 }
 
@@ -500,7 +495,7 @@ fn entity(d: &Device) -> Result<&str, String> {
 }
 
 /// What an entity is doing, for the Devices panel.
-fn checked(state: &Value, describe: fn(&Value) -> String) -> (State, String) {
+fn checked(state: &Value, describe: Says) -> (State, String) {
     if state.get("state").and_then(Value::as_str) == Some("unavailable") {
         (State::Offline, "unavailable in Home Assistant".into())
     } else {
@@ -509,7 +504,7 @@ fn checked(state: &Value, describe: fn(&Value) -> String) -> (State, String) {
 }
 
 /// What every HA backend says about the same things.
-fn check_entity(d: &Device, describe: fn(&Value) -> String) -> (State, String) {
+fn check_entity(d: &Device, describe: Says) -> (State, String) {
     match Hub::of(d).and_then(|hub| hub.state(entity(d)?)) {
         Ok(state) => checked(&state, describe),
         Err(e) => (State::Offline, e),
@@ -579,7 +574,7 @@ mod tests {
             "friendly_name": "Strip", "supported_color_modes": ["color_temp", "hs"],
             "effect_list": ["Rainbow", "Night-Light", "off"], "supported_features": 44,
         }});
-        let (backend, data) = describe("light.strip", &state).unwrap();
+        let (backend, data, _) = describe("light.strip", &state).unwrap();
         assert_eq!(backend, "ha_light");
         assert_eq!(
             data,
@@ -587,36 +582,37 @@ mod tests {
                    "effects": ["Rainbow", "Night-Light"], "stops": true, "flash": true})
         );
         let dimmer = json!({"state": "off", "attributes": {"supported_color_modes": ["brightness"]}});
-        let (_, data) = describe("light.hall", &dimmer).unwrap();
+        let (_, data, _) = describe("light.hall", &dimmer).unwrap();
         assert_eq!((data["name"].as_str(), data["colour"].as_bool(), data["white"].as_bool()), (Some("light.hall"), Some(false), Some(false)));
         assert_eq!((data["dims"].as_bool(), data["stops"].as_bool(), data["flash"].as_bool()), (Some(true), Some(false), Some(false)));
         assert!(describe("sensor.temperature", &state).is_none());
         let rgb = json!({"state": "on", "attributes": {"supported_color_modes": ["rgb"]}});
-        let (_, data) = describe("light.bulb", &rgb).unwrap();
+        let (_, data, _) = describe("light.bulb", &rgb).unwrap();
         assert_eq!((data["colour"].as_bool(), data["white"].as_bool()), (Some(true), Some(true)), "HA makes white tones from colour");
         let unknown = json!({"state": "unavailable", "attributes": {}});
-        let (_, data) = describe("light.away", &unknown).unwrap();
+        let (_, data, _) = describe("light.away", &unknown).unwrap();
         assert_eq!((data["colour"].as_bool(), data["white"].as_bool(), data["dims"].as_bool()), (Some(true), Some(true), Some(true)));
     }
 
     #[test]
     fn listings_carry_each_entitys_state() {
         let off = json!({"state": "off", "attributes": {}});
-        assert_eq!(checked(&off, state_of("ha_light")), (State::Ready, "off".into()));
+        assert_eq!(checked(&off, describe_light), (State::Ready, "off".into()));
         let gone = json!({"state": "unavailable", "attributes": {}});
-        assert_eq!(checked(&gone, state_of("ha_switch")).0, State::Offline);
+        assert_eq!(checked(&gone, describe_switch).0, State::Offline);
         let tv = json!({"state": "playing", "attributes": {"source": "Netflix"}});
-        assert_eq!(checked(&tv, state_of("ha_tv")).1, "playing · Netflix");
+        assert_eq!(checked(&tv, describe_tv).1, "playing · Netflix");
     }
 
     #[test]
     fn only_tvs_are_tvs() {
         let tv = json!({"attributes": {"friendly_name": "Lounge TV", "device_class": "tv"}});
-        assert_eq!(describe("media_player.lounge", &tv), Some(("ha_tv", json!({"name": "Lounge TV"}))));
+        let kept = |entity: &str, state: &Value| describe(entity, state).map(|(backend, data, _)| (backend, data));
+        assert_eq!(kept("media_player.lounge", &tv), Some(("ha_tv", json!({"name": "Lounge TV"}))));
         let speaker = json!({"attributes": {"device_class": "speaker"}});
         assert!(describe("media_player.kitchen", &speaker).is_none());
         let plug = json!({"attributes": {"friendly_name": "Kettle"}});
-        assert_eq!(describe("switch.kettle", &plug), Some(("ha_switch", json!({"name": "Kettle"}))));
+        assert_eq!(kept("switch.kettle", &plug), Some(("ha_switch", json!({"name": "Kettle"}))));
     }
 
     #[test]

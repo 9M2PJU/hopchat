@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn an_on_off_light_says_it_only_switches() {
         let state = json!({"state": "off", "attributes": {"supported_color_modes": ["onoff"]}});
-        let (backend, data) = describe("light.porch", &state).unwrap();
+        let (backend, data, _) = describe("light.porch", &state).unwrap();
         let d = Device::new(backend, "Porch".into(), Ipv4Addr::UNSPECIFIED, None, data);
         assert_eq!(HaLight.about(&d), "on or off only");
         let older = Device::new("ha_light", "Hall".into(), Ipv4Addr::UNSPECIFIED, None, json!({}));
