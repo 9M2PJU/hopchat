@@ -86,13 +86,16 @@ impl TvDriver for HaTv {
         Ok(format!("{} is turning {}", d.name, if on { "on" } else { "off" }))
     }
 
+    /// Every call goes through [`Hub::drive`], as power and sources do, so
+    /// a slow answer says what the TV is doing so far rather than failing.
     fn volume(&self, d: &mut Device, level: Option<u8>, change: Option<i8>, mute: Option<bool>) -> Result<String, String> {
         let hub = Hub::of(d)?;
         let entity = entity(d)?;
+        let call = |service: &str, body: Value| hub.drive(service, entity, body, describe_tv).map(drop);
         if let Some(mute) = mute {
-            hub.call("media_player.volume_mute", entity, json!({"is_volume_muted": mute}))?;
+            call("media_player.volume_mute", json!({"is_volume_muted": mute}))?;
         }
-        let set = |level: f64| hub.call("media_player.volume_set", entity, json!({"volume_level": level}));
+        let set = |level: f64| call("media_player.volume_set", json!({"volume_level": level}));
         if let Some(level) = level {
             set(f64::from(level.min(100)) / 100.0)?;
         } else if let Some(change) = change.filter(|c| *c != 0) {
@@ -103,7 +106,7 @@ impl TvDriver for HaTv {
                 Volume::Step(steps) => {
                     let service = if change > 0 { "media_player.volume_up" } else { "media_player.volume_down" };
                     for _ in 0..steps {
-                        hub.call(service, entity, json!({}))?;
+                        call(service, json!({}))?;
                     }
                 }
             }
