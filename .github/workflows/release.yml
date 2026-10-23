@@ -27,6 +27,9 @@ env:
   CARGO_GENERATE_RPM_VERSION: "0.21.1"
   APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
   APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+  # The oldest glibc the Linux binaries may need. README promises this floor;
+  # the build fails if a runner image bump would silently raise it.
+  GLIBC_FLOOR: "2.35"
 
 jobs:
   # Each target is compiled exactly once. The tarball and every Linux package
@@ -38,7 +41,7 @@ jobs:
       fail-fast: false
       matrix:
         # Linux builds run on the oldest supported Ubuntu so the binaries link
-        # against an older glibc and run on Debian 12 / Ubuntu 22.04 and newer.
+        # against an older glibc; the GLIBC_FLOOR check enforces it.
         include:
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04, os: linux, arch: x86_64 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm, os: linux, arch: aarch64 }
@@ -77,6 +80,19 @@ jobs:
 
       - name: Build binary
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check glibc floor
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          max="$(objdump -T "target/${{ matrix.target }}/release/hopchat" \
+            | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -1)"
+          echo "highest glibc symbol version: $max (floor $GLIBC_FLOOR)"
+          if [ "$(printf '%s\n%s\n' "$max" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::binary needs glibc $max, above the documented floor $GLIBC_FLOOR"
+            exit 1
+          fi
 
       - name: Smoke test binary
         if: ${{ !matrix.cross }}
