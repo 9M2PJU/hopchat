@@ -87,8 +87,24 @@ jobs:
           fi
           echo "VER=$VER" >> "$GITHUB_ENV"
 
+      # Linux tarballs and the AppImage carry their own OpenSSL, so they run
+      # on any distro that meets the glibc floor, OpenSSL 3 or not.
       - name: Build binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: >-
+          cargo build --release --locked --target ${{ matrix.target }}
+          ${{ matrix.os == 'linux' && '--features vendored-openssl' || '' }}
+
+      - name: Check OpenSSL is bundled
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          needed="$(objdump -p "target/${{ matrix.target }}/release/hopchat" | awk '$1 == "NEEDED" { print $2 }')"
+          echo "$needed"
+          if printf '%s\n' "$needed" | grep -qE '^lib(ssl|crypto)\.so'; then
+            echo "::error::the portable binary still links the system OpenSSL"
+            exit 1
+          fi
 
       - name: Check glibc floor
         if: matrix.os == 'linux'
@@ -104,13 +120,20 @@ jobs:
           fi
 
       - name: Smoke test binary
-        run: target/${{ matrix.target }}/release/hopchat --help
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/hopchat"
+          "$bin" --help >/dev/null
+          got="$("$bin" --version)"
+          [ "$got" = "hopchat $VER" ] || { echo "::error::--version says '$got', expected 'hopchat $VER'"; exit 1; }
 
       - name: Build tarball
         shell: bash
         run: |
           set -eux
-          # install.sh expects hopchat-<ver>-<os>-<arch>.tar.gz with ./hopchat at the top.
+          # install.sh expects hopchat-<ver>-<os>-<arch>.tar.gz whose members are
+          # hopchat, README.md and LICENSE, with no ./ prefix: it extracts by name.
           mkdir -p dist staging
           cp "target/${{ matrix.target }}/release/hopchat" README.md LICENSE staging/
           tar -czf "dist/hopchat-${VER}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" -C staging hopchat README.md LICENSE
@@ -122,13 +145,35 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      # The packaging jobs reuse this exact binary instead of rebuilding it.
-      - name: Upload binary for packaging
+      # The AppImage reuses this exact bundled-OpenSSL binary.
+      - name: Upload portable binary for packaging
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: bin-${{ matrix.target }}
+          name: bin-vendored-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/hopchat
+          if-no-files-found: error
+
+      # The .deb and .rpm link the system OpenSSL instead, so the distro's
+      # security updates reach them. Separate target dir: different features.
+      - name: Build system-OpenSSL binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target ${{ matrix.target }} --target-dir target-system
+          bin="target-system/${{ matrix.target }}/release/hopchat"
+          needed="$(objdump -p "$bin" | awk '$1 == "NEEDED" { print $2 }')"
+          printf '%s\n' "$needed" | grep -qx 'libssl\.so\.3' \
+            || { echo "::error::system build does not link libssl.so.3"; exit 1; }
+          [ "$("$bin" --version)" = "hopchat $VER" ]
+
+      - name: Upload system-OpenSSL binary for packaging
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bin-system-${{ matrix.target }}
+          path: target-system/${{ matrix.target }}/release/hopchat
           if-no-files-found: error
 
   package:
@@ -157,7 +202,7 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: bin-${{ env.TARGET }}
+          name: ${{ matrix.asset == 'appimage' && 'bin-vendored' || 'bin-system' }}-${{ env.TARGET }}
           path: target/${{ env.TARGET }}/release
 
       - name: Prepare binary
@@ -176,12 +221,17 @@ jobs:
         run: |
           set -eux
           cargo install cargo-deb --locked --version "$CARGO_DEB_VERSION"
-          # --no-strip keeps the packaged binary byte-identical to the tarball's.
+          # --no-strip keeps the packaged binary byte-identical to the one built above.
           cargo deb --target "$TARGET" --no-build --no-strip --output dist/
+          # The runner already has libssl3, so installing alone cannot prove the
+          # dependency is declared. Check the control file directly.
+          deps="$(dpkg-deb -f dist/*.deb Depends)"
+          echo "Depends: $deps"
+          printf '%s\n' "$deps" | grep -q 'libssl3' || { echo "::error::.deb does not depend on libssl3"; exit 1; }
           # Install it on this runner to prove its dependencies resolve and it runs.
           sudo apt-get update -y
           sudo apt-get install -y ./dist/*.deb
-          hopchat --help
+          [ "$(hopchat --version)" = "hopchat $VER" ]
           sudo apt-get remove -y hopchat
 
       - name: Build .rpm (cargo-generate-rpm)
@@ -190,9 +240,13 @@ jobs:
           set -eux
           cargo install cargo-generate-rpm --locked --version "$CARGO_GENERATE_RPM_VERSION"
           cargo generate-rpm --target "$TARGET" --output dist/
-          # Install it on Fedora to prove its dependencies resolve and it runs.
-          docker run --rm -v "$PWD/dist:/dist:ro" fedora:latest \
-            sh -c 'dnf install -y /dist/*.rpm && hopchat --help'
+          # Fedora already ships OpenSSL, so check the declared requirement and
+          # the license file before proving it installs and runs.
+          docker run --rm -e VER -v "$PWD/dist:/dist:ro" fedora:latest sh -euxc '
+            rpm -qpR /dist/*.rpm | grep -q "libssl.so.3"
+            rpm -qpl /dist/*.rpm | grep -qx /usr/share/licenses/hopchat/LICENSE
+            dnf install -y /dist/*.rpm
+            [ "$(hopchat --version)" = "hopchat $VER" ]'
 
       - name: Build AppImage
         if: matrix.asset == 'appimage'
@@ -207,7 +261,7 @@ jobs:
           export APPIMAGE_EXTRACT_AND_RUN=1
           VERSION="$VER" sh packaging/appimage/build.sh \
             --binary "target/$TARGET/release/hopchat" --output dist
-          "dist/hopchat-${VER}-linux-x86_64.AppImage" --help
+          [ "$("dist/hopchat-${VER}-linux-x86_64.AppImage" --version)" = "hopchat $VER" ]
 
       - name: Upload package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -279,4 +333,4 @@ jobs:
           # Runners have cargo, so a missing asset would quietly fall back to a
           # source build. Require the verified prebuilt path.
           grep -q '^Checksum OK\.$' "$RUNNER_TEMP/install.log"
-          "$RUNNER_TEMP/bin/hopchat" --help
+          [ "$("$RUNNER_TEMP/bin/hopchat" --version)" = "hopchat ${GITHUB_REF_NAME#v}" ]
