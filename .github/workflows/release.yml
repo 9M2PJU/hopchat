@@ -32,6 +32,15 @@ env:
   GLIBC_FLOOR: "2.35"
 
 jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: shellcheck -s sh install.sh packaging/appimage/build.sh
+
   # Each target is compiled exactly once. The tarball and every Linux package
   # below ship these same bytes.
   build:
@@ -45,8 +54,8 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04, os: linux, arch: x86_64 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm, os: linux, arch: aarch64 }
-          # Cross-compiled on the arm64 runner, so it is not run here.
-          - { target: x86_64-apple-darwin, runner: macos-latest, os: macos, arch: x86_64, cross: true }
+          # Cross-compiled on the arm64 runner; the smoke test runs it under Rosetta 2.
+          - { target: x86_64-apple-darwin, runner: macos-latest, os: macos, arch: x86_64 }
           - { target: aarch64-apple-darwin, runner: macos-latest, os: macos, arch: aarch64 }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -95,7 +104,6 @@ jobs:
           fi
 
       - name: Smoke test binary
-        if: ${{ !matrix.cross }}
         run: target/${{ matrix.target }}/release/hopchat --help
 
       - name: Build tarball
@@ -182,6 +190,9 @@ jobs:
           set -eux
           cargo install cargo-generate-rpm --locked --version "$CARGO_GENERATE_RPM_VERSION"
           cargo generate-rpm --target "$TARGET" --output dist/
+          # Install it on Fedora to prove its dependencies resolve and it runs.
+          docker run --rm -v "$PWD/dist:/dist:ro" fedora:latest \
+            sh -c 'dnf install -y /dist/*.rpm && hopchat --help'
 
       - name: Build AppImage
         if: matrix.asset == 'appimage'
@@ -211,7 +222,7 @@ jobs:
     # to a slow source build, so any failed leg stops the publish. Pull
     # requests run the same legs, which is where such failures should surface.
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-    needs: [build, package]
+    needs: [lint, build, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -236,3 +247,26 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
 
+  # Runs the one-liner the README documents against the release just published.
+  verify-install:
+    name: install.sh (${{ matrix.runner }})
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: [release]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install with install.sh
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sh install.sh --dir "$RUNNER_TEMP/bin" --tag "$GITHUB_REF_NAME" | tee "$RUNNER_TEMP/install.log"
+          # Runners have cargo, so a missing asset would quietly fall back to a
+          # source build. Require the verified prebuilt path.
+          grep -q '^Checksum OK\.$' "$RUNNER_TEMP/install.log"
+          "$RUNNER_TEMP/bin/hopchat" --help
