@@ -29,8 +29,10 @@ env:
   APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
 
 jobs:
-  artifacts:
-    name: ${{ matrix.asset }} (${{ matrix.target }})
+  # Each target is compiled exactly once. The tarball and every Linux package
+  # below ship these same bytes.
+  build:
+    name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -38,29 +40,11 @@ jobs:
         # Linux builds run on the oldest supported Ubuntu so the binaries link
         # against an older glibc and run on Debian 12 / Ubuntu 22.04 and newer.
         include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            asset: tarball
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            asset: deb
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            asset: rpm
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            asset: appimage
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04-arm
-            asset: tarball
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            asset: tarball
-            # Cross-compiled on an arm64 runner, so it is not run here.
-            cross: true
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            asset: tarball
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04, os: linux, arch: x86_64 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm, os: linux, arch: aarch64 }
+          # Cross-compiled on the arm64 runner, so it is not run here.
+          - { target: x86_64-apple-darwin, runner: macos-latest, os: macos, arch: x86_64, cross: true }
+          - { target: aarch64-apple-darwin, runner: macos-latest, os: macos, arch: aarch64 }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -73,13 +57,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ matrix.target }}-${{ matrix.asset }}
+          key: ${{ matrix.target }}
 
       - name: Resolve version
+        id: version
         shell: bash
         run: |
-          set -eu
-          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          set -euo pipefail
+          VER="$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "hopchat") | .version')"
+          [ -n "$VER" ] || { echo "::error::could not read the hopchat version"; exit 1; }
           # A tag must match Cargo.toml, or tarballs and packages would carry
           # different versions and install.sh would look up the wrong asset.
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$VER" ]; then
@@ -96,30 +83,77 @@ jobs:
         run: target/${{ matrix.target }}/release/hopchat --help
 
       - name: Build tarball
-        if: matrix.asset == 'tarball'
         shell: bash
         run: |
           set -eux
           # install.sh expects hopchat-<ver>-<os>-<arch>.tar.gz with ./hopchat at the top.
-          case "${{ matrix.target }}" in
-            *-linux-*) OS=linux ;;
-            *-apple-*) OS=macos ;;
-          esac
-          case "${{ matrix.target }}" in
-            x86_64-*) ARCH=x86_64 ;;
-            aarch64-*) ARCH=aarch64 ;;
-          esac
           mkdir -p dist staging
           cp "target/${{ matrix.target }}/release/hopchat" README.md LICENSE staging/
-          tar -czf "dist/hopchat-${VER}-${OS}-${ARCH}.tar.gz" -C staging hopchat README.md LICENSE
+          tar -czf "dist/hopchat-${VER}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" -C staging hopchat README.md LICENSE
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-tarball-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      # The packaging jobs reuse this exact binary instead of rebuilding it.
+      - name: Upload binary for packaging
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/hopchat
+          if-no-files-found: error
+
+  package:
+    name: ${{ matrix.asset }} (x86_64-unknown-linux-gnu)
+    needs: [build]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        asset: [deb, rpm, appimage]
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      # Caches the installed cargo-deb / cargo-generate-rpm between runs.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: package-${{ matrix.asset }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: bin-${{ env.TARGET }}
+          path: target/${{ env.TARGET }}/release
+
+      - name: Prepare binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Artifacts do not keep the executable bit.
+          chmod 755 "target/$TARGET/release/hopchat"
+          VER="$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "hopchat") | .version')"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          mkdir -p dist
 
       - name: Build .deb (cargo-deb)
         if: matrix.asset == 'deb'
         run: |
           set -eux
           cargo install cargo-deb --locked --version "$CARGO_DEB_VERSION"
-          mkdir -p dist
-          cargo deb --target ${{ matrix.target }} --no-build --output dist/
+          # --no-strip keeps the packaged binary byte-identical to the tarball's.
+          cargo deb --target "$TARGET" --no-build --no-strip --output dist/
           # Install it on this runner to prove its dependencies resolve and it runs.
           sudo apt-get update -y
           sudo apt-get install -y ./dist/*.deb
@@ -131,8 +165,7 @@ jobs:
         run: |
           set -eux
           cargo install cargo-generate-rpm --locked --version "$CARGO_GENERATE_RPM_VERSION"
-          mkdir -p dist
-          cargo generate-rpm --target ${{ matrix.target }} --output dist/
+          cargo generate-rpm --target "$TARGET" --output dist/
 
       - name: Build AppImage
         if: matrix.asset == 'appimage'
@@ -145,14 +178,14 @@ jobs:
           sudo install -m 755 "$RUNNER_TEMP/appimagetool" /usr/local/bin/appimagetool
           # appimagetool is itself an AppImage: extract it instead of needing FUSE.
           export APPIMAGE_EXTRACT_AND_RUN=1
-          sh packaging/appimage/build.sh \
-            --binary "target/${{ matrix.target }}/release/hopchat" --output dist
+          VERSION="$VER" sh packaging/appimage/build.sh \
+            --binary "target/$TARGET/release/hopchat" --output dist
           "dist/hopchat-${VER}-linux-x86_64.AppImage" --help
 
-      - name: Upload artifacts
+      - name: Upload package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ matrix.asset }}-${{ matrix.target }}
+          name: dist-${{ matrix.asset }}-${{ env.TARGET }}
           path: dist/*
           if-no-files-found: error
 
@@ -162,13 +195,14 @@ jobs:
     # to a slow source build, so any failed leg stops the publish. Pull
     # requests run the same legs, which is where such failures should surface.
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-    needs: [artifacts]
+    needs: [build, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: dist-*
           path: dist
           merge-multiple: true
 
@@ -185,3 +219,4 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+

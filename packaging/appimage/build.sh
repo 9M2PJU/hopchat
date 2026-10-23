@@ -3,6 +3,7 @@
 # Usage: sh packaging/appimage/build.sh [--binary PATH] [--output DIR]
 #   --binary PATH  package this prebuilt binary (default: cargo build --release)
 #   --output DIR   where the AppImage goes (default: dist/)
+#   VERSION=x.y.z  version for the file name (default: read from Cargo.toml)
 # Requires appimagetool (or linuxdeploy) in PATH. Set APPIMAGE_EXTRACT_AND_RUN=1
 # where FUSE is unavailable, e.g. in containers and CI.
 set -eu
@@ -21,7 +22,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | cut -d'"' -f2)"
+# CI passes VERSION from `cargo metadata`; the grep is only for local runs.
+VERSION="${VERSION:-$(grep -m1 '^version' "$ROOT/Cargo.toml" | cut -d'"' -f2)}"
 ARCH="$(uname -m)"
 
 if [ -z "$BINARY" ]; then
