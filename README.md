@@ -8,8 +8,10 @@
 [![Release](https://img.shields.io/github/v/release/bahdotsh/hopchat)](https://github.com/bahdotsh/hopchat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
-[![Built with ratatui](https://img.shields.io/badge/built%20with-ratatui-8a2be2.svg)](https://ratatui.rs)
+[![Built With Ratatui](https://ratatui.rs/built-with-ratatui/badge.svg)](https://ratatui.rs/)
 [![MLS RFC 9420](https://img.shields.io/badge/encryption-MLS%20RFC%209420-success.svg)](https://www.rfc-editor.org/rfc/rfc9420)
+
+![alice and bob find each other on the same network and start a private, end-to-end encrypted chat](demo/hopchat.gif)
 
 </div>
 
