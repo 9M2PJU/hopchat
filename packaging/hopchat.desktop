@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=hopchat
+GenericName=Terminal Chat
+Comment=Offline, end-to-end encrypted terminal chat for your local network
+Exec=hopchat
+Icon=hopchat
+Terminal=true
+Type=Application
+Categories=Network;Chat;ConsoleOnly;
+Keywords=chat;mesh;offline;mls;terminal;
+StartupNotify=false

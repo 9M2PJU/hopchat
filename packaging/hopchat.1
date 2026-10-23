@@ -1,0 +1,79 @@
+.TH HOPCHAT 1 "2026" "hopchat 0.1.0" "User Commands"
+.SH NAME
+hopchat \- offline, end-to-end encrypted terminal chat for your local network
+.SH SYNOPSIS
+.B hopchat
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+hopchat is a terminal chat app built on the Offline Protocol SDK.
+Peers on the same network discover each other over UDP multicast and DNS-SD;
+every conversation is end-to-end encrypted with MLS (RFC 9420).
+No server, no internet, no accounts.
+.PP
+Run hopchat on two machines on the same network:
+.PP
+.RS
+hopchat \-\-name alice    # on one machine
+.br
+hopchat \-\-name bob      # on another
+.RE
+.SH OPTIONS
+.TP
+.BR \-\-name ", " \-n " " \fINICK\fR
+What peers see you as (default: $USER).
+.TP
+.BR \-\-dir " " \fIPATH\fR
+Where identity and history live (default: ~/.hopchat/NICK).
+.TP
+.BR \-\-downloads " " \fIPATH\fR
+Where received files are saved (default: ~/Downloads/hopchat).
+.TP
+.BR \-\-theme " " \fINAME\fR
+dark or light (default: last /theme, else the terminal's).
+.TP
+.B \-\-echo
+No UI: answer every message (a bot to test against).
+.TP
+.BR \-\-say " " \fITEXT\fR
+No UI: send TEXT to the first peer that connects.
+.TP
+.BR \-\-file " " \fIPATH\fR
+No UI: send the file at PATH to the first peer that connects.
+.TP
+.BR \-\-to " " \fINICK\fR
+With \-\-say/\-\-file: only send to a peer with this nick.
+.TP
+.B \-\-lobby
+With \-\-say: say it in the lobby, once the first peer (or \-\-to NICK) has a session.
+.TP
+.BR \-\-group " " \fINAME\fR
+No UI: create group NAME, invite peers as they connect, and \-\-say into the group.
+.TP
+.B \-\-home
+With \-\-group: let the group use this machine's devices.
+.TP
+.B \-\-ai
+With \-\-group: let the group ask this machine's model with @ai.
+.TP
+.BR \-\-help ", " \-h
+Print usage and exit.
+.SH FILES
+.TP
+.I ~/.hopchat/<name>/
+Identity, history and settings per profile.
+.TP
+.I ~/Downloads/hopchat
+Where received files are saved by default.
+.SH EXAMPLES
+.PP
+.RS
+hopchat \-\-name alice
+.br
+hopchat \-\-name bot \-\-echo
+.br
+hopchat \-\-name alice \-\-say "hello" \-\-to bob
+.RE
+.SH SEE ALSO
+Full documentation: <https://github.com/bahdotsh/hopchat>
+.SH AUTHOR
+Written by bahdotsh.

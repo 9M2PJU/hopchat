@@ -74,7 +74,35 @@ It's also a remote control for the room you're in. Mention `@home` to dim the li
 
 ## Installation
 
-From GitHub:
+One-liner (Linux/macOS, installs the latest release to `~/.local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bahdotsh/hopchat/main/install.sh | sh
+```
+
+Arch Linux (AUR):
+
+```sh
+yay -S hopchat        # stable release
+yay -S hopchat-git    # latest git
+```
+
+Debian/Ubuntu and Fedora/RHEL: grab the `.deb` / `.rpm` from the
+[releases page](https://github.com/bahdotsh/hopchat/releases):
+
+```sh
+sudo dpkg -i hopchat_0.1.0_amd64.deb        # Debian/Ubuntu
+sudo rpm -i hopchat-0.1.0-1.x86_64.rpm      # Fedora/RHEL
+```
+
+AppImage (any Linux distribution):
+
+```sh
+chmod +x hopchat-0.1.0-linux-x86_64.AppImage
+./hopchat-0.1.0-linux-x86_64.AppImage --name alice
+```
+
+From GitHub with cargo:
 
 ```sh
 cargo install --git https://github.com/bahdotsh/hopchat

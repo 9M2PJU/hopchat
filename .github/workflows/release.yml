@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  artifacts:
+    name: ${{ matrix.asset }} (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            asset: tarball
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            asset: deb
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            asset: rpm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            asset: appimage
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            asset: tarball
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            asset: tarball
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            asset: tarball
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.asset }}
+
+      - name: Build binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage dist files
+        shell: bash
+        run: |
+          set -eux
+          BIN="target/${{ matrix.target }}/release/hopchat"
+          test -f "$BIN"
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir -p dist staging
+          case "${{ matrix.asset }}" in
+            tarball)
+              # install.sh expects: hopchat-<ver>-<os>-<arch>.tar.gz containing ./hopchat
+              case "${{ matrix.target }}" in
+                *-linux-*) OS=linux ;;
+                *-apple-*) OS=macos ;;
+              esac
+              case "${{ matrix.target }}" in
+                x86_64-*) ARCH=x86_64 ;;
+                aarch64-*) ARCH=aarch64 ;;
+              esac
+              cp "$BIN" staging/hopchat
+              cp README.md LICENSE staging/ 2>/dev/null || true
+              tar -czf "dist/hopchat-${VER}-${OS}-${ARCH}.tar.gz" -C staging hopchat
+              ;;
+          esac
+
+      - name: Build .deb (cargo-deb)
+        if: matrix.asset == 'deb'
+        run: |
+          set -eux
+          cargo install cargo-deb --locked
+          cargo deb --target ${{ matrix.target }} --no-build --output dist/
+          ls -lh dist/
+
+      - name: Build .rpm (cargo-generate-rpm)
+        if: matrix.asset == 'rpm'
+        run: |
+          set -eux
+          cargo install cargo-generate-rpm --locked
+          cargo generate-rpm --target ${{ matrix.target }} --output dist/
+          ls -lh dist/
+
+      - name: Build AppImage
+        if: matrix.asset == 'appimage'
+        run: |
+          set -eux
+          sudo apt-get update -y
+          sudo apt-get install -y file zsync desktop-file-utils
+          # appimagetool for x86_64 runners
+          curl -fsSL -o /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+          mkdir -p dist
+          # Reuse the repo script but point cargo at the already-built binary:
+          # build.sh rebuilds for host target, which equals x86_64-unknown-linux-gnu here.
+          sh packaging/appimage/build.sh --output dist
+          ls -lh dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [artifacts]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
