@@ -74,8 +74,9 @@ It's also a remote control for the room you're in. Mention `@home` to dim the li
 
 ## Installation
 
-Prebuilt Linux binaries need glibc 2.35+ and OpenSSL 3, which means Debian 12,
-Ubuntu 22.04, Fedora 36 or newer. On older systems, use cargo below.
+Prebuilt Linux binaries need glibc 2.35+, which means Debian 12, Ubuntu 22.04,
+Fedora 36 or newer. The tarballs and AppImage bundle their own OpenSSL; the
+`.deb` and `.rpm` use the system's OpenSSL 3. On older systems, use cargo below.
 
 One-liner (Linux/macOS, installs the latest release to `~/.local/bin` after
 checking the download for corruption against the release's `SHA256SUMS`):
@@ -103,7 +104,7 @@ sudo apt install ./hopchat_0.1.0-1_amd64.deb       # Debian/Ubuntu
 sudo dnf install ./hopchat-0.1.0-1.x86_64.rpm      # Fedora/RHEL
 ```
 
-AppImage (x86_64 Linux, same glibc and OpenSSL requirements as above):
+AppImage (x86_64 Linux, glibc 2.35+, nothing else to install):
 
 ```sh
 chmod +x hopchat-0.1.0-linux-x86_64.AppImage

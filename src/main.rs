@@ -35,6 +35,7 @@ const USAGE: &str = "usage: hopchat [--name NICK] [--dir PATH] [--downloads PATH
                     (only --to NICK, if given), and --say into the group
   --home            with --group: let the group use this machine's devices
   --ai              with --group: let the group ask this machine's model with @ai
+  --version         print the version and exit
 
 Run two copies with different names to chat with yourself on one machine.";
 
@@ -68,6 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--ai" => ai_on = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
+                return Ok(());
+            }
+            "--version" | "-V" => {
+                println!("hopchat {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             _ => return Err(USAGE.into()),
