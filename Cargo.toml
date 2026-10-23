@@ -13,7 +13,8 @@ categories = ["command-line-utilities"]
 maintainer = "bahdotsh <appu.yess@gmail.com>"
 copyright = "2026, bahdotsh <appu.yess@gmail.com>"
 license-file = ["LICENSE", "0"]
-depends = "$auto, libssl3"
+# $auto reads the real shared-library deps (libc6, libssl3) from the binary.
+depends = "$auto"
 extended-description = """Offline, end-to-end encrypted terminal chat for your local network. No server, no internet, no accounts."""
 section = "net"
 priority = "optional"
