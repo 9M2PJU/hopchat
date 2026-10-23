@@ -78,7 +78,7 @@ Prebuilt Linux binaries need glibc 2.35+ and OpenSSL 3, which means Debian 12,
 Ubuntu 22.04, Fedora 36 or newer. On older systems, use cargo below.
 
 One-liner (Linux/macOS, installs the latest release to `~/.local/bin` after
-checking it against the release's `SHA256SUMS`):
+checking the download for corruption against the release's `SHA256SUMS`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bahdotsh/hopchat/main/install.sh | sh
@@ -110,8 +110,14 @@ chmod +x hopchat-0.1.0-linux-x86_64.AppImage
 ```
 
 Every release lists the SHA-256 of each file in `SHA256SUMS`. To check a
-manual download, run `sha256sum --ignore-missing -c SHA256SUMS` in the folder
-that holds both.
+manual download for corruption, run `sha256sum --ignore-missing -c SHA256SUMS`
+in the folder that holds both. To check that a file was built by this
+repository's release workflow, verify its build provenance with the
+[GitHub CLI](https://cli.github.com):
+
+```sh
+gh attestation verify hopchat-0.1.0-linux-x86_64.tar.gz --repo bahdotsh/hopchat
+```
 
 From GitHub with cargo:
 
