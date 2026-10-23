@@ -74,13 +74,19 @@ It's also a remote control for the room you're in. Mention `@home` to dim the li
 
 ## Installation
 
-One-liner (Linux/macOS, installs the latest release to `~/.local/bin`):
+Prebuilt Linux binaries need glibc 2.35+ and OpenSSL 3, which means Debian 12,
+Ubuntu 22.04, Fedora 36 or newer. On older systems, use cargo below.
+
+One-liner (Linux/macOS, installs the latest release to `~/.local/bin` after
+checking it against the release's `SHA256SUMS`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bahdotsh/hopchat/main/install.sh | sh
+# options go after `sh -s --`, e.g. a system-wide install:
+curl -fsSL https://raw.githubusercontent.com/bahdotsh/hopchat/main/install.sh | sudo sh -s -- --system
 ```
 
-Arch Linux (AUR):
+Arch Linux (AUR, community-maintained):
 
 ```sh
 yay -S hopchat        # stable release
@@ -88,19 +94,24 @@ yay -S hopchat-git    # latest git
 ```
 
 Debian/Ubuntu and Fedora/RHEL: grab the `.deb` / `.rpm` from the
-[releases page](https://github.com/bahdotsh/hopchat/releases):
+[releases page](https://github.com/bahdotsh/hopchat/releases). Installing
+through the package manager pulls in OpenSSL if it is missing:
 
 ```sh
-sudo dpkg -i hopchat_0.1.0_amd64.deb        # Debian/Ubuntu
-sudo rpm -i hopchat-0.1.0-1.x86_64.rpm      # Fedora/RHEL
+sudo apt install ./hopchat_0.1.0-1_amd64.deb       # Debian/Ubuntu
+sudo dnf install ./hopchat-0.1.0-1.x86_64.rpm      # Fedora/RHEL
 ```
 
-AppImage (any Linux distribution):
+AppImage (x86_64 Linux, same glibc and OpenSSL requirements as above):
 
 ```sh
 chmod +x hopchat-0.1.0-linux-x86_64.AppImage
 ./hopchat-0.1.0-linux-x86_64.AppImage --name alice
 ```
+
+Every release lists the SHA-256 of each file in `SHA256SUMS`. To check a
+manual download, run `sha256sum --ignore-missing -c SHA256SUMS` in the folder
+that holds both.
 
 From GitHub with cargo:
 
