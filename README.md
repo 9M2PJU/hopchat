@@ -89,9 +89,10 @@ curl -fsSL https://raw.githubusercontent.com/bahdotsh/hopchat/main/install.sh | 
 Arch Linux (AUR, community-maintained):
 
 ```sh
-yay -S hopchat        # stable release
 yay -S hopchat-git    # latest git
 ```
+
+A stable `hopchat` AUR package follows the first tagged release.
 
 Debian/Ubuntu and Fedora/RHEL: grab the `.deb` / `.rpm` from the
 [releases page](https://github.com/bahdotsh/hopchat/releases). Installing
