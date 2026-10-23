@@ -10,10 +10,9 @@ license=('MIT')
 depends=('gcc-libs' 'openssl')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/bahdotsh/hopchat/archive/refs/tags/v$pkgver.tar.gz")
-# Deliberately not SKIP: a fixed release tarball must be verified. This
-# placeholder makes makepkg fail closed until the real sum is filled in with
-# `updpkgsums` after the v$pkgver tag exists (see ../README.md).
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+# Deliberately not SKIP: a fixed release tarball must be verified. Run
+# `updpkgsums` after bumping pkgver (see ../README.md).
+sha256sums=('65d164e10146fbf1cddfb75f20bbe0daa7c9cb13771270305c319f6c977b1087')
 
 prepare() {
   cd "$pkgname-$pkgver"

@@ -4,6 +4,8 @@
 
 **Offline, end-to-end encrypted terminal chat for your local network. No server, no internet, no accounts.**
 
+[![crates.io](https://img.shields.io/crates/v/hopchat.svg)](https://crates.io/crates/hopchat)
+[![Release](https://img.shields.io/github/v/release/bahdotsh/hopchat)](https://github.com/bahdotsh/hopchat/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![Built with ratatui](https://img.shields.io/badge/built%20with-ratatui-8a2be2.svg)](https://ratatui.rs)
@@ -68,7 +70,7 @@ It's also a remote control for the room you're in. Mention `@home` to dim the li
 
 ## Requirements
 
-- Rust 1.88 or newer (the crate uses edition 2024)
+- Rust 1.88 or newer, only when installing with cargo or building from source (the crate uses edition 2024)
 - macOS or Linux, on a network that allows UDP multicast
 - Optional, for `@home` and `@ai`: [Ollama](https://ollama.com) with a model that can call tools, such as `qwen2.5:7b`
 
@@ -93,7 +95,8 @@ Arch Linux (AUR, community-maintained):
 yay -S hopchat-git    # latest git
 ```
 
-A stable `hopchat` AUR package follows the first tagged release.
+A stable `hopchat` AUR package for v0.1.0 is being updated by its maintainer.
+Until it lands, use `hopchat-git`.
 
 Debian/Ubuntu and Fedora/RHEL: grab the `.deb` / `.rpm` from the
 [releases page](https://github.com/bahdotsh/hopchat/releases). Installing
@@ -121,11 +124,20 @@ repository's release workflow, verify its build provenance with the
 gh attestation verify hopchat-0.1.0-linux-x86_64.tar.gz --repo bahdotsh/hopchat
 ```
 
-From GitHub with cargo:
+From [crates.io](https://crates.io/crates/hopchat) with cargo (builds the
+latest release on any glibc, and links your system's OpenSSL):
 
 ```sh
-cargo install --git https://github.com/bahdotsh/hopchat
+cargo install hopchat --locked
 ```
+
+The latest unreleased code on `main`:
+
+```sh
+cargo install --git https://github.com/bahdotsh/hopchat --locked
+```
+
+Check what you have installed with `hopchat --version`.
 
 From source:
 
@@ -376,6 +388,8 @@ hopchat [--name NICK] [--dir PATH] [--downloads PATH] [--theme dark|light]
 | `--group NAME` | | no UI: create a group and invite peers as they connect |
 | `--home` | | with `--group`: let the group use this machine's devices |
 | `--ai` | | with `--group`: let the group ask this machine's model |
+| `--version`, `-V` | | print the version and exit |
+| `--help`, `-h` | | print usage and exit |
 
 **Data directory** (`~/.hopchat/<name>`):
 

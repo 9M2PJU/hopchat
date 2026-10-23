@@ -4,8 +4,8 @@ Two package bases, following Arch conventions:
 
 | Directory     | AUR package  | Source              | When to use |
 |---------------|--------------|---------------------|-------------|
-| `hopchat/`    | `hopchat`    | upstream release tag `v$pkgver` | stable, once tags exist |
-| `hopchat-git/`| `hopchat-git`| `main` branch (VCS) | latest commit, works today |
+| `hopchat/`    | `hopchat`    | upstream release tag `v$pkgver` | latest release |
+| `hopchat-git/`| `hopchat-git`| `main` branch (VCS) | latest commit |
 
 ## Who maintains them
 
@@ -40,9 +40,9 @@ makepkg -si         # verify it builds
 # push to AUR as above, and commit the updated files here too
 ```
 
-The stable PKGBUILD carries an all-zero `sha256sums` placeholder, not `SKIP`.
-`makepkg` fails on it until `updpkgsums` writes the real sum, so an
-unverified tarball can never be built by accident.
+The stable PKGBUILD never uses `SKIP`: a fixed release tarball must be
+verified. When bumping `pkgver`, `updpkgsums` writes the new sum; until it
+runs, the old sum no longer matches and `makepkg` fails closed.
 
 For `hopchat-git`, no update is needed on release; `pkgver()` tracks the
 latest commit automatically. Push only when the PKGBUILD itself changes
@@ -51,7 +51,9 @@ latest commit automatically. Push only when the PKGBUILD itself changes
 ## Notes
 
 - `hopchat` points at `https://github.com/bahdotsh/hopchat/archive/refs/tags/v$pkgver.tar.gz`.
-  The `v0.1.0` tag does not exist yet, so the stable package builds only
-  after the first upstream release. Until then, use `hopchat-git`.
+  The reference copy here carries the verified sum for v0.1.0. The copy on
+  the AUR must match it: it still had `SKIP` when v0.1.0 was released.
+- The AUR packages link the system `openssl`. Only the prebuilt release
+  tarballs and the AppImage bundle it (the `vendored-openssl` feature).
 - Runtime deps are `gcc-libs` + `openssl` (via `native-tls`); `mdns-sd`
   discovery is pure Rust and needs no Avahi daemon.
