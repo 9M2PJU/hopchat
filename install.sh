@@ -44,10 +44,16 @@ if command -v curl >/dev/null 2>&1; then
       *) return 1 ;;
     esac
   }
-  # Prints where github.com/$REPO/releases/latest redirects to.
+  # Prints where github.com/$REPO/releases/latest redirects to. Any final
+  # status but 200 (5xx, rate limit) is fatal, never "no release yet".
   latest_url() {
-    curl -sSIL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' \
-      "https://github.com/$REPO/releases/latest" || die "cannot reach github.com"
+    out="$(curl -sSIL --proto '=https' --tlsv1.2 -o /dev/null \
+      -w '%{http_code} %{url_effective}' \
+      "https://github.com/$REPO/releases/latest")" || die "cannot reach github.com"
+    case "$out" in
+      "200 "*) printf '%s\n' "${out#200 }" ;;
+      *) die "github.com answered HTTP ${out%% *} while looking up the latest release; try again later" ;;
+    esac
   }
 elif command -v wget >/dev/null 2>&1; then
   fetch_to() {
@@ -58,10 +64,15 @@ elif command -v wget >/dev/null 2>&1; then
   }
   # Busybox wget has no --max-redirect, so follow the redirects and take the
   # last Location header; both GNU and busybox wget print every hop with -S.
+  # As with curl, a final status other than 200 is fatal.
   latest_url() {
-    hdrs="$(wget -q -S --spider "https://github.com/$REPO/releases/latest" 2>&1)" || true
+    start="https://github.com/$REPO/releases/latest"
+    hdrs="$(wget -q -S --spider "$start" 2>&1)" || true
     printf '%s\n' "$hdrs" | grep -q 'HTTP/' || die "cannot reach github.com"
-    printf '%s\n' "$hdrs" | awk 'tolower($1) == "location:" { l = $2 } END { print l }' | tr -d '\r'
+    status="$(printf '%s\n' "$hdrs" | awk '$1 ~ /^HTTP\// { s = $2 } END { print s }')"
+    [ "$status" = 200 ] || die "github.com answered HTTP $status while looking up the latest release; try again later"
+    printf '%s\n' "$hdrs" \
+      | awk -v u="$start" 'tolower($1) == "location:" { u = $2 } END { print u }' | tr -d '\r'
   }
 else
   die "need curl or wget"
@@ -82,7 +93,9 @@ resolve_latest_tag() {
   url="$(latest_url)" || exit 1
   case "$url" in
     */releases/tag/*) printf '%s\n' "${url##*/}" ;;
-    *) ;;
+    # GitHub sends /releases/latest to /releases when there is none.
+    */releases|*/releases/) ;;
+    *) die "unexpected redirect while looking up the latest release: $url" ;;
   esac
 }
 
@@ -207,14 +220,17 @@ main() {
   # Stage next to the destination, not in $TMP: /tmp may be mounted noexec
   # (the check below would then blame glibc), and a rename within one
   # filesystem is atomic, so an interrupted install never leaves half a binary.
-  STAGED="$INSTALL_DIR/.$BIN.new.$$"
+  # mktemp picks an unpredictable name, so nothing planted there is followed.
+  STAGED="$(mktemp "$INSTALL_DIR/.$BIN.new.XXXXXX")" || die "cannot create a file in $INSTALL_DIR"
   cp "$TMP/$BIN" "$STAGED"
   chmod 755 "$STAGED"
 
-  # Prove it runs here (glibc, OpenSSL, architecture) before replacing anything.
-  if ! "$STAGED" --help >/dev/null 2>&1; then
+  # Prove it runs here (glibc, architecture) before replacing anything.
+  if ! "$STAGED" --version >/dev/null 2>&1; then
     echo "error: the downloaded $BIN does not run on this system." >&2
-    echo "  Linux builds need glibc 2.35+ and OpenSSL 3 (Debian 12, Ubuntu 22.04 or newer)." >&2
+    if [ "$TARGET_OS" = linux ]; then
+      echo "  Linux builds need glibc 2.35+ (Debian 12, Ubuntu 22.04, Fedora 36 or newer)." >&2
+    fi
     echo "  Otherwise install with: cargo install --git https://github.com/$REPO --locked" >&2
     exit 1
   fi
@@ -222,7 +238,7 @@ main() {
   mv -f "$STAGED" "$INSTALL_DIR/$BIN"
   STAGED=""
   echo ""
-  echo "Installed $BIN to $INSTALL_DIR/$BIN"
+  echo "Installed $("$INSTALL_DIR/$BIN" --version) to $INSTALL_DIR/$BIN"
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *) echo "Note: $INSTALL_DIR is not on your PATH. Add it, e.g.:"; echo "  export PATH=\"\$PATH:$INSTALL_DIR\"" ;;
